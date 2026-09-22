@@ -13,22 +13,11 @@
    typedef unsigned long VALUE;
 #endif
 
-// True while QApplication::exec() is running with the GVL released. Tells the
-// callback whether it must re-acquire the GVL before touching Ruby.
-// Nesting depth of blocking Qt event loops running with the GVL released
-// (app.exec can contain a modal dialog.exec). Non-zero means released.
-extern int g_qt_gvl_released;
-
-// RAII for "this thread is about to release the GVL". Releasing it makes the
-// thread-local "I already re-acquired the GVL" flag a lie: a callback fired
-// from the nested Qt event loop would take the "I hold it" path and run Ruby
-// with the GVL released. Clear the flag for the duration and restore it after.
-// Also owns the g_qt_gvl_released depth counter so the two can't drift.
-struct GvlReleaseScope {
-  bool saved;
-  GvlReleaseScope();
-  ~GvlReleaseScope();
-};
+// Runs a blocking Qt call (a modal exec, a static file dialog) with the GVL
+// released, so Ruby's background threads keep running while it is up.
+// Whether a callback needs to re-acquire the GVL is no longer tracked in our
+// own state -- ruby_thread_has_gvl_p() answers it directly.
+void ruby_without_gvl(const std::function<void()> &fn);
 
 // Reports a contained Ruby exception (class, message, first frames) on stderr
 // and clears it; returns true if there was one. `context` names the call site,

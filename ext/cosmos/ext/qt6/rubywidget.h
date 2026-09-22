@@ -15,6 +15,10 @@
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QCloseEvent>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
+#include <QMimeData>
 class QPainter;
 class QAbstractItemModel;
 #include <QMainWindow>
@@ -57,11 +61,27 @@ bool ruby_event_dispatch(QObject *obj, const char *method, VALUE arg);
 bool ruby_event_dispatch_n(QObject *obj, const char *method, int argc, VALUE *argv);
 VALUE ruby_event_call(QObject *obj, const char *method, int argc, VALUE *argv, bool *handled);
 VALUE ruby_wrap_model_index(const QModelIndex &idx);
+VALUE ruby_wrap_style_option_view_item(const void *opt);
 VALUE ruby_wrap_painter_borrowed(QPainter *p);
 VALUE ruby_wrap_qobject(QObject *o);
 QWidget *ruby_unwrap_widget(VALUE v);
-VALUE ruby_make_key_event(int key);
-VALUE ruby_make_mouse_event(int x, int y, int button);
+// Which snapshot class a forwarded event should be built as.
+enum RubyEventKind {
+  RUBY_EV_PLAIN = 0, RUBY_EV_CLOSE, RUBY_EV_SHOW, RUBY_EV_RESIZE,
+  RUBY_EV_FOCUS, RUBY_EV_LEAVE, RUBY_EV_DRAGENTER, RUBY_EV_DRAGMOVE, RUBY_EV_DROP
+};
+
+// Qt events reach Ruby as snapshots, never as pointers -- the QEvent is gone
+// once dispatch returns, so a handler that stored one would hold freed memory.
+// accept/ignore is read back off the snapshot and applied to the real event.
+VALUE ruby_make_plain_event(int kind, int type);
+VALUE ruby_make_paint_event(int x, int y, int w, int h, int type);
+VALUE ruby_make_wheel_event(int dx, int dy, int mods, int type);
+VALUE ruby_make_key_event(int key, const char *text, int mods, int type);
+VALUE ruby_make_mouse_event(int x, int y, int button, int buttons, int mods, int type);
+VALUE ruby_make_drop_event(int kind, const void *mime, int type);
+bool  ruby_event_accepted(VALUE ev);
+bool  ruby_event_proposed(VALUE ev);
 
 // QWidget subclass that forwards the virtuals COSMOS overrides in Ruby.
 // Without this, a Ruby `def paintEvent` is simply never called and nothing
@@ -78,6 +98,13 @@ protected:
   void initializeGL() override;
   void resizeGL(int w, int h) override;
   void paintGL() override;
+  // gl_viewer.rb:590-658 overrides these for rotate / pan / zoom / pick;
+  // QOpenGLWidget's own virtuals were the only ones forwarded, so 3D input
+  // in Telemetry Viewer's GL screens and OpenGL Builder did nothing.
+  void mousePressEvent(QMouseEvent *e) override;
+  void mouseReleaseEvent(QMouseEvent *e) override;
+  void mouseMoveEvent(QMouseEvent *e) override;
+  void wheelEvent(QWheelEvent *e) override;
 };
 
 // QStyledItemDelegate forwarding the virtuals COSMOS overrides in
@@ -102,10 +129,6 @@ public:
   explicit RubyWidget(QWidget *parent = nullptr) : QWidget(parent) {}
 
 protected:
-  // Helpers so every callback body runs inside a single ruby_with_gvl.
-  bool dispatch_plain(const char *method);
-  bool dispatch_mouse(const char *method, QMouseEvent *e);
-
   void paintEvent(QPaintEvent *e) override;
   void resizeEvent(QResizeEvent *e) override;
   void mousePressEvent(QMouseEvent *e) override;
@@ -118,6 +141,9 @@ protected:
   void closeEvent(QCloseEvent *e) override;
   void wheelEvent(QWheelEvent *e) override;
   void showEvent(QShowEvent *e) override;
+  void dragEnterEvent(QDragEnterEvent *e) override;
+  void dragMoveEvent(QDragMoveEvent *e) override;
+  void dropEvent(QDropEvent *e) override;
 };
 
 // Ruby overrides of Qt virtuals only reach Ruby through a C++ subclass that
@@ -135,6 +161,9 @@ protected:
   void showEvent(QShowEvent *e) override;
   void resizeEvent(QResizeEvent *e) override;
   void keyPressEvent(QKeyEvent *e) override;
+  void dragEnterEvent(QDragEnterEvent *e) override;
+  void dragMoveEvent(QDragMoveEvent *e) override;
+  void dropEvent(QDropEvent *e) override;
 };
 
 class RubyDialog : public QDialog {
@@ -165,68 +194,136 @@ public:
   explicit RubyForward(Args &&... args) : Base(std::forward<Args>(args)...) {}
 
 protected:
-  bool fwd_plain(const char *method) {
-    bool handled = false;
-    ruby_with_gvl([&] { handled = ruby_event_dispatch(this, method, Qnil); });
+  // Dispatch with a real event object and apply the handler's accept/ignore
+  // back onto the QEvent. Passing Qnil here made `event.ignore()` raise
+  // NoMethodError on nil; the raise was swallowed, so a closeEvent override
+  // could not cancel a close and 16 COSMOS handlers were silently no-ops.
+  bool fwd_ev(const char *method, int kind, QEvent *e) {
+    bool handled = false, accepted = true;
+    const int type = e ? (int)e->type() : 0;
+    ruby_with_gvl([&] {
+      VALUE ev = ruby_make_plain_event(kind, type);
+      handled  = ruby_event_dispatch(this, method, ev);
+      accepted = ruby_event_accepted(ev);
+    });
+    if (handled && e) e->setAccepted(accepted);
     return handled;
   }
 
   void paintEvent(QPaintEvent *e) override {
     BaseEventScopeT scope([this, e] { Base::paintEvent(e); });
-    if (!fwd_plain("paintEvent")) Base::paintEvent(e);
+    bool handled = false;
+    const QRect r = e->rect();
+    const int type = (int)e->type();
+    ruby_with_gvl([&] {
+      handled = ruby_event_dispatch(
+        this, "paintEvent",
+        ruby_make_paint_event(r.x(), r.y(), r.width(), r.height(), type));
+    });
+    if (!handled) Base::paintEvent(e);
   }
   void resizeEvent(QResizeEvent *e) override {
     BaseEventScopeT scope([this, e] { Base::resizeEvent(e); });
-    if (!fwd_plain("resizeEvent")) Base::resizeEvent(e);
+    if (!fwd_ev("resizeEvent", RUBY_EV_RESIZE, e)) Base::resizeEvent(e);
   }
   void closeEvent(QCloseEvent *e) override {
     BaseEventScopeT scope([this, e] { Base::closeEvent(e); });
-    if (!fwd_plain("closeEvent")) Base::closeEvent(e);
+    if (!fwd_ev("closeEvent", RUBY_EV_CLOSE, e)) Base::closeEvent(e);
   }
   void showEvent(QShowEvent *e) override {
     BaseEventScopeT scope([this, e] { Base::showEvent(e); });
-    if (!fwd_plain("showEvent")) Base::showEvent(e);
-  }
-  void wheelEvent(QWheelEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::wheelEvent(e); });
-    if (!fwd_plain("wheelEvent")) Base::wheelEvent(e);
+    if (!fwd_ev("showEvent", RUBY_EV_SHOW, e)) Base::showEvent(e);
   }
   void leaveEvent(QEvent *e) override {
     BaseEventScopeT scope([this, e] { Base::leaveEvent(e); });
-    if (!fwd_plain("leaveEvent")) Base::leaveEvent(e);
+    if (!fwd_ev("leaveEvent", RUBY_EV_LEAVE, e)) Base::leaveEvent(e);
   }
   void focusInEvent(QFocusEvent *e) override {
     BaseEventScopeT scope([this, e] { Base::focusInEvent(e); });
-    if (!fwd_plain("focusInEvent")) Base::focusInEvent(e);
+    if (!fwd_ev("focusInEvent", RUBY_EV_FOCUS, e)) Base::focusInEvent(e);
   }
   void focusOutEvent(QFocusEvent *e) override {
     BaseEventScopeT scope([this, e] { Base::focusOutEvent(e); });
-    if (!fwd_plain("focusOutEvent")) Base::focusOutEvent(e);
+    if (!fwd_ev("focusOutEvent", RUBY_EV_FOCUS, e)) Base::focusOutEvent(e);
+  }
+  // event.ignore() in a wheelEvent means "let the parent scroll instead"
+  // (cmd_tlm_server_gui.rb:90), so a handled event must NOT fall through to
+  // the base implementation, which would accept and absorb the wheel.
+  void wheelEvent(QWheelEvent *e) override {
+    BaseEventScopeT scope([this, e] { Base::wheelEvent(e); });
+    bool handled = false, accepted = true;
+    const int dx = e->angleDelta().x(), dy = e->angleDelta().y();
+    const int mods = (int)e->modifiers(), type = (int)e->type();
+    ruby_with_gvl([&] {
+      VALUE ev = ruby_make_wheel_event(dx, dy, mods, type);
+      handled  = ruby_event_dispatch(this, "wheelEvent", ev);
+      accepted = ruby_event_accepted(ev);
+    });
+    if (handled) e->setAccepted(accepted);
+    else         Base::wheelEvent(e);
   }
   void keyPressEvent(QKeyEvent *e) override {
     BaseEventScopeT scope([this, e] { Base::keyPressEvent(e); });
-    bool handled = false;
-    const int key = e->key();
+    bool handled = false, accepted = true;
+    const int key = e->key(), mods = (int)e->modifiers(), type = (int)e->type();
+    const QByteArray txt = e->text().toUtf8();
     ruby_with_gvl([&] {
-      handled = ruby_event_dispatch(this, "keyPressEvent", ruby_make_key_event(key));
+      VALUE ev = ruby_make_key_event(key, txt.constData(), mods, type);
+      handled  = ruby_event_dispatch(this, "keyPressEvent", ev);
+      accepted = ruby_event_accepted(ev);
     });
-    if (!handled) Base::keyPressEvent(e);
+    if (handled) e->setAccepted(accepted);
+    else         Base::keyPressEvent(e);
   }
   void mousePressEvent(QMouseEvent *e) override   { fwd_mouse("mousePressEvent", e); }
   void mouseMoveEvent(QMouseEvent *e) override    { fwd_mouse("mouseMoveEvent", e); }
   void mouseReleaseEvent(QMouseEvent *e) override { fwd_mouse("mouseReleaseEvent", e); }
 
+  // setAcceptDrops(true) already worked, so these widgets advertised drop
+  // support while the Ruby overrides were never reached.
+  void dragEnterEvent(QDragEnterEvent *e) override {
+    BaseEventScopeT scope([this, e] { Base::dragEnterEvent(e); });
+    if (!fwd_dnd("dragEnterEvent", RUBY_EV_DRAGENTER, e)) Base::dragEnterEvent(e);
+  }
+  void dragMoveEvent(QDragMoveEvent *e) override {
+    BaseEventScopeT scope([this, e] { Base::dragMoveEvent(e); });
+    if (!fwd_dnd("dragMoveEvent", RUBY_EV_DRAGMOVE, e)) Base::dragMoveEvent(e);
+  }
+  void dropEvent(QDropEvent *e) override {
+    BaseEventScopeT scope([this, e] { Base::dropEvent(e); });
+    if (!fwd_dnd("dropEvent", RUBY_EV_DROP, e)) Base::dropEvent(e);
+  }
+
 private:
+  bool fwd_dnd(const char *method, int kind, QDropEvent *e) {
+    bool handled = false, accepted = true, proposed = false;
+    const QMimeData *md = e->mimeData();
+    const int type = (int)e->type();
+    ruby_with_gvl([&] {
+      VALUE ev = ruby_make_drop_event(kind, md, type);
+      handled  = ruby_event_dispatch(this, method, ev);
+      accepted = ruby_event_accepted(ev);
+      proposed = ruby_event_proposed(ev);
+    });
+    if (!handled) return false;
+    if (proposed) e->acceptProposedAction();
+    else          e->setAccepted(accepted);
+    return true;
+  }
+
   void fwd_mouse(const char *method, QMouseEvent *e) {
     BaseEventScopeT scope([this, method, e] { base_mouse(method, e); });
-    bool handled = false;
-    const int x = (int)e->position().x();
-    const int y = (int)e->position().y();
-    const int b = (int)e->button();
+    bool handled = false, accepted = true;
+    const int x = (int)e->position().x(), y = (int)e->position().y();
+    const int b = (int)e->button(), bs = (int)e->buttons();
+    const int mods = (int)e->modifiers(), type = (int)e->type();
     ruby_with_gvl([&] {
-      handled = ruby_event_dispatch(this, method, ruby_make_mouse_event(x, y, b));
+      VALUE ev = ruby_make_mouse_event(x, y, b, bs, mods, type);
+      handled  = ruby_event_dispatch(this, method, ev);
+      accepted = ruby_event_accepted(ev);
     });
-    if (!handled) base_mouse(method, e);
+    if (handled) e->setAccepted(accepted);
+    else         base_mouse(method, e);
   }
   void base_mouse(const char *method, QMouseEvent *e) {
     if (!strcmp(method, "mousePressEvent"))        Base::mousePressEvent(e);

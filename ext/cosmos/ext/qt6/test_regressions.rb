@@ -546,21 +546,26 @@ puts "   (every error reported from real use lately -- FontMetrics#size,"
 puts "    itemAt(row,role), CoreApplication#exit, indexAt, currentCharFormat --"
 puts "    was a Qt method COSMOS calls that was never bound. scan_unbound.rb"
 puts "    finds them statically instead of waiting for a click.)"
-UNBOUND_BUDGET = 6    # ratchet: lower this as they get bound, never raise it
+UNBOUND_BUDGET = 0    # ratchet: lower this as they get bound, never raise it
 chk("no more than #{UNBOUND_BUDGET} unbound Qt calls remain") do
   out = `ruby -rset #{File.join(__dir__, 'scan_unbound.rb').inspect} 2>&1`
-  n = out[/TOTAL (\d+)/, 1].to_i
+  total = out[/TOTAL (\d+)/, 1]
+  n = total.to_i
   puts "    (scanner reports #{n} unbound; budget #{UNBOUND_BUDGET})"
-  n > 0 && n <= UNBOUND_BUDGET
+  # total must be present: the scanner used to die on Array#to_set with no
+  # require 'set', and a scanner that cannot run must not pass silently.
+  !total.nil? && n <= UNBOUND_BUDGET
 end
-chk('the 6 remaining need infrastructure, not a QDEF') do
-  # hasUrls/acceptProposedAction/setAccepted need Qt event objects wrapped
-  # (callbacks currently pass Qnil); closeEditor/drawControl need
-  # QStyleOption; setFormat needs a QSyntaxHighlighter subclass. Listed so
-  # they are not mistaken for oversights.
-  out = `ruby -rset #{File.join(__dir__, 'scan_unbound.rb').inspect} 2>&1`
-  names = out.lines.reject { |l| l.start_with?('TOTAL') }.map { |l| l.split[1] }.compact
-  (names - %w[hasUrls acceptProposedAction setAccepted closeEditor drawControl setFormat]).empty?
+chk('the 6 that needed infrastructure are now bound') do
+  # These needed more than a QDEF: real event objects instead of Qnil
+  # (hasUrls / acceptProposedAction / setAccepted), the QStyleOption structs
+  # (closeEditor / drawControl) and a QSyntaxHighlighter subclass (setFormat).
+  Qt::MimeData.method_defined?(:hasUrls) &&
+    Qt::DropEvent.method_defined?(:acceptProposedAction) &&
+    Qt::Event.method_defined?(:setAccepted) &&
+    Qt::StyledItemDelegate.method_defined?(:closeEditor) &&
+    Qt::Application.style.respond_to?(:drawControl) &&
+    Qt::SyntaxHighlighter.method_defined?(:setFormat)
 end
 chk('methods bound from the last sweep still resolve') do
   t = Qt::TableWidget.new; t.setRowCount(2); t.setColumnCount(2)

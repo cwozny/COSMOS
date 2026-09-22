@@ -132,6 +132,7 @@ static VALUE cLineEdit, cComboBox, cPlainTextEdit, cGroupBox;
 static VALUE cDialog, cMainWindow, cAbstractScrollArea, cAbstractItemView;
 static VALUE cAbstractItemModel;   // needed by the model read-back accessors
 static VALUE cLayout, cBoxLayout, cVBoxLayout, cHBoxLayout, cGridLayout, cAction;
+static VALUE cIcon;   // declared early: ctor_action below takes an icon overload
 static VALUE g_procs;   // GC anchor for connected Ruby blocks
 void ruby_invoke_proc_once(VALUE proc);   // runs a one-shot block, then unanchors it
 
@@ -155,7 +156,12 @@ struct QtWrap {
   bool owned;
 };
 
-static std::map<QObject *, VALUE> g_objmap;   // weak: entries removed on free
+// The QtWrap* is carried alongside the wrapper VALUE so that a destroyed()
+// arriving during a GC sweep can mark the wrapper dangling without touching
+// a Ruby object. qtwrap_free erases the map entry before it xfrees the
+// struct, so a live entry always means a live struct.
+struct ObjRef { VALUE v; QtWrap *w; };
+static std::map<QObject *, ObjRef> g_objmap;   // weak: entries removed on free
 
 // app.exec() releases the GVL, so Qt's event loop and a Ruby background thread
 // run genuinely in parallel -- one mutating g_objmap from a destroyed() signal,
@@ -237,18 +243,21 @@ static void on_destroyed(QObject *o) {
   VALUE v;
   {
   ObjMapLock lk(g_objmap_mutex);
-  std::map<QObject *, VALUE>::iterator it = g_objmap.find(o);
+  std::map<QObject *, ObjRef>::iterator it = g_objmap.find(o);
   if (it == g_objmap.end()) return;      // already reaped by qtwrap_free
   if (g_in_gc_free) {
-    // THIS thread is inside a GC sweep: drop the map entry only. Touching the
-    // Ruby wrapper
-    // here can dereference an already-swept object. The wrapper is left with a
-    // stale ptr, but it is unreachable from Ruby and its own free() will not
-    // delete it (owned == false), so this is safe.
+    // THIS thread is inside a GC sweep, so the wrapper VALUE may itself have
+    // been swept and must not be touched. The QtWrap behind it is still
+    // allocated, and clearing that needs no Ruby API and no GVL.
+    // Dropping only the map entry (as this used to) left a child wrapper that
+    // Ruby still referenced pointing at freed memory while disposed? answered
+    // false -- so every COSMOS `unless widget.disposed?` guard walked straight
+    // into a use-after-free.
+    if (it->second.w) { it->second.w->ptr = NULL; it->second.w->owned = false; }
     g_objmap.erase(it);
     return;
   }
-  v = it->second;
+  v = it->second.v;
   g_objmap.erase(it);
   }   // lock released before re-entering Ruby (see LOCK ORDER above)
   // Touching a Ruby object requires the GVL; this can run from Qt's event
@@ -280,8 +289,8 @@ static VALUE wrap_obj(VALUE klass, QObject *p, bool owned = true) {
   if (!p) return Qnil;
   {
     ObjMapLock lk(g_objmap_mutex);
-    std::map<QObject *, VALUE>::iterator it = g_objmap.find(p);
-    if (it != g_objmap.end()) return it->second;   // identity: one wrapper per object
+    std::map<QObject *, ObjRef>::iterator it = g_objmap.find(p);
+    if (it != g_objmap.end()) return it->second.v;   // identity: one wrapper per object
   }
   QtWrap *w;
   VALUE o = TypedData_Make_Struct(klass, QtWrap, &qtwrap_type, w);
@@ -289,7 +298,7 @@ static VALUE wrap_obj(VALUE klass, QObject *p, bool owned = true) {
   w->owned = owned;
   {
     ObjMapLock lk(g_objmap_mutex);
-    std::map<QObject *, VALUE>::iterator it = g_objmap.find(p);
+    std::map<QObject *, ObjRef>::iterator it = g_objmap.find(p);
     if (it != g_objmap.end()) {
       // Lost the race. Disarm our loser before dropping it: left armed, its
       // qtwrap_free would erase the WINNER's map entry (so the surviving
@@ -297,9 +306,9 @@ static VALUE wrap_obj(VALUE klass, QObject *p, bool owned = true) {
       // QObject the winner still points at.
       w->ptr = NULL;
       w->owned = false;
-      return it->second;
+      return it->second.v;
     }
-    g_objmap[p] = o;
+    g_objmap[p] = ObjRef{o, w};
   }
   QObject::connect(p, &QObject::destroyed, p, &on_destroyed);
   return o;
@@ -344,7 +353,6 @@ static VALUE app_process_events(VALUE self) {
 static void *exec_app_thunk(void *) { QApplication::exec(); return NULL; }
 
 static VALUE app_exec(VALUE self) {
-  GvlReleaseScope gvl;
   rb_thread_call_without_gvl(exec_app_thunk, NULL, RUBY_UBF_IO, NULL);
   return INT2NUM(0);
 }
@@ -356,7 +364,6 @@ static void *run_exec(void *) { QApplication::exec(); return NULL; }
 
 static VALUE app_exec_for(VALUE self, VALUE ms) {
   QTimer::singleShot(NUM2INT(ms), qApp, &QCoreApplication::quit);
-  GvlReleaseScope gvl;
   rb_thread_call_without_gvl(run_exec, NULL, RUBY_UBF_IO, NULL);
   return Qnil;
 }
@@ -398,7 +405,7 @@ static void attach(VALUE self, QObject *p, bool owned) {
   QtWrap *w = get_wrap(self);
   w->ptr = p;
   w->owned = owned;
-  { ObjMapLock lk(g_objmap_mutex); g_objmap[p] = self; }
+  { ObjMapLock lk(g_objmap_mutex); g_objmap[p] = ObjRef{self, w}; }
   QObject::connect(p, &QObject::destroyed, p, &on_destroyed);
 }
 
@@ -437,19 +444,27 @@ static VALUE string_arg(int argc, VALUE *argv) {
   return Qnil;
 }
 
-// KNOWN GAP: ctor_plain and ctor_str ignore the parent argument, so a widget
-// built as Qt::X.new(parent) comes back parentless and -- having no parent to
-// own it -- is marked Ruby-owned and freed by the GC as soon as Ruby drops its
-// reference, even though Qt's parent chain was supposed to keep it alive.
-// Layouts do NOT come through here: ctor_layout below honours the parent and
-// sets g_ctor_took_parent. That is load-bearing -- Qt::VBoxLayout.new(@widget)
-// must install the layout ON @widget or everything added to it is orphaned
-// (interfaces_tab.rb:105). Doing the same for widgets needs ownership tracking
-// for parented objects, which is not implemented yet.
-template <typename T> static QObject *ctor_plain(int, VALUE *) { return new T(); }
+// Qt::X.new(parent) installs the object into Qt's parent chain, and
+// g_ctor_took_parent then tells qt_initialize not to also make Ruby's GC an
+// owner. Dropping the parent (as these used to) produced a parentless object
+// that was marked Ruby-owned, so anything retained only through Qt's parent
+// chain was deleted at the next GC and never rendered in its intended parent.
+// Layouts have always come through ctor_layout below, which does the same
+// thing -- Qt::VBoxLayout.new(@widget) must install the layout ON @widget or
+// everything added to it is orphaned (interfaces_tab.rb:105).
+template <typename T> static QObject *ctor_plain(int argc, VALUE *argv) {
+  QWidget *p = parent_arg(argc, argv);
+  if (p) { g_ctor_took_parent = true; return new T(p); }
+  return new T();
+}
 
 template <typename T> static QObject *ctor_str(int argc, VALUE *argv) {
   VALUE t = string_arg(argc, argv);
+  QWidget *p = parent_arg(argc, argv);
+  if (p) {
+    g_ctor_took_parent = true;
+    return NIL_P(t) ? new T(p) : new T(rb_to_qs(t), p);
+  }
   return NIL_P(t) ? new T() : new T(rb_to_qs(t));
 }
 
@@ -528,18 +543,33 @@ static QObject *ctor_box_layout(int argc, VALUE *argv) {
   return new QBoxLayout(dir);
 }
 
+template <typename T> static T *get_val(VALUE self);   // defined below
+
 // Qt::Action.new(text, parent) -- the parent matters: passing a QActionGroup
 // is how COSMOS builds exclusive action groups (config_editor.rb), and Qt only
 // adds the action to the group via that parent link.
+// COSMOS uses all four qtbindings overloads, so scan every argument by type
+// rather than by position: Action.new(text), Action.new(text, parent),
+// Action.new(icon, text, parent) and Action.new(parent).
 static QObject *ctor_action(int argc, VALUE *argv) {
   QString text;
-  if (argc > 0 && RB_TYPE_P(argv[0], T_STRING)) text = rb_to_qs(argv[0]);
+  QIcon icon;
+  bool have_text = false, have_icon = false;
   QObject *parent = NULL;
-  for (int i = 1; i < argc; i++) {
-    if (NIL_P(argv[i]) || RB_TYPE_P(argv[i], T_STRING)) continue;
-    if (rb_obj_is_kind_of(argv[i], cQtBase)) { parent = get_obj(argv[i]); break; }
+  for (int i = 0; i < argc; i++) {
+    if (NIL_P(argv[i])) continue;
+    if (!have_text && RB_TYPE_P(argv[i], T_STRING)) {
+      text = rb_to_qs(argv[i]); have_text = true;
+    } else if (!have_icon && rb_obj_is_kind_of(argv[i], cIcon)) {
+      icon = *get_val<QIcon>(argv[i]); have_icon = true;
+    } else if (!parent && rb_obj_is_kind_of(argv[i], cQtBase)) {
+      parent = get_obj(argv[i]);
+    }
   }
-  QAction *a = new QAction(text, parent);
+  QAction *a = have_icon ? new QAction(icon, text, parent) : new QAction(text, parent);
+  // A parented QAction belongs to Qt. Without this the GC also owns it and
+  // the second delete is a use-after-free at interpreter shutdown.
+  if (parent) g_ctor_took_parent = true;
   if (QActionGroup *g = qobject_cast<QActionGroup *>(parent)) g->addAction(a);
   return a;
 }
@@ -854,29 +884,37 @@ static VALUE msgbox_static(int argc, VALUE *argv, VALUE klass) {
     if (d != (int)QMessageBox::NoButton)
       box.setDefaultButton((QMessageBox::StandardButton)d);
   }
-  return INT2NUM(box.exec());
+  int rc = 0;
+  ruby_without_gvl([&] { rc = box.exec(); });
+  return INT2NUM(rc);
 }
 
 // ---- Qt::FileDialog --------------------------------------------------------
 static VALUE filedlg_open(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, caption, dir, filter;
   rb_scan_args(argc, argv, "04", &parent, &caption, &dir, &filter);
-  QString f = QFileDialog::getOpenFileName(opt_parent(parent), rb_to_qs(caption),
-                                           rb_to_qs(dir), rb_to_qs(filter));
+  QWidget *pw = opt_parent(parent);
+  const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
+  QString f;
+  ruby_without_gvl([&] { f = QFileDialog::getOpenFileName(pw, cap, d, fl); });
   return f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
 }
 static VALUE filedlg_save(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, caption, dir, filter;
   rb_scan_args(argc, argv, "04", &parent, &caption, &dir, &filter);
-  QString f = QFileDialog::getSaveFileName(opt_parent(parent), rb_to_qs(caption),
-                                           rb_to_qs(dir), rb_to_qs(filter));
+  QWidget *pw = opt_parent(parent);
+  const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
+  QString f;
+  ruby_without_gvl([&] { f = QFileDialog::getSaveFileName(pw, cap, d, fl); });
   return f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
 }
 static VALUE filedlg_open_many(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, caption, dir, filter;
   rb_scan_args(argc, argv, "04", &parent, &caption, &dir, &filter);
-  QStringList fs = QFileDialog::getOpenFileNames(opt_parent(parent), rb_to_qs(caption),
-                                                 rb_to_qs(dir), rb_to_qs(filter));
+  QWidget *pw = opt_parent(parent);
+  const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
+  QStringList fs;
+  ruby_without_gvl([&] { fs = QFileDialog::getOpenFileNames(pw, cap, d, fl); });
   VALUE ary = rb_ary_new();
   for (int i = 0; i < fs.size(); i++)
     rb_ary_push(ary, rb_str_new2(fs.at(i).toUtf8().constData()));
@@ -885,7 +923,10 @@ static VALUE filedlg_open_many(int argc, VALUE *argv, VALUE klass) {
 static VALUE filedlg_dir(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, caption, dir;
   rb_scan_args(argc, argv, "03", &parent, &caption, &dir);
-  QString f = QFileDialog::getExistingDirectory(opt_parent(parent), rb_to_qs(caption), rb_to_qs(dir));
+  QWidget *pw = opt_parent(parent);
+  const QString cap = rb_to_qs(caption), d = rb_to_qs(dir);
+  QString f;
+  ruby_without_gvl([&] { f = QFileDialog::getExistingDirectory(pw, cap, d); });
   return f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
 }
 
@@ -923,9 +964,22 @@ static VALUE cFormLayout, cMenu, cMenuBar, cToolBar, cStatusBar, cProgressBar;
 static VALUE cRadioButton, cSlider, cSpinBox, cDoubleSpinBox, cTextEdit, cTimer;
 
 // ---- table -----------------------------------------------------------------
+// COSMOS reopens Qt::TableWidgetItem#initialize to call
+// setFlags(Qt::ItemIsEnabled) -- "the default COSMOS setting which makes
+// table cells read only" (qt.rb:317, table_manager.rb:26). A singleton `new`
+// that wrapped the pointer directly never ran initialize, so every cell kept
+// QTableWidgetItem's editable/checkable defaults instead. Construct, then
+// call initialize. The C implementation lives in an included module so the
+// reopened version's `super(string)` still reaches it.
 static VALUE twitem_new(int argc, VALUE *argv, VALUE klass) {
+  VALUE obj = wrap_ptr<QTableWidgetItem>(klass, new QTableWidgetItem());
+  rb_obj_call_init(obj, argc, argv);
+  return obj;
+}
+static VALUE twitem_initialize(int argc, VALUE *argv, VALUE self) {
   VALUE t; rb_scan_args(argc, argv, "01", &t);
-  return wrap_ptr<QTableWidgetItem>(klass, new QTableWidgetItem(rb_to_qs(t)));
+  if (!NIL_P(t)) get_ptr<QTableWidgetItem>(self)->setText(rb_to_qs(t));
+  return self;
 }
 static VALUE twitem_text(VALUE self) {
   return rb_str_new2(get_ptr<QTableWidgetItem>(self)->text().toUtf8().constData());
@@ -950,10 +1004,39 @@ static VALUE tw_set_hheader(VALUE self, VALUE c, VALUE item) {
 
 // ---- tree ------------------------------------------------------------------
 static VALUE tritem_new(int argc, VALUE *argv, VALUE klass) {
+  VALUE obj = wrap_ptr<QTreeWidgetItem>(klass, new QTreeWidgetItem());
+  rb_obj_call_init(obj, argc, argv);
+  return obj;
+}
+static VALUE tritem_initialize(int argc, VALUE *argv, VALUE self) {
   VALUE t; rb_scan_args(argc, argv, "01", &t);
-  QTreeWidgetItem *i = new QTreeWidgetItem();
-  if (!NIL_P(t)) i->setText(0, rb_to_qs(t));
-  return wrap_ptr<QTreeWidgetItem>(klass, i);
+  if (NIL_P(t)) return self;
+  QTreeWidgetItem *i = get_ptr<QTreeWidgetItem>(self);
+  if (RB_TYPE_P(t, T_ARRAY)) {
+    // qtbindings' QStringList overload. Test Runner builds every suite node
+    // as Qt::TreeWidgetItem.new([name]) (test_runner.rb:723), which used to
+    // raise TypeError and leave the tree empty.
+    for (long c = 0; c < RARRAY_LEN(t); c++)
+      i->setText((int)c, rb_to_qs(RARRAY_AREF(t, c)));
+  } else {
+    i->setText(0, rb_to_qs(t));
+  }
+  return self;
+}
+// qt.rb:676 builds Qt::ListWidgetItem.new(icon, text); there was no ctor.
+static VALUE lwitem_new(int argc, VALUE *argv, VALUE klass) {
+  VALUE obj = wrap_ptr<QListWidgetItem>(klass, new QListWidgetItem());
+  rb_obj_call_init(obj, argc, argv);
+  return obj;
+}
+static VALUE lwitem_initialize(int argc, VALUE *argv, VALUE self) {
+  QListWidgetItem *it = get_ptr<QListWidgetItem>(self);
+  for (int i = 0; i < argc; i++) {
+    if (NIL_P(argv[i])) continue;
+    if (RB_TYPE_P(argv[i], T_STRING))           it->setText(rb_to_qs(argv[i]));
+    else if (rb_obj_is_kind_of(argv[i], cIcon)) it->setIcon(*get_val<QIcon>(argv[i]));
+  }
+  return self;
 }
 static VALUE tritem_text(VALUE self, VALUE col) {
   return rb_str_new2(get_ptr<QTreeWidgetItem>(self)->text(NUM2INT(col)).toUtf8().constData());
@@ -1214,8 +1297,10 @@ static VALUE inputdlg_get_text(int argc, VALUE *argv, VALUE klass) {
   bool ok = false;
   QLineEdit::EchoMode mode = NIL_P(echo)
       ? QLineEdit::Normal : (QLineEdit::EchoMode)NUM2INT(echo);
-  QString r = QInputDialog::getText(opt_parent(parent), rb_to_qs(title),
-                                    rb_to_qs(label), mode, rb_to_qs(text), &ok);
+  QWidget *pw = opt_parent(parent);
+  const QString ti = rb_to_qs(title), la = rb_to_qs(label), tx = rb_to_qs(text);
+  QString r;
+  ruby_without_gvl([&] { r = QInputDialog::getText(pw, ti, la, mode, tx, &ok); });
   if (!NIL_P(okref) && rb_respond_to(okref, rb_intern("value=")))
     rb_funcall(okref, rb_intern("value="), 1, ok ? Qtrue : Qfalse);
   return ok ? rb_str_new2(r.toUtf8().constData()) : Qnil;
@@ -1227,12 +1312,14 @@ static VALUE inputdlg_get_double(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, title, label, value, lo, hi, dec, okref;
   rb_scan_args(argc, argv, "35", &parent, &title, &label, &value, &lo, &hi, &dec, &okref);
   bool ok = false;
-  double r = QInputDialog::getDouble(
-      opt_parent(parent), rb_to_qs(title), rb_to_qs(label),
-      NIL_P(value) ? 0.0 : NUM2DBL(value),
-      NIL_P(lo) ? -2147483647.0 : NUM2DBL(lo),
-      NIL_P(hi) ?  2147483647.0 : NUM2DBL(hi),
-      NIL_P(dec) ? 1 : NUM2INT(dec), &ok);
+  QWidget *pw = opt_parent(parent);
+  const QString ti = rb_to_qs(title), la = rb_to_qs(label);
+  const double v  = NIL_P(value) ? 0.0 : NUM2DBL(value);
+  const double lv = NIL_P(lo) ? -2147483647.0 : NUM2DBL(lo);
+  const double hv = NIL_P(hi) ?  2147483647.0 : NUM2DBL(hi);
+  const int    dv = NIL_P(dec) ? 1 : NUM2INT(dec);
+  double r = 0.0;
+  ruby_without_gvl([&] { r = QInputDialog::getDouble(pw, ti, la, v, lv, hv, dv, &ok); });
   if (!NIL_P(okref) && rb_respond_to(okref, rb_intern("value=")))
     rb_funcall(okref, rb_intern("value="), 1, ok ? Qtrue : Qfalse);
   return ok ? DBL2NUM(r) : Qnil;
@@ -1243,7 +1330,7 @@ static VALUE lineedit_set_echo(VALUE self, VALUE m) {
 }
 
 // ---- painting value types (Pen / Brush / Gradient / FontMetrics) ----------
-static VALUE cPen, cBrush, cLinearGradient, cFontMetrics, cPixmap, cIcon, cImage, cSettings;
+static VALUE cPen, cBrush, cLinearGradient, cFontMetrics, cPixmap, cImage, cSettings;
 
 // COSMOS caches colours in Hashes (BRUSHES[color], PENS[color]), so QColor
 // wrappers need value equality and a matching hash, not object identity.
@@ -1834,7 +1921,6 @@ static VALUE dialog_exec(VALUE self) {
   DlgExec e;
   e.dlg = qcast<QDialog>(self);
   e.result = 0;
-  GvlReleaseScope gvl;          // may nest inside app.exec
   rb_thread_call_without_gvl(exec_dialog_thunk, &e, RUBY_UBF_IO, NULL);
   return INT2NUM(e.result);
 }
@@ -2867,9 +2953,9 @@ bool ruby_event_dispatch_n(QObject *obj, const char *method, int argc, VALUE *ar
   VALUE self;
   {
     ObjMapLock lk(g_objmap_mutex);
-    std::map<QObject *, VALUE>::iterator it = g_objmap.find(obj);
+    std::map<QObject *, ObjRef>::iterator it = g_objmap.find(obj);
     if (it == g_objmap.end()) return false;
-    self = it->second;
+    self = it->second.v;
   }
   ID mid = rb_intern(method);
   if (!rb_respond_to(self, mid)) return false;   // no Ruby override
@@ -2883,20 +2969,135 @@ bool ruby_event_dispatch(QObject *obj, const char *method, VALUE arg) {
   return ruby_event_dispatch_n(obj, method, 1, &arg);
 }
 
-VALUE ruby_make_key_event(int key) {
-  if (NIL_P(cKeyEventCls)) return Qnil;
-  VALUE ev = rb_obj_alloc(cKeyEventCls);
-  rb_ivar_set(ev, rb_intern("@key"), INT2NUM(key));
+// ---- event objects --------------------------------------------------------
+// A QEvent lives only for the duration of its dispatch, so Ruby is handed a
+// snapshot object rather than a pointer: a handler that stashed the event
+// would otherwise be left holding freed memory. accept/ignore is recorded on
+// the snapshot and written back onto the real QEvent once dispatch returns,
+// which is what lets a closeEvent override actually cancel the close.
+// Previously every no-argument virtual passed Qnil, so `event.ignore` raised
+// NoMethodError on nil, the raise was swallowed, and the window closed anyway.
+static VALUE cEventCls = Qnil, cCloseEventCls = Qnil, cPaintEventCls = Qnil,
+             cWheelEventCls = Qnil, cShowEventCls = Qnil, cResizeEventCls = Qnil,
+             cFocusEventCls = Qnil, cLeaveEventCls = Qnil,
+             cDragEnterEventCls = Qnil, cDragMoveEventCls = Qnil,
+             cDropEventCls = Qnil, cMimeDataCls = Qnil;
+
+static VALUE new_event(VALUE klass, int type) {
+  if (NIL_P(klass)) return Qnil;
+  VALUE ev = rb_obj_alloc(klass);
+  rb_ivar_set(ev, rb_intern("@accepted"), Qtrue);  // Qt's default for these
+  rb_ivar_set(ev, rb_intern("@type"), INT2NUM(type));
   return ev;
 }
-VALUE ruby_make_mouse_event(int x, int y, int button) {
-  if (NIL_P(cMouseEventCls)) return Qnil;
-  VALUE ev = rb_obj_alloc(cMouseEventCls);
-  rb_ivar_set(ev, rb_intern("@x"), INT2NUM(x));
-  rb_ivar_set(ev, rb_intern("@y"), INT2NUM(y));
-  rb_ivar_set(ev, rb_intern("@button"), INT2NUM(button));
+
+VALUE ruby_make_plain_event(int kind, int type) {
+  VALUE k;
+  switch (kind) {
+    case RUBY_EV_CLOSE:  k = cCloseEventCls;  break;
+    case RUBY_EV_SHOW:   k = cShowEventCls;   break;
+    case RUBY_EV_RESIZE: k = cResizeEventCls; break;
+    case RUBY_EV_FOCUS:  k = cFocusEventCls;  break;
+    case RUBY_EV_LEAVE:  k = cLeaveEventCls;  break;
+    default:             k = cEventCls;       break;
+  }
+  return new_event(k, type);
+}
+
+VALUE ruby_make_paint_event(int x, int y, int w, int h, int type) {
+  VALUE ev = new_event(cPaintEventCls, type);
+  if (!NIL_P(ev))
+    rb_ivar_set(ev, rb_intern("@rect"), wrap_val<QRect>(cRect, QRect(x, y, w, h)));
   return ev;
 }
+
+VALUE ruby_make_wheel_event(int dx, int dy, int mods, int type) {
+  VALUE ev = new_event(cWheelEventCls, type);
+  if (NIL_P(ev)) return ev;
+  rb_ivar_set(ev, rb_intern("@angle_x"),   INT2NUM(dx));
+  rb_ivar_set(ev, rb_intern("@angle_y"),   INT2NUM(dy));
+  rb_ivar_set(ev, rb_intern("@modifiers"), INT2NUM(mods));
+  return ev;
+}
+
+VALUE ruby_make_key_event(int key, const char *text, int mods, int type) {
+  VALUE ev = new_event(cKeyEventCls, type);
+  if (NIL_P(ev)) return ev;
+  rb_ivar_set(ev, rb_intern("@key"),       INT2NUM(key));
+  rb_ivar_set(ev, rb_intern("@text"),      rb_str_new2(text ? text : ""));
+  rb_ivar_set(ev, rb_intern("@modifiers"), INT2NUM(mods));
+  return ev;
+}
+
+VALUE ruby_make_mouse_event(int x, int y, int button, int buttons, int mods, int type) {
+  VALUE ev = new_event(cMouseEventCls, type);
+  if (NIL_P(ev)) return ev;
+  rb_ivar_set(ev, rb_intern("@x"),         INT2NUM(x));
+  rb_ivar_set(ev, rb_intern("@y"),         INT2NUM(y));
+  rb_ivar_set(ev, rb_intern("@button"),    INT2NUM(button));
+  rb_ivar_set(ev, rb_intern("@buttons"),   INT2NUM(buttons));
+  rb_ivar_set(ev, rb_intern("@modifiers"), INT2NUM(mods));
+  rb_ivar_set(ev, rb_intern("@pos"),       wrap_val<QPoint>(cPoint, QPoint(x, y)));
+  return ev;
+}
+
+// The QMimeData behind a drop also dies with the event, so it is snapshotted
+// to exactly what COSMOS reads off it: hasUrls, urls and text.
+static VALUE make_mime_snapshot(const void *mimev) {
+  const QMimeData *md = static_cast<const QMimeData *>(mimev);
+  if (NIL_P(cMimeDataCls)) return Qnil;
+  VALUE m = rb_obj_alloc(cMimeDataCls);
+  rb_ivar_set(m, rb_intern("@hasUrls"), (md && md->hasUrls()) ? Qtrue : Qfalse);
+  VALUE arr = rb_ary_new();
+  if (md) {
+    const QList<QUrl> us = md->urls();
+    for (int i = 0; i < us.size(); i++) rb_ary_push(arr, wrap_val<QUrl>(cUrl, us.at(i)));
+  }
+  rb_ivar_set(m, rb_intern("@urls"), arr);
+  rb_ivar_set(m, rb_intern("@text"),
+              rb_str_new2(md ? md->text().toUtf8().constData() : ""));
+  return m;
+}
+
+VALUE ruby_make_drop_event(int kind, const void *mime, int type) {
+  VALUE k = (kind == RUBY_EV_DRAGENTER) ? cDragEnterEventCls
+          : (kind == RUBY_EV_DRAGMOVE)  ? cDragMoveEventCls
+                                        : cDropEventCls;
+  VALUE ev = new_event(k, type);
+  if (NIL_P(ev)) return ev;
+  rb_ivar_set(ev, rb_intern("@proposed"), Qfalse);
+  rb_ivar_set(ev, rb_intern("@mimeData"), make_mime_snapshot(mime));
+  return ev;
+}
+
+bool ruby_event_accepted(VALUE ev) {
+  if (NIL_P(ev)) return true;
+  return RTEST(rb_ivar_get(ev, rb_intern("@accepted")));
+}
+bool ruby_event_proposed(VALUE ev) {
+  if (NIL_P(ev)) return false;
+  return RTEST(rb_ivar_get(ev, rb_intern("@proposed")));
+}
+
+static VALUE event_accept(VALUE self) {
+  rb_ivar_set(self, rb_intern("@accepted"), Qtrue);  return Qnil;
+}
+static VALUE event_ignore(VALUE self) {
+  rb_ivar_set(self, rb_intern("@accepted"), Qfalse); return Qnil;
+}
+static VALUE event_is_accepted(VALUE self) {
+  return rb_ivar_get(self, rb_intern("@accepted"));
+}
+static VALUE event_set_accepted(VALUE self, VALUE v) {
+  rb_ivar_set(self, rb_intern("@accepted"), RTEST(v) ? Qtrue : Qfalse); return v;
+}
+static VALUE event_accept_proposed(VALUE self) {
+  rb_ivar_set(self, rb_intern("@proposed"), Qtrue);
+  rb_ivar_set(self, rb_intern("@accepted"), Qtrue);
+  return Qnil;
+}
+// Qt4 reported one number per wheel notch; Qt6 splits it into angleDelta.
+static VALUE wheel_delta(VALUE self) { return rb_ivar_get(self, rb_intern("@angle_y")); }
 
 // ---- remaining widget/painter odds and ends --------------------------------
 static VALUE widget_set_background_role(VALUE self, VALUE r) {
@@ -2995,6 +3196,13 @@ VALUE ruby_value_from_meta(int typeId, void *data) {
 VALUE ruby_wrap_model_index(const QModelIndex &idx) {
   return wrap_val<QModelIndex>(cModelIndex, idx);
 }
+// A copy, not a pointer: the QStyleOptionViewItem the view hands the delegate
+// is a stack temporary that is gone the moment paint() returns.
+VALUE ruby_wrap_style_option_view_item(const void *opt) {
+  if (NIL_P(cStyleOptionViewItemKlass)) return Qnil;
+  return wrap_val<QStyleOptionViewItem>(
+      cStyleOptionViewItemKlass, *static_cast<const QStyleOptionViewItem *>(opt));
+}
 // Non-owning: the delegate's QPainter belongs to the view.
 VALUE ruby_wrap_painter_borrowed(QPainter *p2) {
   PainterWrap *w;
@@ -3007,8 +3215,8 @@ VALUE ruby_wrap_qobject(QObject *o) {
   if (!o) return Qnil;
   {
     ObjMapLock lk(g_objmap_mutex);
-    std::map<QObject *, VALUE>::iterator it = g_objmap.find(o);
-    if (it != g_objmap.end()) return it->second;
+    std::map<QObject *, ObjRef>::iterator it = g_objmap.find(o);
+    if (it != g_objmap.end()) return it->second.v;
   }
   VALUE fallback = qobject_cast<QWidget *>(o) ? cWidget : cQtObject;
   return wrap_obj(best_ruby_class(o, fallback), o, false);
@@ -3036,9 +3244,9 @@ VALUE ruby_event_call(QObject *obj, const char *method, int argc, VALUE *argv, b
   VALUE self;
   {
     ObjMapLock lk(g_objmap_mutex);
-    std::map<QObject *, VALUE>::iterator it = g_objmap.find(obj);
+    std::map<QObject *, ObjRef>::iterator it = g_objmap.find(obj);
     if (it == g_objmap.end()) return Qnil;
-    self = it->second;
+    self = it->second.v;
   }
   ID mid = rb_intern(method);
   if (!rb_respond_to(self, mid)) return Qnil;
@@ -3722,6 +3930,262 @@ static VALUE variant_from_value(VALUE klass, VALUE v) {
   return wrap_val<QVariant>(cVariant, QVariant(rb_to_qs(v)));
 }
 
+
+// Qt::Shortcut was declared but never given a constructor, so every
+// Qt::Shortcut.new fell through to ctor_plain<QObject> and built a bare
+// QObject: the key sequence was never installed and connect() silently took
+// the "no such signal" path and returned true. 9 shortcuts were dead
+// (script_runner_frame.rb:160-166 F5/F6/F7/F10, Ctrl+Tab, Delete).
+static QObject *ctor_shortcut(int argc, VALUE *argv) {
+  QKeySequence ks;
+  QWidget *p = parent_arg(argc, argv);
+  for (int i = 0; i < argc; i++) {
+    if (rb_obj_is_kind_of(argv[i], cKeySequence)) { ks = *get_val<QKeySequence>(argv[i]); break; }
+    if (RB_TYPE_P(argv[i], T_STRING))  { ks = QKeySequence(rb_to_qs(argv[i])); break; }
+    if (RB_TYPE_P(argv[i], T_FIXNUM))  { ks = QKeySequence((Qt::Key)NUM2INT(argv[i])); break; }
+  }
+  QShortcut *sc = new QShortcut(ks, p);
+  if (p) g_ctor_took_parent = true;
+  return sc;
+}
+
+// Ruby syntax colouring in Script Runner / Test Runner / Config Editor.
+// highlightBlock is pure virtual and setFormat is protected, so a forwarding
+// subclass is the only way to reach them from Ruby.
+class RubyHighlighter : public QSyntaxHighlighter {
+public:
+  explicit RubyHighlighter(QTextDocument *doc) : QSyntaxHighlighter(doc) {}
+  using QSyntaxHighlighter::setFormat;
+protected:
+  void highlightBlock(const QString &text) override {
+    const QByteArray t = text.toUtf8();
+    ruby_with_gvl([&] {
+      ruby_event_dispatch(this, "highlightBlock", rb_str_new2(t.constData()));
+    });
+  }
+};
+static QObject *ctor_highlighter(int argc, VALUE *argv) {
+  QTextDocument *doc = NULL;
+  for (int i = 0; i < argc; i++)
+    if (!NIL_P(argv[i]) && rb_obj_is_kind_of(argv[i], cQtBase))
+      doc = qobject_cast<QTextDocument *>(get_obj(argv[i]));
+  RubyHighlighter *h = new RubyHighlighter(doc);
+  if (doc) g_ctor_took_parent = true;   // the document parents it
+  return h;
+}
+static VALUE highlighter_set_format(VALUE self, VALUE start, VALUE count, VALUE fmt) {
+  RubyHighlighter *h = static_cast<RubyHighlighter *>(
+      qobject_cast<QSyntaxHighlighter *>(get_obj(self)));
+  if (!h) rb_raise(rb_eTypeError, "not a Qt::SyntaxHighlighter");
+  h->setFormat(NUM2INT(start), NUM2INT(count), *get_val<QTextCharFormat>(fmt));
+  return self;
+}
+
+// qt.rb:645-656 installs a filter object that eats Delete/Backspace; none of
+// installEventFilter, removeEventFilter or eventFilter was bound, so
+// Qt::ColorListWidget#set_read_only raised NoMethodError.
+class RubyFilterObject : public QObject {
+public:
+  explicit RubyFilterObject(QObject *parent = nullptr) : QObject(parent) {}
+protected:
+  bool eventFilter(QObject *watched, QEvent *ev) override {
+    bool filtered = false, handled = false;
+    const int type = (int)ev->type();
+    const int key = (ev->type() == QEvent::KeyPress || ev->type() == QEvent::KeyRelease)
+                      ? static_cast<QKeyEvent *>(ev)->key() : 0;
+    ruby_with_gvl([&] {
+      VALUE args[2];
+      args[0] = ruby_wrap_qobject(watched);
+      args[1] = (key ? ruby_make_key_event(key, "", 0, type)
+                     : ruby_make_plain_event(RUBY_EV_PLAIN, type));
+      VALUE r = ruby_event_call(this, "eventFilter", 2, args, &handled);
+      filtered = handled && RTEST(r);
+    });
+    return filtered ? true : QObject::eventFilter(watched, ev);
+  }
+};
+static VALUE obj_install_event_filter(VALUE self, VALUE f) {
+  get_obj(self)->installEventFilter(get_obj(f));
+  return self;
+}
+static VALUE obj_remove_event_filter(VALUE self, VALUE f) {
+  get_obj(self)->removeEventFilter(get_obj(f));
+  return self;
+}
+
+// cmd_param_table_item_delegate.rb:33-34 emits commitData then closeEditor;
+// neither was bound, so the user's Cmd Sender selection was silently dropped.
+static VALUE delegate_commit_data(VALUE self, VALUE editor) {
+  QAbstractItemDelegate *d = qcast<QAbstractItemDelegate>(self);
+  emit d->commitData(qobject_cast<QWidget *>(get_obj(editor)));
+  return self;
+}
+static VALUE delegate_close_editor(int argc, VALUE *argv, VALUE self) {
+  VALUE editor, hint;
+  rb_scan_args(argc, argv, "11", &editor, &hint);
+  QAbstractItemDelegate *d = qcast<QAbstractItemDelegate>(self);
+  QAbstractItemDelegate::EndEditHint h = NIL_P(hint)
+      ? QAbstractItemDelegate::NoHint
+      : (QAbstractItemDelegate::EndEditHint)NUM2INT(hint);
+  emit d->closeEditor(qobject_cast<QWidget *>(get_obj(editor)), h);
+  return self;
+}
+
+// ---- QStyle drawing path ---------------------------------------------------
+// cmd_param_table_item_delegate.rb#paint draws a combo box as a button so the
+// user can tell the cell is clickable, and table_manager.rb does the same.
+// The option structs existed as empty classes with no storage and no
+// constructor, so every one of those paints raised.
+static VALUE cStyleOptionButtonKlass = Qnil;
+
+static VALUE sovi_new(int argc, VALUE *argv, VALUE klass) {
+  VALUE src;
+  rb_scan_args(argc, argv, "01", &src);
+  // Qt4's StyleOptionViewItemV4.new(option) copy constructor.
+  if (!NIL_P(src) && rb_obj_is_kind_of(src, cStyleOptionViewItemKlass))
+    return wrap_val<QStyleOptionViewItem>(klass, *get_val<QStyleOptionViewItem>(src));
+  return wrap_val<QStyleOptionViewItem>(klass, QStyleOptionViewItem());
+}
+static VALUE sovi_rect(VALUE self) {
+  return wrap_val<QRect>(cRect, get_val<QStyleOptionViewItem>(self)->rect);
+}
+static VALUE sovi_set_rect(VALUE self, VALUE r) {
+  get_val<QStyleOptionViewItem>(self)->rect = *get_val<QRect>(r); return r;
+}
+static VALUE sovi_set_text(VALUE self, VALUE t) {
+  get_val<QStyleOptionViewItem>(self)->text = rb_to_qs(t); return t;
+}
+static VALUE sovi_text(VALUE self) {
+  return rb_str_new2(get_val<QStyleOptionViewItem>(self)->text.toUtf8().constData());
+}
+static VALUE sovi_set_features(VALUE self, VALUE f) {
+  get_val<QStyleOptionViewItem>(self)->features =
+      QStyleOptionViewItem::ViewItemFeatures(NUM2INT(f));
+  return f;
+}
+static VALUE sob_new(int argc, VALUE *argv, VALUE klass) {
+  rb_scan_args(argc, argv, "0");
+  return wrap_val<QStyleOptionButton>(klass, QStyleOptionButton());
+}
+static VALUE sob_set_rect(VALUE self, VALUE r) {
+  get_val<QStyleOptionButton>(self)->rect = *get_val<QRect>(r); return r;
+}
+static VALUE sob_rect(VALUE self) {
+  return wrap_val<QRect>(cRect, get_val<QStyleOptionButton>(self)->rect);
+}
+static VALUE sob_set_text(VALUE self, VALUE t) {
+  get_val<QStyleOptionButton>(self)->text = rb_to_qs(t); return t;
+}
+static VALUE style_draw_control(VALUE self, VALUE element, VALUE opt, VALUE painter) {
+  QStyle *st = qcast<QStyle>(self);
+  QPainter *p = painter_of(painter);
+  QStyle::ControlElement ce = (QStyle::ControlElement)NUM2INT(element);
+  if (rb_obj_is_kind_of(opt, cStyleOptionButtonKlass))
+    st->drawControl(ce, get_val<QStyleOptionButton>(opt), p);
+  else if (rb_obj_is_kind_of(opt, cStyleOptionViewItemKlass))
+    st->drawControl(ce, get_val<QStyleOptionViewItem>(opt), p);
+  else
+    rb_raise(rb_eTypeError, "drawControl needs a Qt::StyleOption*, got %s",
+             rb_obj_classname(opt));
+  return self;
+}
+static VALUE widget_style(VALUE self) {
+  return wrap_obj(rb_const_get(mQt, rb_intern("Style")),
+                  qcast<QWidget>(self)->style(), false);
+}
+// QStyledItemDelegate::initStyleOption is protected.
+struct DelegateAccess : public QStyledItemDelegate {
+  using QStyledItemDelegate::initStyleOption;
+};
+static VALUE delegate_init_style_option(VALUE self, VALUE opt, VALUE idx) {
+  QStyledItemDelegate *d = qcast<QStyledItemDelegate>(self);
+  static_cast<DelegateAccess *>(d)->initStyleOption(
+      get_val<QStyleOptionViewItem>(opt), *get_val<QModelIndex>(idx));
+  return self;
+}
+
+// ---- bindings COSMOS calls that were never defined -------------------------
+// Each of these raised NoMethodError the first time its control was used.
+
+// QPlainTextEdit's block-geometry API is protected, and RubyEditor's
+// line-number / breakpoint gutter needs it on every repaint
+// (ruby_editor.rb:345-486). Exposing it changes no behaviour.
+struct PlainTextAccess : public QPlainTextEdit {
+  using QPlainTextEdit::firstVisibleBlock;
+  using QPlainTextEdit::blockBoundingRect;
+  using QPlainTextEdit::blockBoundingGeometry;
+  using QPlainTextEdit::contentOffset;
+};
+static PlainTextAccess *pte_acc(VALUE self) {
+  return static_cast<PlainTextAccess *>(qcast<QPlainTextEdit>(self));
+}
+static VALUE pte_first_visible_block(VALUE self) {
+  return wrap_val<QTextBlock>(cTextBlockKlass, pte_acc(self)->firstVisibleBlock());
+}
+static VALUE pte_block_bounding_rect(VALUE self, VALUE b) {
+  return wrap_val<QRect>(cRect,
+      pte_acc(self)->blockBoundingRect(*get_val<QTextBlock>(b)).toRect());
+}
+static VALUE pte_block_bounding_geometry(VALUE self, VALUE b) {
+  return wrap_val<QRect>(cRect,
+      pte_acc(self)->blockBoundingGeometry(*get_val<QTextBlock>(b)).toRect());
+}
+static VALUE pte_content_offset(VALUE self) {
+  return wrap_val<QPoint>(cPoint, pte_acc(self)->contentOffset().toPoint());
+}
+// ruby_editor.rb:199 -- also the only way to add a breakpoint (:203).
+static VALUE pte_std_context_menu(VALUE self) {
+  return wrap_obj(cMenu, qcast<QPlainTextEdit>(self)->createStandardContextMenu(), false);
+}
+static VALUE textblock_is_visible(VALUE self) {
+  return get_val<QTextBlock>(self)->isVisible() ? Qtrue : Qfalse;
+}
+static VALUE rect_translated(VALUE self, VALUE pt) {
+  return wrap_val<QRect>(cRect, get_val<QRect>(self)->translated(*get_val<QPoint>(pt)));
+}
+// Qt4's value types had explicit destructors and COSMOS still calls dispose on
+// them (ruby_editor.rb:377). These are copies owned by Ruby's GC: no-op.
+static VALUE value_dispose_noop(VALUE) { return Qnil; }
+
+// qt.rb:354 walks the tree with topLevelItem (test_runner.rb:752, :862).
+static VALUE treew_top_level_item(VALUE self, VALUE i) {
+  QTreeWidgetItem *it = qcast<QTreeWidget>(self)->topLevelItem(NUM2INT(i));
+  return it ? wrap_ptr<QTreeWidgetItem>(cTreeWidgetItem, it) : Qnil;
+}
+// Qt::ColorListWidget needs all three (qt.rb:598, 614, 632, 685).
+static VALUE listw_set_uniform_item_sizes(VALUE self, VALUE v) {
+  qcast<QListWidget>(self)->setUniformItemSizes(RTEST(v)); return self;
+}
+static VALUE listw_take_item(VALUE self, VALUE i) {
+  QListWidgetItem *it = qcast<QListWidget>(self)->takeItem(NUM2INT(i));
+  return it ? wrap_ptr<QListWidgetItem>(cListWidgetItem, it) : Qnil;
+}
+static VALUE listw_visual_item_rect(VALUE self, VALUE item) {
+  return wrap_val<QRect>(cRect,
+      qcast<QListWidget>(self)->visualItemRect(get_ptr<QListWidgetItem>(item)));
+}
+static VALUE fm_line_spacing(VALUE self) {
+  return INT2NUM(get_val<QFontMetrics>(self)->lineSpacing());
+}
+// Cosmos::Widget is a module mixed into both widget and layout classes, so
+// widget.rb:207's bare parentWidget also has to resolve on a QLayout.
+static VALUE layout_parent_widget(VALUE self) {
+  return wrap_obj(cWidget, qcast<QLayout>(self)->parentWidget(), false);
+}
+static VALUE tabw_set_tab_icon(VALUE self, VALUE i, VALUE icon) {
+  qcast<QTabWidget>(self)->setTabIcon(NUM2INT(i), *get_val<QIcon>(icon));
+  return self;
+}
+
+// The C initialize goes in an included module, not on the class: COSMOS
+// reopens some of these classes with their own initialize and calls super.
+static void item_init_module(VALUE klass, const char *name,
+                             VALUE (*fn)(int, VALUE *, VALUE)) {
+  VALUE m = rb_define_module_under(mQt, name);
+  rb_define_method(m, "initialize", RUBY_METHOD_FUNC(fn), -1);
+  rb_include_module(klass, m);
+}
+
 extern "C" void Init_qt6(void) {
   mQt = rb_define_module("Qt");
   rb_define_singleton_method(mQt, "connect_raw",  RUBY_METHOD_FUNC(qt_connect), -1);
@@ -3746,13 +4210,17 @@ extern "C" void Init_qt6(void) {
   // raises a clear error if no constructor is registered for the class.
   rb_define_alloc_func(cQtBase, qtobj_alloc);
   cQtObject = rb_define_class_under(mQt, "Object", cQtBase);
-  register_ctor(cQtObject, ctor_plain<QObject>);   // COSMOS subclasses Qt::Object directly
+  // RubyFilterObject, not a bare QObject: qt.rb:648 builds Qt::Object.new and
+  // gives it a singleton eventFilter, which needs a virtual to route through.
+  register_ctor(cQtObject, ctor_plain<RubyFilterObject>);   // COSMOS subclasses Qt::Object directly
   QDEF(cQtBase, "initialize", RUBY_METHOD_FUNC(qt_initialize), -1);
   QDEF(cQtBase, "destroyed?", RUBY_METHOD_FUNC(obj_destroyed_p), 0);
   QDEF(cQtBase, "disposed?",  RUBY_METHOD_FUNC(obj_destroyed_p), 0);   // COSMOS spelling (progress_dialog.rb:162, +4)
   QDEF(cQtBase, "owned?",     RUBY_METHOD_FUNC(obj_owned_p), 0);
   QDEF(cQtBase, "destroy!",   RUBY_METHOD_FUNC(obj_destroy), 0);
   QDEF(cQtBase, "dispose",    RUBY_METHOD_FUNC(obj_destroy), 0);
+  QDEF(cQtBase, "installEventFilter", RUBY_METHOD_FUNC(obj_install_event_filter), 1);
+  QDEF(cQtBase, "removeEventFilter",  RUBY_METHOD_FUNC(obj_remove_event_filter), 1);
   QDEF(cQtBase, "setObjectName", RUBY_METHOD_FUNC(obj_set_object_name), 1);
   QDEF(cQtBase, "objectName",    RUBY_METHOD_FUNC(obj_object_name), 0);
   QDEF(cQtBase, "blockSignals",  RUBY_METHOD_FUNC(obj_block_signals), 1);
@@ -3931,6 +4399,11 @@ extern "C" void Init_qt6(void) {
 
   cPlainTextEdit = rb_define_class_under(mQt, "PlainTextEdit", cAbstractScrollArea);
   register_ctor(cPlainTextEdit, ctor_str<RubyForward<QPlainTextEdit> >);
+  QDEF(cPlainTextEdit, "firstVisibleBlock",        RUBY_METHOD_FUNC(pte_first_visible_block), 0);
+  QDEF(cPlainTextEdit, "blockBoundingRect",        RUBY_METHOD_FUNC(pte_block_bounding_rect), 1);
+  QDEF(cPlainTextEdit, "blockBoundingGeometry",    RUBY_METHOD_FUNC(pte_block_bounding_geometry), 1);
+  QDEF(cPlainTextEdit, "contentOffset",            RUBY_METHOD_FUNC(pte_content_offset), 0);
+  QDEF(cPlainTextEdit, "createStandardContextMenu", RUBY_METHOD_FUNC(pte_std_context_menu), 0);
   QDEF(cPlainTextEdit, "currentCharFormat",    RUBY_METHOD_FUNC(edit_current_char_format), 0);
   QDEF(cPlainTextEdit, "moveCursor",  RUBY_METHOD_FUNC(edit_move_cursor), -1);
   QDEF(cPlainTextEdit, "paste",       RUBY_METHOD_FUNC(edit_paste), 0);
@@ -3979,6 +4452,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cLayout, "setAlignment",       RUBY_METHOD_FUNC(layout_set_alignment), -1);
   QDEF(cLayout, "removeItem",  RUBY_METHOD_FUNC(layout_remove_item), 1);
   QDEF(cLayout, "setMargin",   RUBY_METHOD_FUNC(layout_set_margin), 1);
+  QDEF(cLayout, "parentWidget", RUBY_METHOD_FUNC(layout_parent_widget), 0);
   QDEF(cLayout, "itemAt",             RUBY_METHOD_FUNC(layout_item_at), -1);
   QDEF(cLayout, "setSizeConstraint",  RUBY_METHOD_FUNC(layout_set_size_constraint), 1);
 #define DEF_SC(n) rb_define_const(cLayout, #n, INT2NUM((int)QLayout::n))
@@ -4134,6 +4608,7 @@ extern "C" void Init_qt6(void) {
   rb_define_singleton_method(cPoint, "new", RUBY_METHOD_FUNC(point_new), 2);
   QDEF(cPoint, "x", RUBY_METHOD_FUNC(point_x), 0);
   QDEF(cPoint, "y", RUBY_METHOD_FUNC(point_y), 0);
+  QDEF(cPoint, "dispose", RUBY_METHOD_FUNC(value_dispose_noop), 0);
 
   // widget methods that depend on the value types above
   QDEF(cWidget, "setFont",       RUBY_METHOD_FUNC(widget_set_font), 1);
@@ -4150,6 +4625,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cWidget, "update",          RUBY_METHOD_FUNC((call_void<QWidget, &QWidget::update>)), 0);
   QDEF(cWidget, "repaint",         RUBY_METHOD_FUNC((call_void<QWidget, &QWidget::repaint>)), 0);
   QDEF(cWidget, "raise_",          RUBY_METHOD_FUNC((call_void<QWidget, &QWidget::raise>)), 0);
+  QDEF(cWidget, "style",           RUBY_METHOD_FUNC(widget_style), 0);
   QDEF(cWidget, "lower",           RUBY_METHOD_FUNC((call_void<QWidget, &QWidget::lower>)), 0);
   QDEF(cWidget, "activateWindow",  RUBY_METHOD_FUNC((call_void<QWidget, &QWidget::activateWindow>)), 0);
   QDEF(cWidget, "setHidden",       RUBY_METHOD_FUNC(widget_set_hidden), 1);
@@ -4235,6 +4711,7 @@ extern "C" void Init_qt6(void) {
   // ---- tables ----------------------------------------------------------
   cTableWidgetItem = rb_define_class_under(mQt, "TableWidgetItem", rb_cObject);
   rb_define_singleton_method(cTableWidgetItem, "new", RUBY_METHOD_FUNC(twitem_new), -1);
+  item_init_module(cTableWidgetItem, "TableWidgetItemInit", twitem_initialize);
   QDEF(cTableWidgetItem, "text",    RUBY_METHOD_FUNC(twitem_text), 0);
   QDEF(cTableWidgetItem, "textColor", RUBY_METHOD_FUNC(twi_text_color), 0);
   QDEF(cTableWidgetItem, "setText", RUBY_METHOD_FUNC(twitem_set_text), 1);
@@ -4252,7 +4729,9 @@ extern "C" void Init_qt6(void) {
   QDEF(cTableWidgetItem, "data",           RUBY_METHOD_FUNC(twitem_data), 1);
 
   cTableWidget = rb_define_class_under(mQt, "TableWidget", cAbstractItemView);
-  register_ctor(cTableWidget, ctor_plain<QTableWidget>);
+  // cmd_tlm_server_gui.rb:90 reopens Qt::TableWidget purely to override
+  // wheelEvent; an unsubclassed QTableWidget has no virtual to route it.
+  register_ctor(cTableWidget, ctor_plain<RubyForward<QTableWidget> >);
   QDEF(cTableWidget, "setRowCount",    RUBY_METHOD_FUNC((set_int<QTableWidget, &QTableWidget::setRowCount>)), 1);
   QDEF(cTableWidget, "rowCount",       RUBY_METHOD_FUNC((get_int<QTableWidget, &QTableWidget::rowCount>)), 0);
   QDEF(cTableWidget, "setColumnCount", RUBY_METHOD_FUNC((set_int<QTableWidget, &QTableWidget::setColumnCount>)), 1);
@@ -4266,6 +4745,7 @@ extern "C" void Init_qt6(void) {
   // ---- trees -----------------------------------------------------------
   cTreeWidgetItem = rb_define_class_under(mQt, "TreeWidgetItem", rb_cObject);
   rb_define_singleton_method(cTreeWidgetItem, "new", RUBY_METHOD_FUNC(tritem_new), -1);
+  item_init_module(cTreeWidgetItem, "TreeWidgetItemInit", tritem_initialize);
   QDEF(cTreeWidgetItem, "text",     RUBY_METHOD_FUNC(tritem_text), 1);
   QDEF(cTreeWidgetItem, "setExpanded", RUBY_METHOD_FUNC(twi_set_expanded), 1);
   QDEF(cTreeWidgetItem, "setText",  RUBY_METHOD_FUNC(tritem_set_text), 2);
@@ -4275,6 +4755,7 @@ extern "C" void Init_qt6(void) {
 
   cTreeWidget = rb_define_class_under(mQt, "TreeWidget", cAbstractItemView);
   register_ctor(cTreeWidget, ctor_plain<RubyForward<QTreeWidget> >);
+  QDEF(cTreeWidget, "topLevelItem", RUBY_METHOD_FUNC(treew_top_level_item), 1);
   QDEF(cTreeWidget, "setColumnCount",     RUBY_METHOD_FUNC((set_int<QTreeWidget, &QTreeWidget::setColumnCount>)), 1);
   QDEF(cTreeWidget, "columnCount",        RUBY_METHOD_FUNC((get_int<QTreeWidget, &QTreeWidget::columnCount>)), 0);
   QDEF(cTreeWidget, "setHeaderLabels",        RUBY_METHOD_FUNC(tree_set_header_labels), 1);
@@ -4287,11 +4768,16 @@ extern "C" void Init_qt6(void) {
   cListWidget = rb_define_class_under(mQt, "ListWidget", cAbstractItemView);
   // Declared but never defined, so findItems/currentItem had nothing to wrap.
   cListWidgetItem = rb_define_class_under(mQt, "ListWidgetItem", rb_cObject);
+  rb_define_singleton_method(cListWidgetItem, "new", RUBY_METHOD_FUNC(lwitem_new), -1);
+  item_init_module(cListWidgetItem, "ListWidgetItemInit", lwitem_initialize);
   QDEF(cListWidgetItem, "text",        RUBY_METHOD_FUNC(lwi_text), 0);
   QDEF(cListWidgetItem, "setText",     RUBY_METHOD_FUNC(lwi_set_text), 1);
   QDEF(cListWidgetItem, "setSelected", RUBY_METHOD_FUNC(lwi_set_selected), 1);
   QDEF(cListWidgetItem, "isSelected",  RUBY_METHOD_FUNC(lwi_is_selected), 0);
   register_ctor(cListWidget, ctor_plain<RubyForward<QListWidget> >);
+  QDEF(cListWidget, "setUniformItemSizes", RUBY_METHOD_FUNC(listw_set_uniform_item_sizes), 1);
+  QDEF(cListWidget, "takeItem",            RUBY_METHOD_FUNC(listw_take_item), 1);
+  QDEF(cListWidget, "visualItemRect",      RUBY_METHOD_FUNC(listw_visual_item_rect), 1);
   QDEF(cListWidget, "item",          RUBY_METHOD_FUNC(lw_item), 1);
   QDEF(cListWidget, "findItems",     RUBY_METHOD_FUNC(lw_find_items), -1);
   QDEF(cListWidget, "currentItem",   RUBY_METHOD_FUNC(lw_current_item), 0);
@@ -4304,6 +4790,7 @@ extern "C" void Init_qt6(void) {
 
   // ---- containers ------------------------------------------------------
   cTabWidget = rb_define_class_under(mQt, "TabWidget", cWidget);
+  QDEF(cTabWidget, "setTabIcon", RUBY_METHOD_FUNC(tabw_set_tab_icon), 2);
   register_ctor(cTabWidget, ctor_plain<QTabWidget>);
   QDEF(cTabWidget, "addTab",          RUBY_METHOD_FUNC(tab_add_tab), 2);
   QDEF(cTabWidget, "tabText",         RUBY_METHOD_FUNC(tab_text), 1);
@@ -4509,6 +4996,7 @@ extern "C" void Init_qt6(void) {
   QSDEF(cInputDialog, "getDouble",                      RUBY_METHOD_FUNC(inputdlg_get_double), -1);
 
   cShortcut = rb_define_class_under(mQt, "Shortcut", cQtObject);
+  register_ctor(cShortcut, ctor_shortcut);
 
   rb_define_const(mQt, "PLUGIN_PATH", rb_str_new2(""));
   // ---- painting value types --------------------------------------------
@@ -4534,6 +5022,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cBrush, "color",    RUBY_METHOD_FUNC(brush_color), 0);
 
   cFontMetrics = rb_define_class_under(mQt, "FontMetrics", rb_cObject);
+  QDEF(cFontMetrics, "lineSpacing", RUBY_METHOD_FUNC(fm_line_spacing), 0);
   rb_define_singleton_method(cFontMetrics, "new", RUBY_METHOD_FUNC(fontmetrics_new), 1);
   QDEF(cFontMetrics, "boundingRect", RUBY_METHOD_FUNC(fm_bounding_rect), 1);
   QDEF(cFontMetrics, "width",   RUBY_METHOD_FUNC(fm_width), 1);
@@ -4653,6 +5142,8 @@ extern "C" void Init_qt6(void) {
   QDEF(cRect, "isValid",  RUBY_METHOD_FUNC(rect_valid), 0);
   QDEF(cRect, "width",  RUBY_METHOD_FUNC(rect_w), 0);
   QDEF(cRect, "height", RUBY_METHOD_FUNC(rect_h), 0);
+  QDEF(cRect, "translated", RUBY_METHOD_FUNC(rect_translated), 1);
+  QDEF(cRect, "dispose",    RUBY_METHOD_FUNC(value_dispose_noop), 0);
   // Qt::Polygon was declared but never defined -- no class, no constructor.
   // Declared but never defined, like Polygon and ListWidgetItem were.
   cDate = rb_define_class_under(mQt, "Date", rb_cObject);
@@ -4728,6 +5219,9 @@ extern "C" void Init_qt6(void) {
 
   VALUE cStyledItemDelegate = rb_define_class_under(mQt, "StyledItemDelegate", cQtObject);
   register_ctor(cStyledItemDelegate, ctor_plain<RubyItemDelegate>);   // virtuals -> Ruby
+  QDEF(cStyledItemDelegate, "initStyleOption", RUBY_METHOD_FUNC(delegate_init_style_option), 2);
+  QDEF(cStyledItemDelegate, "commitData",  RUBY_METHOD_FUNC(delegate_commit_data), 1);
+  QDEF(cStyledItemDelegate, "closeEditor", RUBY_METHOD_FUNC(delegate_close_editor), -1);
 
   // ---- text --------------------------------------------------------------
   cTextDocument = rb_define_class_under(mQt, "TextDocument", cQtObject);
@@ -4758,7 +5252,9 @@ extern "C" void Init_qt6(void) {
   rb_define_const(cTextOption, "NoWrap",     INT2NUM((int)QTextOption::NoWrap));
   rb_define_const(cTextOption, "WordWrap",   INT2NUM((int)QTextOption::WordWrap));
   rb_define_const(cTextOption, "WrapAnywhere", INT2NUM((int)QTextOption::WrapAnywhere));
-  rb_define_class_under(mQt, "SyntaxHighlighter", cQtObject);
+  VALUE cSyntaxHighlighter = rb_define_class_under(mQt, "SyntaxHighlighter", cQtObject);
+  register_ctor(cSyntaxHighlighter, ctor_highlighter);
+  QDEF(cSyntaxHighlighter, "setFormat", RUBY_METHOD_FUNC(highlighter_set_format), 3);
 
   // ---- misc widgets / helpers --------------------------------------------
   VALUE cDialogButtonBox = rb_define_class_under(mQt, "DialogButtonBox", cWidget);
@@ -4776,7 +5272,11 @@ extern "C" void Init_qt6(void) {
   VALUE cEventLoop = rb_define_class_under(mQt, "EventLoop", cQtObject);
   register_ctor(cEventLoop, ctor_plain<QEventLoop>);
   VALUE cMovie = rb_define_class_under(mQt, "Movie", cQtObject);
-  VALUE cMimeData = rb_define_class_under(mQt, "MimeData", cQtObject);
+  // Snapshot of the QMimeData behind a drop: the real one dies with the event.
+  cMimeDataCls = rb_define_class_under(mQt, "MimeData", rb_cObject);
+  rb_define_attr(cMimeDataCls, "hasUrls", 1, 0);
+  rb_define_attr(cMimeDataCls, "urls",    1, 0);
+  rb_define_attr(cMimeDataCls, "text",    1, 0);
   rb_define_class_under(mQt, "Drag", cQtObject);
   rb_define_class_under(mQt, "SpacerItem", rb_cObject);
   rb_define_class_under(mQt, "Polygon", rb_cObject);
@@ -4785,14 +5285,55 @@ extern "C" void Init_qt6(void) {
   QDEF(cChar, "to_s",    RUBY_METHOD_FUNC(qchar_to_s), 0);
   QDEF(cChar, "to_str",  RUBY_METHOD_FUNC(qchar_to_s), 0);
   QDEF(cChar, "unicode", RUBY_METHOD_FUNC(qchar_unicode), 0);
-  rb_define_class_under(mQt, "Event", rb_cObject);
-  cKeyEventCls = rb_define_class_under(mQt, "KeyEvent", rb_cObject);
+  // ---- event objects ----
+  // Every forwarded Qt virtual now receives one of these instead of nil, and
+  // accept/ignore on it is written back onto the real QEvent after dispatch.
+  cEventCls = rb_define_class_under(mQt, "Event", rb_cObject);
+  rb_define_attr(cEventCls, "type", 1, 0);
+  QDEF(cEventCls, "accept",      RUBY_METHOD_FUNC(event_accept),       0);
+  QDEF(cEventCls, "ignore",      RUBY_METHOD_FUNC(event_ignore),       0);
+  QDEF(cEventCls, "isAccepted",  RUBY_METHOD_FUNC(event_is_accepted),  0);
+  QDEF(cEventCls, "accepted?",   RUBY_METHOD_FUNC(event_is_accepted),  0);
+  QDEF(cEventCls, "setAccepted", RUBY_METHOD_FUNC(event_set_accepted), 1);
+  QDEF(cEventCls, "dispose",     RUBY_METHOD_FUNC(value_dispose_noop), 0);
+
+  cKeyEventCls = rb_define_class_under(mQt, "KeyEvent", cEventCls);
   rb_define_attr(cKeyEventCls, "key", 1, 0);
-  cMouseEventCls = rb_define_class_under(mQt, "MouseEvent", rb_cObject);
+  rb_define_attr(cKeyEventCls, "text", 1, 0);
+  rb_define_attr(cKeyEventCls, "modifiers", 1, 0);
+
+  cMouseEventCls = rb_define_class_under(mQt, "MouseEvent", cEventCls);
   rb_define_attr(cMouseEventCls, "x", 1, 0);
   rb_define_attr(cMouseEventCls, "y", 1, 0);
   rb_define_attr(cMouseEventCls, "button", 1, 0);
-  rb_define_class_under(mQt, "CloseEvent", rb_cObject);
+  rb_define_attr(cMouseEventCls, "buttons", 1, 0);
+  rb_define_attr(cMouseEventCls, "modifiers", 1, 0);
+  rb_define_attr(cMouseEventCls, "pos", 1, 0);
+
+  cCloseEventCls  = rb_define_class_under(mQt, "CloseEvent",  cEventCls);
+  cShowEventCls   = rb_define_class_under(mQt, "ShowEvent",   cEventCls);
+  cResizeEventCls = rb_define_class_under(mQt, "ResizeEvent", cEventCls);
+  cFocusEventCls  = rb_define_class_under(mQt, "FocusEvent",  cEventCls);
+  cLeaveEventCls  = rb_define_class_under(mQt, "LeaveEvent",  cEventCls);
+
+  cPaintEventCls = rb_define_class_under(mQt, "PaintEvent", cEventCls);
+  rb_define_attr(cPaintEventCls, "rect", 1, 0);
+
+  cWheelEventCls = rb_define_class_under(mQt, "WheelEvent", cEventCls);
+  rb_define_attr(cWheelEventCls, "modifiers", 1, 0);
+  QDEF(cWheelEventCls, "delta", RUBY_METHOD_FUNC(wheel_delta), 0);
+
+  // Drag and drop: setAcceptDrops(true) already worked, but nothing forwarded
+  // the drag virtuals and these classes did not exist, so dropping a script on
+  // Script Runner or Config Editor silently did nothing.
+  cDragEnterEventCls = rb_define_class_under(mQt, "DragEnterEvent", cEventCls);
+  cDragMoveEventCls  = rb_define_class_under(mQt, "DragMoveEvent",  cEventCls);
+  cDropEventCls      = rb_define_class_under(mQt, "DropEvent",      cEventCls);
+  VALUE dnd[3] = { cDragEnterEventCls, cDragMoveEventCls, cDropEventCls };
+  for (int i = 0; i < 3; i++) {
+    rb_define_attr(dnd[i], "mimeData", 1, 0);
+    QDEF(dnd[i], "acceptProposedAction", RUBY_METHOD_FUNC(event_accept_proposed), 0);
+  }
   VALUE cStyleK = rb_define_class_under(mQt, "Style", cQtObject);
 #define DEF_STYLE_PIX(n) rb_define_const(cStyleK, #n, INT2NUM((int)QStyle::n))
   DEF_STYLE_PIX(SP_MessageBoxCritical); DEF_STYLE_PIX(SP_MessageBoxInformation);
@@ -4800,9 +5341,23 @@ extern "C" void Init_qt6(void) {
   DEF_STYLE_PIX(SP_DialogOkButton); DEF_STYLE_PIX(SP_DialogCancelButton);
 #undef DEF_STYLE_PIX
   QDEF(cStyleK, "standardIcon", RUBY_METHOD_FUNC(style_standard_icon), 1);
-  QDEF(cStyleK, "standardIcon", RUBY_METHOD_FUNC(style_standard_icon), 1);
-  rb_define_class_under(mQt, "StyleOptionButton", rb_cObject);
+  QDEF(cStyleK, "drawControl",  RUBY_METHOD_FUNC(style_draw_control), 3);
+  cStyleOptionButtonKlass = rb_define_class_under(mQt, "StyleOptionButton", rb_cObject);
+  rb_define_singleton_method(cStyleOptionButtonKlass, "new", RUBY_METHOD_FUNC(sob_new), -1);
+  QDEF(cStyleOptionButtonKlass, "rect",    RUBY_METHOD_FUNC(sob_rect), 0);
+  QDEF(cStyleOptionButtonKlass, "rect=",   RUBY_METHOD_FUNC(sob_set_rect), 1);
+  QDEF(cStyleOptionButtonKlass, "text=",   RUBY_METHOD_FUNC(sob_set_text), 1);
+  QDEF(cStyleOptionButtonKlass, "dispose", RUBY_METHOD_FUNC(value_dispose_noop), 0);
   VALUE cSOVI = rb_define_class_under(mQt, "StyleOptionViewItem", rb_cObject);
+  cStyleOptionViewItemKlass = cSOVI;
+  rb_define_singleton_method(cSOVI, "new", RUBY_METHOD_FUNC(sovi_new), -1);
+  QDEF(cSOVI, "rect",      RUBY_METHOD_FUNC(sovi_rect), 0);
+  QDEF(cSOVI, "rect=",     RUBY_METHOD_FUNC(sovi_set_rect), 1);
+  QDEF(cSOVI, "text",      RUBY_METHOD_FUNC(sovi_text), 0);
+  QDEF(cSOVI, "text=",     RUBY_METHOD_FUNC(sovi_set_text), 1);
+  QDEF(cSOVI, "features=", RUBY_METHOD_FUNC(sovi_set_features), 1);
+  QDEF(cSOVI, "dispose",   RUBY_METHOD_FUNC(value_dispose_noop), 0);
+  rb_define_const(cSOVI, "WrapText", INT2NUM((int)QStyleOptionViewItem::WrapText));
   // QStyleOptionViewItemV2/V3/V4 were removed in Qt5; COSMOS still names them.
   rb_define_const(mQt, "StyleOptionViewItemV2", cSOVI);
   rb_define_const(mQt, "StyleOptionViewItemV3", cSOVI);
@@ -4909,6 +5464,8 @@ extern "C" void Init_qt6(void) {
   cTextBlockKlass = rb_define_class_under(mQt, "TextBlock", rb_cObject);
   QDEF(cTextBlockKlass, "text",        RUBY_METHOD_FUNC(tb_text), 0);
   QDEF(cTextBlockKlass, "blockNumber", RUBY_METHOD_FUNC(tb_number), 0);
+  QDEF(cTextBlockKlass, "isVisible",   RUBY_METHOD_FUNC(textblock_is_visible), 0);
+  QDEF(cTextBlockKlass, "dispose",     RUBY_METHOD_FUNC(value_dispose_noop), 0);
   QDEF(cTextBlockKlass, "position",    RUBY_METHOD_FUNC(tb_position), 0);
   QDEF(cTextBlockKlass, "length",      RUBY_METHOD_FUNC(tb_length), 0);
   QDEF(cTextBlockKlass, "isValid",     RUBY_METHOD_FUNC(tb_valid), 0);
@@ -5052,6 +5609,7 @@ extern "C" void Init_qt6(void) {
 
 #define DEF_CE(n) rb_define_const(cStyleK, #n, INT2NUM((int)QStyle::n))
   DEF_CE(CE_PushButton); DEF_CE(CE_PushButtonLabel); DEF_CE(CE_CheckBox);
+  DEF_CE(CE_ItemViewItem);
 #undef DEF_CE
 
 #define DEF_FIND(n) rb_define_const(cTextDocument, #n, INT2NUM((int)QTextDocument::n))

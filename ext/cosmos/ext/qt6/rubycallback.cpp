@@ -2,14 +2,14 @@
 #include "rubywidget.h"   // ruby_wrap_model_index
 #include <ruby/thread.h>
 
-int g_qt_gvl_released = 0;
-
-// g_qt_gvl_released says "a Qt event loop on some thread released the GVL".
-// It does NOT say whether THIS thread currently holds it. Without that
-// distinction a nested callback (a Ruby slot that triggers another signal)
-// calls rb_thread_call_with_gvl while already holding the GVL, which corrupts
-// Ruby's thread state and crashes unrelated threads. Track it per-thread.
-static thread_local bool t_reacquired_gvl = false;
+// Whether THIS thread currently holds the GVL. Ruby already knows, so ask it.
+// Tracking it locally did not work: "a Qt event loop released the GVL" was a
+// process-global counter while "I already re-acquired it" was thread_local,
+// so a background Ruby thread that natively held the GVL took the re-acquire
+// path and aborted the process with
+//   rb_thread_call_with_gvl: called by a thread which has GVL.
+// Exported by libruby but not declared in a public header.
+extern "C" int ruby_thread_has_gvl_p(void);
 
 // Runs fn with the GVL held, acquiring it only if this thread doesn't have it.
 void ruby_run_with_gvl(void *(*fn)(void *), void *arg) {
@@ -19,13 +19,8 @@ void ruby_run_with_gvl(void *(*fn)(void *), void *arg) {
   // "pthread_mutex_lock: Invalid argument (EINVAL)". Skip instead.
   if (!ruby_native_thread_p()) return;
 
-  if (g_qt_gvl_released > 0 && !t_reacquired_gvl) {
-    t_reacquired_gvl = true;
-    rb_thread_call_with_gvl(fn, arg);
-    t_reacquired_gvl = false;
-  } else {
-    fn(arg);
-  }
+  if (ruby_thread_has_gvl_p()) fn(arg);
+  else                          rb_thread_call_with_gvl(fn, arg);
 }
 
 // A Ruby exception raised inside a slot must never longjmp out through Qt's
@@ -95,16 +90,6 @@ static bool contain_error(int state) {
 static VALUE do_call_proc(VALUE p) {
   return rb_funcall(p, rb_intern("call"), 0);
 }
-GvlReleaseScope::GvlReleaseScope() {
-  saved = t_reacquired_gvl;
-  t_reacquired_gvl = false;
-  g_qt_gvl_released++;
-}
-GvlReleaseScope::~GvlReleaseScope() {
-  g_qt_gvl_released--;
-  t_reacquired_gvl = saved;
-}
-
 static void *call_proc(void *p) {
   int state = 0;
   rb_protect(do_call_proc, *(VALUE *)p, &state);
@@ -129,8 +114,18 @@ static void *run_std_fn(void *p) {
   (*(const std::function<void()> *)p)();
   return NULL;
 }
+static void *run_std_fn_v(void *p) { return run_std_fn(p); }
 void ruby_with_gvl(const std::function<void()> &fn) {
   ruby_run_with_gvl(run_std_fn, (void *)&fn);
+}
+
+// Runs a blocking Qt call with the GVL released so Ruby's other threads keep
+// getting scheduled. Every nested modal loop must go through this: a
+// QMessageBox that holds the GVL gives CmdTlmServer's interface, telemetry
+// and logging threads zero slices for as long as the dialog is on screen.
+void ruby_without_gvl(const std::function<void()> &fn) {
+  if (!ruby_native_thread_p() || !ruby_thread_has_gvl_p()) { fn(); return; }
+  rb_thread_call_without_gvl(run_std_fn_v, (void *)&fn, RUBY_UBF_IO, NULL);
 }
 
 void ruby_invoke_proc(VALUE proc) {
