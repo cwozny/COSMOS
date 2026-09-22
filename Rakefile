@@ -149,7 +149,8 @@ task :build => [:devkit] do
       'line_graph',
       'packet',
       'platform',
-      'buffered_file']
+      'buffered_file',
+      'qt6']
 
     extensions.each do |extension_name|
       Dir.chdir "ext/cosmos/ext/#{extension_name}"
@@ -159,7 +160,15 @@ task :build => [:devkit] do
       FileUtils.rm_f 'Makefile'
       system('ruby extconf.rb')
       system('make')
-      FileUtils.copy("#{extension_name}.#{shared_extension}", '../../../../lib/cosmos/ext/.')
+      built = "#{extension_name}.#{shared_extension}"
+      if File.exist?(built)
+        FileUtils.copy(built, '../../../../lib/cosmos/ext/.')
+      else
+        # qt6 writes a do-nothing Makefile when Qt6 is not installed rather
+        # than aborting, which would fail the whole build.
+        puts "  #{extension_name}: not built (Qt6 not found) - skipping"
+      end
+      FileUtils.rm_f Dir.glob('moc_*.cpp')
       FileUtils.rm_f Dir.glob('*.o')
       FileUtils.rm_f Dir.glob("*.#{shared_extension}")
       FileUtils.rm_f Dir.glob('*.def')

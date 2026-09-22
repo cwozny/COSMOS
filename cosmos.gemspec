@@ -59,6 +59,7 @@ spec = Gem::Specification.new do |s|
     s.extensions << 'ext/cosmos/ext/packet/extconf.rb'
     s.extensions << 'ext/cosmos/ext/platform/extconf.rb'
     s.extensions << 'ext/cosmos/ext/polynomial_conversion/extconf.rb'
+    s.extensions << 'ext/cosmos/ext/qt6/extconf.rb'
     s.extensions << 'ext/cosmos/ext/string/extconf.rb'
     s.extensions << 'ext/cosmos/ext/tabbed_plots_config/extconf.rb'
     s.extensions << 'ext/cosmos/ext/telemetry/extconf.rb'
@@ -89,7 +90,8 @@ spec = Gem::Specification.new do |s|
   s.add_runtime_dependency 'rubyzip', '~> 1.2'
   s.add_runtime_dependency 'nokogiri', ['~> 1.10', '< 1.13'] # Nokogiri 1.13 doesn't support Ruby 2.5
   s.add_runtime_dependency 'opengl-bindings', '~> 1.6' if RUBY_ENGINE == 'ruby' # MRI Only
-  s.add_runtime_dependency 'qtbindings', '~> 4.8.6', '>= 4.8.6.2' if RUBY_ENGINE == 'ruby' && !ENV['CI'] # MRI Only, not Github
+  # The GUI now runs on the Qt6 binding in ext/cosmos/ext/qt6 (built above),
+  # so the Qt4 qtbindings gem is no longer a dependency.
   s.add_runtime_dependency 'puma', '~> 3.10'
   s.add_runtime_dependency 'rack', '~> 2.0'
   s.add_runtime_dependency 'httpclient', '~> 2.8'

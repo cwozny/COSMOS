@@ -685,6 +685,12 @@ ext/cosmos/ext/platform/extconf.rb
 ext/cosmos/ext/platform/platform.c
 ext/cosmos/ext/polynomial_conversion/extconf.rb
 ext/cosmos/ext/polynomial_conversion/polynomial_conversion.c
+ext/cosmos/ext/qt6/cosmos_qt6.cpp
+ext/cosmos/ext/qt6/extconf.rb
+ext/cosmos/ext/qt6/rubycallback.cpp
+ext/cosmos/ext/qt6/rubycallback.h
+ext/cosmos/ext/qt6/rubywidget.cpp
+ext/cosmos/ext/qt6/rubywidget.h
 ext/cosmos/ext/string/extconf.rb
 ext/cosmos/ext/string/string.c
 ext/cosmos/ext/structure/structure.c
@@ -907,6 +913,7 @@ install/tools/mac/TlmViewer.app/Contents/MacOS/main.sh
 install/tools/mac/TlmViewer.app/Contents/MacOS/tool_launch.rb
 install/tools/mac/TlmViewer.app/Contents/Resources/appIcon.icns
 install/tools/tool_launch.rb
+lib/Qt.rb
 lib/cosmos.rb
 lib/cosmos/ccsds/ccsds_packet.rb
 lib/cosmos/ccsds/ccsds_parser.rb
