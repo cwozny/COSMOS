@@ -4031,6 +4031,37 @@ static VALUE delegate_close_editor(int argc, VALUE *argv, VALUE self) {
   return self;
 }
 
+// ---- gaps found by the class-aware pass of scan_unbound.rb -----------------
+// Each was bound on some other class, so a name-only sweep saw nothing.
+static VALUE image_rect(VALUE self) {
+  return wrap_val<QRect>(cRect, get_val<QImage>(self)->rect());
+}
+static VALUE point_set_x(VALUE self, VALUE v) {
+  get_val<QPoint>(self)->setX(NUM2INT(v)); return v;
+}
+static VALUE point_set_y(VALUE self, VALUE v) {
+  get_val<QPoint>(self)->setY(NUM2INT(v)); return v;
+}
+static VALUE lwitem_set_data(VALUE self, VALUE role, VALUE val) {
+  get_ptr<QListWidgetItem>(self)->setData(NUM2INT(role), *get_val<QVariant>(val));
+  return self;
+}
+static VALUE tritem_set_check_state(VALUE self, VALUE col, VALUE st) {
+  get_ptr<QTreeWidgetItem>(self)
+    ->setCheckState(NUM2INT(col), (Qt::CheckState)NUM2INT(st));
+  return self;
+}
+static VALUE layout_spacing(VALUE self) {
+  return INT2NUM(qcast<QLayout>(self)->spacing());
+}
+// limits_monitor.rb:805 fires the shortcut from a button handler, which in
+// qtbindings meant emitting the signal.
+static VALUE shortcut_activated(VALUE self) {
+  QShortcut *sc = qcast<QShortcut>(self);
+  emit sc->activated();
+  return self;
+}
+
 // ---- QStyle drawing path ---------------------------------------------------
 // cmd_param_table_item_delegate.rb#paint draws a combo box as a button so the
 // user can tell the cell is clickable, and table_manager.rb does the same.
@@ -4336,6 +4367,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cLabel, "setAlignment", RUBY_METHOD_FUNC(label_set_alignment), 1);
   QDEF(cLabel, "wordWrap", RUBY_METHOD_FUNC(label_word_wrap), 0);
   QDEF(cLabel, "setWordWrap",  RUBY_METHOD_FUNC((set_bool<QLabel, &QLabel::setWordWrap>)), 1);
+  QDEF(cLabel, "setMargin",    RUBY_METHOD_FUNC((set_int<QLabel, &QLabel::setMargin>)), 1);
   QDEF(cLabel, "setBuddy",      RUBY_METHOD_FUNC(label_set_buddy), 1);
   QDEF(cLabel, "setPixmap",     RUBY_METHOD_FUNC(label_set_pixmap), 1);
   QDEF(cLabel, "setTextFormat", RUBY_METHOD_FUNC(label_set_text_format), 1);
@@ -4383,6 +4415,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cComboBox, "itemText",        RUBY_METHOD_FUNC(combo_item_text), 1);
   QDEF(cComboBox, "setCurrentIndex", RUBY_METHOD_FUNC((set_int<QComboBox, &QComboBox::setCurrentIndex>)), 1);
   QDEF(cComboBox, "currentIndex",    RUBY_METHOD_FUNC((get_int<QComboBox, &QComboBox::currentIndex>)), 0);
+  QDEF(cComboBox, "setMaxCount",     RUBY_METHOD_FUNC((set_int<QComboBox, &QComboBox::setMaxCount>)), 1);
   QDEF(cComboBox, "currentText",     RUBY_METHOD_FUNC((get_str<QComboBox, &QComboBox::currentText>)), 0);
   QDEF(cComboBox, "count",           RUBY_METHOD_FUNC((get_int<QComboBox, &QComboBox::count>)), 0);
   QDEF(cComboBox, "itemData",    RUBY_METHOD_FUNC(cb_item_data), 1);
@@ -4453,6 +4486,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cLayout, "removeItem",  RUBY_METHOD_FUNC(layout_remove_item), 1);
   QDEF(cLayout, "setMargin",   RUBY_METHOD_FUNC(layout_set_margin), 1);
   QDEF(cLayout, "parentWidget", RUBY_METHOD_FUNC(layout_parent_widget), 0);
+  QDEF(cLayout, "spacing",      RUBY_METHOD_FUNC(layout_spacing), 0);
   QDEF(cLayout, "itemAt",             RUBY_METHOD_FUNC(layout_item_at), -1);
   QDEF(cLayout, "setSizeConstraint",  RUBY_METHOD_FUNC(layout_set_size_constraint), 1);
 #define DEF_SC(n) rb_define_const(cLayout, #n, INT2NUM((int)QLayout::n))
@@ -4608,6 +4642,8 @@ extern "C" void Init_qt6(void) {
   rb_define_singleton_method(cPoint, "new", RUBY_METHOD_FUNC(point_new), 2);
   QDEF(cPoint, "x", RUBY_METHOD_FUNC(point_x), 0);
   QDEF(cPoint, "y", RUBY_METHOD_FUNC(point_y), 0);
+  QDEF(cPoint, "setX", RUBY_METHOD_FUNC(point_set_x), 1);
+  QDEF(cPoint, "setY", RUBY_METHOD_FUNC(point_set_y), 1);
   QDEF(cPoint, "dispose", RUBY_METHOD_FUNC(value_dispose_noop), 0);
 
   // widget methods that depend on the value types above
@@ -4750,6 +4786,7 @@ extern "C" void Init_qt6(void) {
   cTreeWidgetItem = rb_define_class_under(mQt, "TreeWidgetItem", rb_cObject);
   rb_define_singleton_method(cTreeWidgetItem, "new", RUBY_METHOD_FUNC(tritem_new), -1);
   item_init_module(cTreeWidgetItem, "TreeWidgetItemInit", tritem_initialize);
+  QDEF(cTreeWidgetItem, "setCheckState", RUBY_METHOD_FUNC(tritem_set_check_state), 2);
   QDEF(cTreeWidgetItem, "text",     RUBY_METHOD_FUNC(tritem_text), 1);
   QDEF(cTreeWidgetItem, "setExpanded", RUBY_METHOD_FUNC(twi_set_expanded), 1);
   QDEF(cTreeWidgetItem, "setText",  RUBY_METHOD_FUNC(tritem_set_text), 2);
@@ -4774,6 +4811,7 @@ extern "C" void Init_qt6(void) {
   cListWidgetItem = rb_define_class_under(mQt, "ListWidgetItem", rb_cObject);
   rb_define_singleton_method(cListWidgetItem, "new", RUBY_METHOD_FUNC(lwitem_new), -1);
   item_init_module(cListWidgetItem, "ListWidgetItemInit", lwitem_initialize);
+  QDEF(cListWidgetItem, "setData", RUBY_METHOD_FUNC(lwitem_set_data), 2);
   QDEF(cListWidgetItem, "text",        RUBY_METHOD_FUNC(lwi_text), 0);
   QDEF(cListWidgetItem, "setText",     RUBY_METHOD_FUNC(lwi_set_text), 1);
   QDEF(cListWidgetItem, "setSelected", RUBY_METHOD_FUNC(lwi_set_selected), 1);
@@ -4807,6 +4845,8 @@ extern "C" void Init_qt6(void) {
   QDEF(cTabWidget, "currentTab",    RUBY_METHOD_FUNC(tab_current_widget), 0);
   QDEF(cTabWidget, "setTabEnabled",   RUBY_METHOD_FUNC(tab_set_tab_enabled), 2);
   QDEF(cTabWidget, "currentIndex",    RUBY_METHOD_FUNC((get_int<QTabWidget, &QTabWidget::currentIndex>)), 0);
+  // overview_tabbed_plots.rb:1220 uses it as the index it indexes tabs[] with.
+  QDEF(cTabWidget, "current",         RUBY_METHOD_FUNC((get_int<QTabWidget, &QTabWidget::currentIndex>)), 0);
   QDEF(cTabWidget, "setTabText",      RUBY_METHOD_FUNC(tab_set_tab_text), 2);
 
   cSplitter = rb_define_class_under(mQt, "Splitter", cFrame);
@@ -5001,6 +5041,7 @@ extern "C" void Init_qt6(void) {
 
   cShortcut = rb_define_class_under(mQt, "Shortcut", cQtObject);
   register_ctor(cShortcut, ctor_shortcut);
+  QDEF(cShortcut, "activated", RUBY_METHOD_FUNC(shortcut_activated), 0);
 
   rb_define_const(mQt, "PLUGIN_PATH", rb_str_new2(""));
   // ---- painting value types --------------------------------------------
@@ -5085,6 +5126,7 @@ extern "C" void Init_qt6(void) {
   cImage = rb_define_class_under(mQt, "Image", rb_cObject);
   rb_define_singleton_method(cImage, "new", RUBY_METHOD_FUNC(image_new), -1);
   QDEF(cImage, "width",  RUBY_METHOD_FUNC(image_width), 0);
+  QDEF(cImage, "rect",   RUBY_METHOD_FUNC(image_rect), 0);
   QDEF(cImage, "height",     RUBY_METHOD_FUNC(image_height), 0);
   QDEF(cImage, "pixelColor", RUBY_METHOD_FUNC(image_pixel_color), 2);
   QDEF(cImage, "save",       RUBY_METHOD_FUNC(image_save), 1);

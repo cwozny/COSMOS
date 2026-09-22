@@ -834,6 +834,27 @@ chk('cmd_params.rb create_table sequence runs end to end') do
   true
 end
 
+puts "\n28. Found by the class-aware pass of scan_unbound.rb"
+puts "   (each of these was bound on some other class, so the name-only"
+puts "    sweep reported zero while the call site would raise)"
+chk('Qt::ComboBox#maxCount=')          { Qt::ComboBox.new.maxCount = 5; true }
+chk('Qt::Image#rect')                  { Qt::Image.method_defined?(:rect) }
+chk('Qt::Label#setMargin')             { Qt::Label.new('x').setMargin(11); true }
+chk('Qt::ListWidgetItem#setData')      { Qt::ListWidgetItem.new('x').respond_to?(:setData) }
+chk('Qt::Point#x= and #y=')            { p = Qt::Point.new(1, 1); p.x = 3; p.y = 4; [p.x, p.y] == [3, 4] }
+chk('Qt::Shortcut#activated')          { Qt::Shortcut.new(Qt::KeySequence.new('F5'), Qt::Widget.new).respond_to?(:activated) }
+chk('Qt::TabWidget#current == currentIndex') do
+  t = Qt::TabWidget.new
+  t.current == t.currentIndex
+end
+chk('Qt::TreeWidgetItem#setCheckState') { Qt::TreeWidgetItem.new('x').setCheckState(0, 0); true }
+chk('Qt::VBoxLayout#spacing')          { Qt::VBoxLayout.new.spacing.is_a?(Integer) }
+chk('Qt::ActionGroup#addAction still resolves') do
+  g = Qt::ActionGroup.new(nil)
+  g.addAction(Qt::Action.new('a'))
+  true
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'
