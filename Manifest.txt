@@ -13,6 +13,7 @@ Gemfile
 Guardfile
 LICENSE.txt
 Manifest.txt
+QT6_PORT_ASSESSMENT.md
 README.md
 Rakefile
 appveyor.yml
@@ -233,6 +234,8 @@ bin/mgwhelp-x64.dll
 bin/mgwhelp.dll
 bin/rubysloc
 bin/xtce_converter
+cosmos-demo.sh
+cosmos-run.sh
 cosmos.gemspec
 data/COSMOS_64x64.bmp
 data/COSMOS_64x64.ico

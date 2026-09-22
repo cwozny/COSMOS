@@ -437,13 +437,15 @@ static VALUE string_arg(int argc, VALUE *argv) {
   return Qnil;
 }
 
-// KNOWN GAP: constructors ignore the parent argument. For layouts this is
-// load-bearing -- Qt::VBoxLayout.new(@widget) should install the layout ON
-// @widget, and dropping it orphans everything added to it, which is why
-// CmdTlmServer's tabs render empty (interfaces_tab.rb:105).
-// Honouring it (ctor_layout below) fixes the tabs but destabilises object
-// lifetimes elsewhere and segfaults during startup, so it is not enabled.
-// Fixing this properly needs ownership tracking for parented objects.
+// KNOWN GAP: ctor_plain and ctor_str ignore the parent argument, so a widget
+// built as Qt::X.new(parent) comes back parentless and -- having no parent to
+// own it -- is marked Ruby-owned and freed by the GC as soon as Ruby drops its
+// reference, even though Qt's parent chain was supposed to keep it alive.
+// Layouts do NOT come through here: ctor_layout below honours the parent and
+// sets g_ctor_took_parent. That is load-bearing -- Qt::VBoxLayout.new(@widget)
+// must install the layout ON @widget or everything added to it is orphaned
+// (interfaces_tab.rb:105). Doing the same for widgets needs ownership tracking
+// for parented objects, which is not implemented yet.
 template <typename T> static QObject *ctor_plain(int, VALUE *) { return new T(); }
 
 template <typename T> static QObject *ctor_str(int argc, VALUE *argv) {
