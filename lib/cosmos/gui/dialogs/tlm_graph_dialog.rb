@@ -82,7 +82,7 @@ module Cosmos
 
         dialog.setLayout(dialog_layout)
         dialog.show
-        dialog.raise
+        dialog.raise_
         if dialog.exec == Qt::Dialog::Accepted
           indices_to_graph = [index_chooser.value.to_i]
           if num_array_elements > 0 and checkbox.isChecked()

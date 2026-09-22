@@ -96,7 +96,7 @@ module Cosmos
       # Create the dialog and show it
       dialog = SplashDialogBox.new(parent)
       dialog.show unless wait_for_complete
-      dialog.raise
+      dialog.raise_
 
       # Create a new thread to run the block
       # WARNING! If you need to update your own gui you must wrap it with:

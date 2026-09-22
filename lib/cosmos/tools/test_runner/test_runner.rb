@@ -928,7 +928,7 @@ module Cosmos
         dialog_layout.addWidget(button_box)
         box.setLayout(dialog_layout)
       end
-      dialog.raise
+      dialog.raise_
       dialog.exec
       dialog.dispose
     end

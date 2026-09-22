@@ -133,7 +133,7 @@ module Cosmos
 
       setMaximumWidth(800)
       ok.setFocus
-      self.raise()
+      self.raise_()
       exec()
       dispose()
     end

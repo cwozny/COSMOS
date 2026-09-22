@@ -289,22 +289,14 @@ module Qt
     end
   end
 
-  # qtbindings shadowed Kernel#raise on widgets with QWidget::raise(), and
-  # COSMOS relies on the Qt meaning (top_level.rb:355, tlm_viewer.rb:501/522,
-  # test_runner.rb:931). A blanket override is worse than the problem though:
-  # Impl modules sit ahead of Kernel in every widget subclass, so it turns
-  # `raise SomeError, "msg"` into ArgumentError and a bare re-raise into a
-  # silent no-op -- swallowing errors across the whole widget hierarchy.
-  # Dispatch on what the caller meant; raise_ is the plain Qt binding.
-  class Widget
-    def raise(*args)
-      if args.empty?
-        $! ? Kernel.raise($!) : raise_
-      else
-        Kernel.raise(*args)
-      end
-    end
-  end
+  # qtbindings shadowed Kernel#raise on widgets with QWidget::raise(). Nothing
+  # shadows it here: guessing the caller's intent from $! meant that a no-arg
+  # widget.raise inside a rescue re-raised the exception being handled instead
+  # of raising the window. exception_dialog.rb:104 does exactly that, and
+  # because its @@mutex is unlocked after the call and not in an ensure, the
+  # first error inside a rescue permanently suppressed every later error
+  # dialog in the process. The 25 call sites that mean the Qt sense now say
+  # raise_, which is the plain binding.
 
   # QTextCursor#selection returns a QTextDocumentFragment. COSMOS only ever
   # calls toPlainText on it (qt.rb:530) and reads .format/.cursor off a

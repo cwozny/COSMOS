@@ -99,7 +99,7 @@ module Cosmos
         self.setLayout(overall_layout)
         self.resize(700, 280)
         self.show
-        self.raise
+        self.raise_
       rescue DRb::DRbConnError
         # Just do nothing
       end

@@ -65,7 +65,7 @@ module Cosmos
       resize(500, 300)
 
       self.show()
-      self.raise()
+      self.raise_()
       if self.exec() == Qt::Dialog::Accepted
         build_system_config()
       end

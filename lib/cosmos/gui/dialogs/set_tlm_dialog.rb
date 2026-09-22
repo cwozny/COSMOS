@@ -140,7 +140,7 @@ module Cosmos
     def self.execute(parent, title, done_button, cancel_button, target_name, packet_name, packet = nil)
       dialog = self.new(parent, title, done_button, cancel_button, target_name, packet_name, packet)
       begin
-        dialog.raise
+        dialog.raise_
         if dialog.exec == Qt::Dialog::Accepted
           dialog.set_items
           result = true

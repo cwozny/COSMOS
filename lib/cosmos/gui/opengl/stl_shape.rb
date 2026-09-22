@@ -100,7 +100,7 @@ module Cosmos
       unless @@splash
         @progress_dialog = ProgressDialog.new(Qt::CoreApplication.instance.activeWindow, "Loading STL File", 500, 300, true, false, true, false, false)
         @progress_dialog.show
-        @progress_dialog.raise
+        @progress_dialog.raise_
         @progress_dialog.append_text("Loading #{@stl_file}")
         @progress_dialog.set_overall_progress(0.0)
       else

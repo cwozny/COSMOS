@@ -153,7 +153,7 @@ module Cosmos
       end
 
       @listView.show
-      @listView.raise
+      @listView.raise_
     end
 
     def updateFilteredList(text)

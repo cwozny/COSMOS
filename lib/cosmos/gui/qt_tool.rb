@@ -241,7 +241,7 @@ module Cosmos
       else
         show()
       end
-      self.raise()
+      self.raise_()
     end
 
     # The closeEvent is sent to the application when it is about to close. We

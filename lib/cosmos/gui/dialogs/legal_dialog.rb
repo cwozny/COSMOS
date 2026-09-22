@@ -87,7 +87,7 @@ module Cosmos
       layout.addLayout(hlayout)
 
       self.show()
-      self.raise()
+      self.raise_()
       result = exec()
       dispose()
       exit if result != Qt::Dialog::Accepted

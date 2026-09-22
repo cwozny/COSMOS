@@ -66,7 +66,7 @@ def plot (x = nil, y = nil, legend = "Line 1", *args)
       end
     end
 
-    a.raise
+    a.raise_
     a.show
 
     my_line_graph = a.line_graph

@@ -40,7 +40,7 @@ module Cosmos
       @text_edit.setMinimumSize(width, height)
 
       self.setLayout(layout)
-      self.raise
+      self.raise_
       self.exec
       self.dispose
     end

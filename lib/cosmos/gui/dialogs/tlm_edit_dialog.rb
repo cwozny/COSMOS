@@ -63,7 +63,7 @@ module Cosmos
 
       dialog.setLayout(dialog_layout)
       dialog.show
-      dialog.raise
+      dialog.raise_
       if dialog.exec == Qt::Dialog::Accepted
         if checkbox.isChecked()
           enable_limits(target_name, packet_name, item_name)

@@ -52,7 +52,7 @@ module Cosmos
       # Ideally we resize to show the entire list
       resize(@list.width, @list.height)
 
-      self.raise
+      self.raise_
       exec()
       dispose()
     end

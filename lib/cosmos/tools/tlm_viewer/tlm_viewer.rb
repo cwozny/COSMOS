@@ -498,7 +498,7 @@ module Cosmos
         Qt.execute_in_main_thread(true) do
           begin
             if screen_info.screen.window
-              screen_info.screen.window.raise
+              screen_info.screen.window.raise_
               screen_info.screen.window.activateWindow
               screen_info.screen.window.showNormal
               success = true
@@ -519,7 +519,7 @@ module Cosmos
           screen_info.screen = Screen.new(screen_info.full_name, screen_info.filename, self, :REALTIME, screen_info.x_pos, screen_info.y_pos, screen_info.original_target_name, screen_info.substitute, screen_info.force_substitute)
         end
         if screen_info.screen.window
-          screen_info.screen.window.raise
+          screen_info.screen.window.raise_
           screen_info.screen.window.activateWindow
           screen_info.screen.window.showNormal
         end

@@ -277,7 +277,7 @@ module Cosmos
       # Create a non-modal dialog by default
       dialog = ProgressDialog.new(parent, title, width, height, show_overall, show_step, show_text, show_done, show_cancel)
       dialog.setModal(true)
-      dialog.raise
+      dialog.raise_
 
       dialog.thread = Thread.new do
         dialog.thread = Thread.current

@@ -94,7 +94,7 @@ module Cosmos
 
       self.setLayout(layout)
       self.show
-      self.raise
+      self.raise_
 
       # Attach pry
       @pry_thread = Thread.new do

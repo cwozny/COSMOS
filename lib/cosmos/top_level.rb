@@ -352,7 +352,7 @@ module Cosmos
                   vframe.addWidget(ok)
                   box.setLayout(vframe)
                   box.show
-                  box.raise
+                  box.raise_
                 end
                 dialog.exec
                 dialog.dispose

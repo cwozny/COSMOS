@@ -47,7 +47,7 @@ module Cosmos
       layout.addLayout(button_layout)
 
       setLayout(layout)
-      self.raise
+      self.raise_
       if self.exec == Qt::Dialog::Accepted
         @result = chooser.string
       else

@@ -75,7 +75,12 @@ end
 
 puts "\n2. Qt::Widget#raise shadowed Kernel#raise"
 puts "   (Impl modules sit ahead of Kernel, so `raise Foo, 'm'` in any widget"
-puts "    subclass became ArgumentError and a bare re-raise was swallowed)"
+puts "    subclass became ArgumentError and a bare re-raise was swallowed."
+puts "    Dispatching on $! replaced that with a worse bug: a no-arg"
+puts "    widget.raise inside a rescue re-raised the exception being handled,"
+puts "    and exception_dialog.rb:104 does exactly that -- so the first error"
+puts "    inside a rescue killed every later error dialog in the process."
+puts "    Nothing shadows Kernel#raise now; the Qt sense is spelled raise_.)"
 class RaiseProbe < Qt::Widget
   def with_args;  raise ArgumentError, 'boom'; end
   def bare;       begin; raise 'inner'; rescue; raise; end; end
@@ -88,9 +93,24 @@ chk('bare raise re-raises instead of swallowing') do
   begin; RaiseProbe.new.bare; false
   rescue RuntimeError => e; e.message == 'inner'; end
 end
-chk('dialog.raise still means QWidget::raise()') do
-  Qt::Dialog.new.raise
+chk('widget.raise_ means QWidget::raise()') do
+  Qt::Dialog.new.raise_
   true
+end
+chk('raise_ inside a rescue does not re-raise the handled exception') do
+  begin
+    raise 'original'
+  rescue
+    begin
+      Qt::Widget.new.raise_
+      true
+    rescue
+      false          # the $!-dispatching shim failed exactly here
+    end
+  end
+end
+chk('no widget class shadows Kernel#raise') do
+  Qt::Widget.new.method(:raise).owner == Kernel
 end
 
 puts "\n3. closeEvent never reached Ruby"
