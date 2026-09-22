@@ -84,12 +84,25 @@ class RakeCrc32
 
 end
 
-require 'yard' if RUBY_ENGINE == 'ruby'
+# yard is only needed by the yardoc task below and is not a declared
+# development dependency, so a missing yard must not stop the whole Rakefile
+# from loading -- that would take `rake build` and `rake spec` down with it.
+HAVE_YARD = if RUBY_ENGINE == 'ruby'
+  begin
+    require 'yard'
+    true
+  rescue LoadError
+    false
+  end
+else
+  false
+end
 
 # Import the rake tasks
 import 'tasks/manifest.rake'
 import 'tasks/spec.rake'
 import 'tasks/gemfile_stats.rake'
+import 'tasks/qt6.rake'
 
 # Update the built in task dependencies
 task :default => [:spec] # :test
@@ -159,14 +172,28 @@ task :build => [:devkit] do
       FileUtils.rm_f Dir.glob('*.def')
       FileUtils.rm_f 'Makefile'
       system('ruby extconf.rb')
-      system('make')
+      make_ok = system('make')
       built = "#{extension_name}.#{shared_extension}"
+      build_error = nil
       if File.exist?(built)
-        FileUtils.copy(built, '../../../../lib/cosmos/ext/.')
+        # Replace-and-resign rather than copy over the existing file. On macOS
+        # an in-place overwrite reuses the inode and leaves the kernel holding
+        # a stale code-signing hash for it, after which ruby is SIGKILLed at
+        # load with no message at all -- `codesign -v` still reports the file
+        # as valid, so it looks like the extension simply does not work.
+        dest = File.join('..', '..', '..', '..', 'lib', 'cosmos', 'ext', built)
+        FileUtils.rm_f dest
+        FileUtils.copy(built, dest)
+        system("codesign -f -s - #{dest.inspect}") if RUBY_PLATFORM =~ /darwin/
+      elsif extension_name == 'qt6' && make_ok
+        # Only qt6 is allowed to produce nothing: its extconf.rb writes a stub
+        # Makefile when Qt6 is absent rather than aborting, so a machine with
+        # no Qt6 can still build the rest of COSMOS. Every other extension
+        # producing nothing is a real build failure and must not be silent.
+        puts "  qt6: Qt6 not found - skipping (COSMOS GUI tools will not run)"
       else
-        # qt6 writes a do-nothing Makefile when Qt6 is not installed rather
-        # than aborting, which would fail the whole build.
-        puts "  #{extension_name}: not built (Qt6 not found) - skipping"
+        build_error = "#{extension_name}: build FAILED - " +
+          (make_ok ? "make succeeded but produced no #{built}" : "make returned non-zero")
       end
       FileUtils.rm_f Dir.glob('moc_*.cpp')
       FileUtils.rm_f Dir.glob('*.o')
@@ -174,6 +201,7 @@ task :build => [:devkit] do
       FileUtils.rm_f Dir.glob('*.def')
       FileUtils.rm_f 'Makefile'
       Dir.chdir saved
+      abort("  #{build_error}") if build_error
     end
   end
 end
@@ -300,7 +328,7 @@ task :mac_app_exec_bit do
   end
 end
 
-if RUBY_ENGINE == 'ruby'
+if HAVE_YARD
   YARD::Rake::YardocTask.new do |t|
     t.options = ['--protected'] # See all options by typing 'yardoc --help'
   end

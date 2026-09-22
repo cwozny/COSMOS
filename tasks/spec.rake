@@ -13,7 +13,9 @@ begin
 
   desc 'Run all specs with basic output'
   RSpec::Core::RakeTask.new do |t|
-    t.pattern = ['spec/*_spec.rb']
+    # 'spec/*_spec.rb' matched nothing: all 137 spec files live in
+    # subdirectories, so `rake spec` -- what CI runs -- ran zero tests.
+    t.pattern = ['spec/**/*_spec.rb']
     t.rspec_opts = '-f d'
   end
 

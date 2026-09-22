@@ -5,12 +5,22 @@
 #
 # This exists because each of these used to be found the slow way -- by a user
 # clicking something and getting a stack trace.
+require 'set'   # Array#to_set; not autoloaded on Ruby 2.6
+
 ROOT = File.expand_path('../../../..', __dir__)
 
 bound = []
 cpp = File.read(File.join(ROOT, 'ext/cosmos/ext/qt6/cosmos_qt6.cpp'))
-bound += cpp.scan(/QS?DEF\(\s*\w+\s*,\s*"([^"]+)"/).flatten   # QDEF and QSDEF (class methods)
-bound += cpp.scan(/rb_define_(?:singleton_)?method\(\s*\w+\s*,\s*"([^"]+)"/).flatten
+# The class argument is any expression, not just an identifier: some classes
+# are registered through an array (the drag/drop event classes), and missing
+# that reported already-bound methods as unbound.
+bound += cpp.scan(/QS?DEF\(\s*[^,]+?\s*,\s*"([^"]+)"/).flatten   # QDEF and QSDEF (class methods)
+bound += cpp.scan(/rb_define_(?:singleton_)?method\(\s*[^,]+?\s*,\s*"([^"]+)"/).flatten
+# rb_define_attr defines real readers/writers and was not counted at all.
+cpp.scan(/rb_define_attr\(\s*[^,]+?\s*,\s*"([^"]+)"\s*,\s*(\d)\s*,\s*(\d)\s*\)/) do |name, r, w|
+  bound << name
+  bound << "#{name}=" if w == '1'
+end
 bound += cpp.scan(/\bdef\s+(?:self\.)?([a-zA-Z_]\w*[?!=]?)/).flatten
 bound += File.read(File.join(ROOT, 'lib/Qt.rb')).scan(/\bdef\s+(?:self\.)?([a-zA-Z_]\w*[?!=]?)/).flatten
 

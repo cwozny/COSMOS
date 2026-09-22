@@ -11,9 +11,9 @@ name: Cosmos 4 Tests
 
 on:
   push:
-    branches: [cosmos4]
+    branches: [cosmos4, cosmos4-qt6]
   pull_request:
-    branches: [cosmos4]
+    branches: [cosmos4, cosmos4-qt6]
 
 jobs:
   test:
@@ -31,3 +31,29 @@ jobs:
         run: bundle exec rake build spec
         env:
           COSMOS_DEVEL: ${GITHUB_WORKSPACE}\.
+
+  # The Qt6 binding's own suites. They need Qt 6 and a display, so they run
+  # separately from the matrix above: ubuntu-18.04 has no Qt6 packages, and
+  # without this job nothing ever ran test_regressions.rb -- including the
+  # scan_unbound ratchet in its section 19.
+  qt6:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      CI: 1
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "2.6"
+          bundler-cache: true
+      - name: Install Qt 6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev libgl1-mesa-dev
+      - name: Build extensions
+        run: bundle exec rake build
+      - name: Unbound-method ratchet
+        run: bundle exec rake qt6_scan_unbound
+      - name: Qt6 suites
+        run: bundle exec rake qt6_test
