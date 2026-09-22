@@ -4741,6 +4741,10 @@ extern "C" void Init_qt6(void) {
   QDEF(cTableWidget, "setHorizontalHeaderItem", RUBY_METHOD_FUNC(tw_set_hheader), 2);
   QDEF(cTableWidget, "resizeColumnsToContents", RUBY_METHOD_FUNC((call_void<QTableView, &QTableView::resizeColumnsToContents>)), 0);
   QDEF(cTableWidget, "setHorizontalHeaderLabels", RUBY_METHOD_FUNC(tw_set_h_header_labels), 1);
+  // cmd_params.rb:238. setWordWrap was bound on Qt::Label only, and
+  // scan_unbound.rb matches names rather than receiver types, so a call
+  // on a table looked bound and reached a user instead.
+  QDEF(cTableWidget, "setWordWrap", RUBY_METHOD_FUNC((set_bool<QTableView, &QTableView::setWordWrap>)), 1);
 
   // ---- trees -----------------------------------------------------------
   cTreeWidgetItem = rb_define_class_under(mQt, "TreeWidgetItem", rb_cObject);

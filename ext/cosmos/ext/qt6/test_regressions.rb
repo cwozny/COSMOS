@@ -810,6 +810,30 @@ chk('addRow(labelWidget, field) as well as addRow(String, field)') do
   host.findChildren.count { |c| c.is_a?(Qt::LineEdit) } == 2
 end
 
+puts "\n27. A method bound on one class but called on another"
+puts "   (scan_unbound.rb matches names, not receiver types, so setWordWrap"
+puts "    being bound on Qt::Label made a Qt::TableWidget call look bound."
+puts "    Cmd Sender raised on it at cmd_params.rb:238. Same shape as"
+puts "    Qt::Layout#removeItem vs Qt::ComboBox#removeItem earlier.)"
+chk('Qt::TableWidget#setWordWrap') do
+  Qt::TableWidget.new.setWordWrap(true)
+  true
+end
+chk('Qt::Label#setWordWrap still works') do
+  Qt::Label.new('x').setWordWrap(true)
+  true
+end
+chk('cmd_params.rb create_table sequence runs end to end') do
+  t = Qt::TableWidget.new
+  t.setSizePolicy(Qt::SizePolicy::Expanding, Qt::SizePolicy::Expanding)
+  t.setWordWrap(true)
+  t.setRowCount(2)
+  t.setColumnCount(5)
+  t.setHorizontalHeaderLabels(['Name', 'Value', '', 'Units', 'Description'])
+  t.horizontalHeader.setStretchLastSection(true)
+  true
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'
