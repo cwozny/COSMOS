@@ -41,6 +41,7 @@ QEvent *ruby_call_base_event() {
   f();
   return e;
 }
+QEvent *ruby_current_event() { return t_base_qevent; }
 
 // ---- RubyItemDelegate ------------------------------------------------------
 QWidget *RubyItemDelegate::createEditor(QWidget *parent,
@@ -51,7 +52,8 @@ QWidget *RubyItemDelegate::createEditor(QWidget *parent,
   bool handled = false;
   QWidget *w = NULL;
   ruby_with_gvl([&] {
-    VALUE args[3] = { ruby_wrap_qobject(parent), Qnil, ruby_wrap_model_index(idx) };
+    VALUE args[3] = { ruby_wrap_qobject(parent), ruby_wrap_style_option_view_item(&opt),
+                      ruby_wrap_model_index(idx) };
     VALUE r = ruby_event_call(const_cast<RubyItemDelegate *>(this),
                               "createEditor", 3, args, &handled);
     if (handled) w = ruby_unwrap_widget(r);

@@ -44,6 +44,9 @@ void ruby_with_gvl(const std::function<void()> &fn);
 // NoMethodError. Calling it runs Qt's default; it self-clears so a handler
 // cannot invoke the base twice.
 QEvent *ruby_call_base_event();
+// The real event of that dispatch (nullptr outside one), without running its
+// base: qt_base_event hands it to another widget's handler.
+QEvent *ruby_current_event();
 
 // RAII: installs the base-class thunk for the duration of one dispatch, so a
 // Ruby override's `super` can run Qt's default. Restores the previous thunk,

@@ -1232,6 +1232,47 @@ chk('the Legal dialog verifies every core CRC') do
   !f23_text.include?('Core CRC checks failed') || raise(f23_text.lines.first(2).join.strip)
 end
 
+say "\n35. CmdSender's parameter table reported an error for cells it painted"
+say "    and for every state picked"
+say "   (CmdParamTableItemDelegate draws the state and description columns"
+say "    itself and calls super for the rest, which raised NoMethodError, as"
+say "    did the description column's Qt::Style.CE_ItemViewItem. Its"
+say "    setModelData writes the picked state with model.setData, which was"
+say "    unbound. See test_regressions.rb sections 77 and 78.)"
+require 'stringio'
+# What the binding reports goes to $stderr, which ScriptRunnerFrame has
+# redirected; capture it directly.
+def reported
+  saved = $stderr
+  $stderr = StringIO.new
+  yield
+  APP.processEvents
+  $stderr.string
+ensure
+  $stderr = saved
+end
+collect = cmd_params.update_cmd_params(Cosmos::System.commands.packet('INST', 'COLLECT'))
+collect.resize(900, 300)
+collect.show
+APP.processEvents
+collect_painted = reported { collect.grab }
+chk("painting INST COLLECT's parameters reports no error") do
+  collect_painted.empty? || raise(collect_painted.lines.first.to_s.strip)
+end
+collect_row = param_row(collect, 'TYPE')
+collect.editItem(collect.item(collect_row, 1))
+APP.processEvents
+collect_combo = collect.viewport.findChildren.find { |c| c.is_a?(Qt::ComboBox) }
+collect_delegate = collect.findChildren.find { |c| c.is_a?(Cosmos::CmdParamTableItemDelegate) }
+chk('picking a state commits it without an error') do
+  collect_combo || raise('no state editor opened')
+  collect_combo.setCurrentIndex(collect_combo.findText('SPECIAL'))
+  committed = reported { collect_delegate.commitData(collect_combo) }
+  committed.empty? || raise(committed.lines.first.to_s.strip)
+  (state = collect.item(collect_row, 1).text) == 'SPECIAL' || raise("state cell #{state.inspect}")
+end
+collect.hide
+
 say
 if $failures.empty?
   say 'ALL COSMOS TOOL CHECKS PASSED'

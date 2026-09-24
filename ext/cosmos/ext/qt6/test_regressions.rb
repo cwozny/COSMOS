@@ -2502,6 +2502,124 @@ chk('Qt destroying objects whose wrappers are garbage, under GC from another thr
     raise($?.signaled? ? "died with SIG#{Signal.signame($?.termsig)}" : "exit #{$?.exitstatus}: #{out.lines.grep(/BUG/).first.to_s.strip}")
 end
 
+puts "\n77. super in a StyledItemDelegate override raised NoMethodError"
+puts "   (Qt::StyledItemDelegate had no paint, createEditor, setEditorData or"
+puts "    setModelData for super to reach. CmdSender's parameter delegate calls"
+puts "    super for every cell it does not draw itself, so each of those paints"
+puts "    reported an error, and after its painter.save the skipped restore"
+puts "    left Qt warning 'Painter ended with 1 saved states')"
+class SuperDelegate < Qt::StyledItemDelegate
+  attr_reader :calls
+  def initialize(parent); super(parent); @calls = []; end
+  def paint(painter, option, index)
+    @calls << :paint
+    painter.save
+    super(painter, option, index)
+    painter.restore
+  end
+  def createEditor(parent, option, index); @calls << :createEditor; super(parent, option, index); end
+  def setEditorData(editor, index); @calls << :setEditorData; super(editor, index); end
+  def setModelData(editor, model, index); @calls << :setModelData; super(editor, model, index); end
+end
+f77_table = Qt::TableWidget.new
+f77_table.setRowCount(1)
+f77_table.setColumnCount(1)
+f77_table.setItem(0, 0, Qt::TableWidgetItem.new('before'))
+f77_delegate = SuperDelegate.new(f77_table)
+f77_table.setItemDelegate(f77_delegate)
+f77_table.show
+APP.processEvents
+f77_paint = stderr_of { f77_table.grab }
+chk('paint calling super reports no error') do
+  f77_delegate.calls.include?(:paint) || raise('paint never reached Ruby')
+  f77_paint.empty? || raise(f77_paint.lines.first.to_s.strip)
+end
+f77_edit = stderr_of { f77_table.editItem(f77_table.item(0, 0)) }
+f77_editor = f77_table.viewport.findChildren.find { |c| c.is_a?(Qt::LineEdit) }
+chk('createEditor and setEditorData calling super open an editor on the cell') do
+  f77_edit.empty? || raise(f77_edit.lines.first.to_s.strip)
+  (f77_editor && f77_editor.text == 'before') || raise("editor #{f77_editor.inspect}")
+end
+chk('setModelData calling super writes the edit back') do
+  f77_editor.setText('after')
+  commit = stderr_of { f77_delegate.commitData(f77_editor) }
+  commit.empty? || raise(commit.lines.first.to_s.strip)
+  f77_table.item(0, 0).text == 'after' || raise("cell #{f77_table.item(0, 0).text.inspect}")
+end
+f77_table.hide
+chk('Qt::Style.CE_ItemViewItem reads the constant, as qtbindings did') do
+  # cmd_param_table_item_delegate.rb:65 paints the description column with it
+  Qt::Style.CE_ItemViewItem == Qt::Style::CE_ItemViewItem
+end
+
+puts "\n78. Qt::AbstractItemModel#setData was unbound"
+puts "   (the setModelData overrides of CmdSender's parameter delegate and"
+puts "    TableManager's write a chosen state back with model.setData"
+puts "    (cmd_param_table_item_delegate.rb:74, table_manager.rb:75): every"
+puts "    commit reported NoMethodError and Qt's default wrote the value)"
+def f78_table
+  table = Qt::TableWidget.new
+  table.setRowCount(1)
+  table.setColumnCount(1)
+  table.setItem(0, 0, Qt::TableWidgetItem.new('x'))
+  table
+end
+chk('model.setData(index, Variant, EditRole) sets the cell and returns true') do
+  table = f78_table
+  model = table.model
+  ok = model.setData(model.index(0, 0), Qt::Variant.new('y'), Qt::EditRole)
+  (ok == true && table.item(0, 0).text == 'y') ||
+    raise("returned #{ok.inspect}, cell #{table.item(0, 0).text.inspect}")
+end
+chk('setData takes a plain value and defaults the role to EditRole') do
+  table = f78_table
+  model = table.model
+  model.setData(model.index(0, 0), 'z')
+  table.item(0, 0).text == 'z' || raise("cell #{table.item(0, 0).text.inspect}")
+end
+
+puts "\n79. Handing an event to another widget's handler ran the caller's default"
+puts "   (qt_base_event, the pass-through that makes super work, ran whatever"
+puts "    default was being dispatched and ignored its receiver. TableManager"
+puts "    hands each combo box's wheel to its window, whose default ignores"
+puts "    it so the table scrolls (table_manager.rb:20-24); the combo's own"
+puts "    default ran instead and changed the value under the mouse)"
+class HandOffDialog < Qt::Dialog
+  attr_accessor :other, :handler
+  def closeEvent(e); @other.__send__(@handler, e); end   # no super on itself
+end
+# Closes a HandOffDialog that hands its close event to +handler+ of a plain
+# widget. QDialog's own default would call reject() first.
+def hand_off_close(handler)
+  d = HandOffDialog.new
+  d.other = Qt::Widget.new
+  d.handler = handler
+  rejected = false
+  d.connect(SIGNAL('rejected()')) { rejected = true }
+  d.show
+  APP.processEvents
+  err = stderr_of { d.close }
+  err.empty? || raise(err.lines.first.to_s.strip)
+  rejected && raise("the dialog's own QDialog::closeEvent ran (rejected)")
+  !d.isVisible || raise('the close did not go through')
+end
+chk("closeEvent handed to another widget runs that widget's default") do
+  hand_off_close(:closeEvent)   # QWidget's default accepts the close
+end
+chk('an event handed to a handler of another kind runs nothing') do
+  hand_off_close(:wheelEvent)   # a close event is not a wheel event
+end
+chk('super still runs the dispatching widget\'s own default') do
+  d = Class.new(Qt::Dialog) { def closeEvent(e); super(e); end }.new
+  rejected = false
+  d.connect(SIGNAL('rejected()')) { rejected = true }
+  d.show
+  APP.processEvents
+  d.close
+  APP.processEvents
+  rejected || raise('QDialog::closeEvent did not run')
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'

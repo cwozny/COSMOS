@@ -164,6 +164,25 @@ module Qt
         Qt.__overrides_changed
         result
       end
+
+      # qtbindings also answered an enum value called like a class method:
+      # Qt::Style.CE_ItemViewItem (cmd_param_table_item_delegate.rb:65).
+      def method_missing(name, *args, &block)
+        owner = args.empty? && !block && __qt_const_owner(name)
+        return owner.const_get(name, false) if owner
+        super
+      end
+
+      def respond_to_missing?(name, include_private = false)
+        !!__qt_const_owner(name) || super
+      end
+
+      # The Qt class or module in the ancestry that defines constant +name+.
+      # Not Object's constants: Qt::Style.String is not a Qt enum.
+      def __qt_const_owner(name)
+        return nil unless name.to_s =~ /\A[A-Z]\w*\z/
+        ancestors.find { |a| a.name.to_s.start_with?('Qt::') && a.const_defined?(name, false) }
+      end
     end
 
     def singleton_method_added(name)

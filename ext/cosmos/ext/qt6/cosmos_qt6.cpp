@@ -2795,12 +2795,87 @@ static VALUE url_to_local_file(VALUE self) {
   return rb_str_new2(get_val<QUrl>(self)->toLocalFile().toUtf8().constData());
 }
 
+// The object and virtual being dispatched into Ruby (ruby_event_dispatch_n,
+// ruby_event_call). A handler called on that object under that name is its
+// override's super.
+static thread_local QObject *t_dispatch_obj = nullptr;
+static thread_local const char *t_dispatch_method = nullptr;
+struct DispatchScope {
+  QObject *saved_obj;
+  const char *saved_method;
+  DispatchScope(QObject *o, const char *m) : saved_obj(t_dispatch_obj), saved_method(t_dispatch_method) {
+    t_dispatch_obj = o;
+    t_dispatch_method = m;
+  }
+  ~DispatchScope() { t_dispatch_obj = saved_obj; t_dispatch_method = saved_method; }
+};
+// While qt_base_event runs another widget's handler, that widget's forwarding
+// virtual runs Qt's default instead of dispatching into Ruby: its Ruby
+// override, if it has one, is what called here (see ruby_overrides).
+static thread_local const QObject *t_bypass_obj = nullptr;
+static thread_local const char *t_bypass_method = nullptr;
+
+// The protected QWidget handlers, public so one can run on another widget.
+// Calls through this are virtual: they reach the widget's own class.
+struct WidgetHandlers : public QWidget {
+  using QWidget::closeEvent;   using QWidget::paintEvent;   using QWidget::resizeEvent;
+  using QWidget::showEvent;    using QWidget::wheelEvent;   using QWidget::leaveEvent;
+  using QWidget::focusInEvent; using QWidget::focusOutEvent; using QWidget::keyPressEvent;
+  using QWidget::mousePressEvent; using QWidget::mouseMoveEvent; using QWidget::mouseReleaseEvent;
+};
+// `other.wheelEvent(event)` inside a handler runs other's own handler on the
+// event being dispatched, as qtbindings did. TableManager hands each combo
+// box's wheel to its window this way, whose default ignores it so the table
+// scrolls (table_manager.rb:20-24). Nothing runs outside a dispatch, or for
+// an event the handler does not take. Returns the event it ran on.
+static QEvent *run_other_handler(QObject *receiver, const char *name) {
+  QEvent *e = ruby_current_event();
+  QWidget *w = qobject_cast<QWidget *>(receiver);
+  if (!e || !w || !name) return nullptr;
+  WidgetHandlers *h = static_cast<WidgetHandlers *>(w);
+  const QEvent::Type t = e->type();
+  const QObject *saved_obj = t_bypass_obj;
+  const char *saved_method = t_bypass_method;
+  t_bypass_obj = w;
+  t_bypass_method = name;
+  bool ran = true;
+  if (!strcmp(name, "closeEvent") && t == QEvent::Close)            h->closeEvent(static_cast<QCloseEvent *>(e));
+  else if (!strcmp(name, "paintEvent") && t == QEvent::Paint)       h->paintEvent(static_cast<QPaintEvent *>(e));
+  else if (!strcmp(name, "resizeEvent") && t == QEvent::Resize)     h->resizeEvent(static_cast<QResizeEvent *>(e));
+  else if (!strcmp(name, "showEvent") && t == QEvent::Show)         h->showEvent(static_cast<QShowEvent *>(e));
+  else if (!strcmp(name, "wheelEvent") && t == QEvent::Wheel)       h->wheelEvent(static_cast<QWheelEvent *>(e));
+  else if (!strcmp(name, "leaveEvent") && t == QEvent::Leave)       h->leaveEvent(e);
+  else if (!strcmp(name, "focusInEvent") && t == QEvent::FocusIn)   h->focusInEvent(static_cast<QFocusEvent *>(e));
+  else if (!strcmp(name, "focusOutEvent") && t == QEvent::FocusOut) h->focusOutEvent(static_cast<QFocusEvent *>(e));
+  else if (!strcmp(name, "keyPressEvent") && t == QEvent::KeyPress) h->keyPressEvent(static_cast<QKeyEvent *>(e));
+  else if (!strcmp(name, "mousePressEvent") &&
+           (t == QEvent::MouseButtonPress || t == QEvent::MouseButtonDblClick))
+    h->mousePressEvent(static_cast<QMouseEvent *>(e));
+  else if (!strcmp(name, "mouseMoveEvent") && t == QEvent::MouseMove)
+    h->mouseMoveEvent(static_cast<QMouseEvent *>(e));
+  else if (!strcmp(name, "mouseReleaseEvent") && t == QEvent::MouseButtonRelease)
+    h->mouseReleaseEvent(static_cast<QMouseEvent *>(e));
+  else ran = false;
+  t_bypass_obj = saved_obj;
+  t_bypass_method = saved_method;
+  return ran ? e : nullptr;
+}
+
 // Bound so a Ruby override's `super` reaches Qt's default implementation.
 // 25 COSMOS event handlers call super; without these it is a NoMethodError
-// ("super: no superclass method `closeEvent'"). Takes any args and ignores
-// them -- the event pointer is captured by the dispatching virtual.
-static VALUE qt_base_event(int argc, VALUE *argv, VALUE) {
-  QEvent *e = ruby_call_base_event();
+// ("super: no superclass method `closeEvent'"). The event pointer is
+// captured by the dispatching virtual. Called on any other widget, or under
+// another handler's name, it is that widget's handler instead: it used to run
+// whatever default was being dispatched, whatever the receiver.
+static VALUE qt_base_event(int argc, VALUE *argv, VALUE self) {
+  QObject *receiver = get_wrap(self)->ptr;   // NULL once Qt deleted it
+  const char *name = rb_id2name(rb_frame_this_func());
+  QEvent *e;
+  if (receiver && receiver == t_dispatch_obj && t_dispatch_method && name &&
+      !strcmp(name, t_dispatch_method))
+    e = ruby_call_base_event();
+  else
+    e = run_other_handler(receiver, name);
   // Copy what Qt's default did to the event back into the Ruby snapshot the
   // override was handed: the dispatcher writes the snapshot's flag onto the
   // real event afterwards, and the untouched default (accepted) undid Qt's
@@ -3421,6 +3496,7 @@ bool ruby_event_dispatch_n(QObject *obj, const char *method, int argc, VALUE *ar
   EvCall c;
   c.obj = self; c.mid = mid; c.argc = argc;
   for (int i = 0; i < argc && i < 4; i++) c.argv[i] = argv[i];
+  DispatchScope ds(obj, method);
   return ev_invoke_protected(&c, method);
 }
 
@@ -3732,6 +3808,7 @@ VALUE ruby_event_call(QObject *obj, const char *method, int argc, VALUE *argv, b
   r.ev.obj = self; r.ev.mid = mid; r.ev.argc = argc;
   for (int i = 0; i < argc && i < 4; i++) r.ev.argv[i] = argv[i];
   r.result = Qnil;
+  DispatchScope ds(obj, method);
   *handled = ev_call_ret_protected(&r, method);
   return r.result;
 }
@@ -4558,6 +4635,10 @@ static bool override_mask(const QObject *obj, unsigned *mask) {
   return true;
 }
 bool ruby_overrides(const QObject *obj, RubyOverrides &c, const char *method) {
+  if (obj == t_bypass_obj && t_bypass_method && !strcmp(method, t_bypass_method)) {
+    t_bypass_obj = nullptr;            // this one call only (see run_other_handler)
+    return false;
+  }
   int i = 0;
   while (i < kForwardedCount && strcmp(kForwardedVirtuals[i], method)) i++;
   if (i == kForwardedCount) return true;              // not tracked
@@ -4589,6 +4670,19 @@ static VALUE variant_from_value(VALUE klass, VALUE v) {
   if (rb_obj_is_kind_of(v, cPoint))
     return wrap_val<QVariant>(cVariant, QVariant::fromValue(*get_val<QPoint>(v)));
   return wrap_val<QVariant>(cVariant, QVariant(rb_to_qs(v)));
+}
+
+// The setModelData overrides of CmdSender's parameter delegate and
+// TableManager's write the picked state back with
+// model.setData(index, Qt::Variant.new(text), Qt::EditRole)
+// (cmd_param_table_item_delegate.rb:74, table_manager.rb:75).
+static VALUE model_set_data(int argc, VALUE *argv, VALUE self) {
+  VALUE idx, value, role;
+  rb_scan_args(argc, argv, "21", &idx, &value, &role);
+  QVariant v;
+  if (!variant_arg(value, &v)) v = *get_val<QVariant>(variant_from_value(cVariant, value));
+  return qcast<QAbstractItemModel>(self)->setData(
+      *get_val<QModelIndex>(idx), v, NIL_P(role) ? (int)Qt::EditRole : NUM2INT(role)) ? Qtrue : Qfalse;
 }
 
 
@@ -4794,6 +4888,34 @@ static VALUE delegate_init_style_option(VALUE self, VALUE opt, VALUE idx) {
   static_cast<DelegateAccess *>(d)->initStyleOption(
       get_val<QStyleOptionViewItem>(opt), *get_val<QModelIndex>(idx));
   return self;
+}
+// What super reaches from a COSMOS delegate override: QStyledItemDelegate's
+// own implementation, called non-virtually so it does not dispatch back into
+// the override. CmdSender's parameter delegate calls super for every cell it
+// does not draw itself (cmd_param_table_item_delegate.rb:38/68/76/90), and
+// TableManager's for every cell without states (table_manager.rb:64/77/94).
+static VALUE delegate_paint(VALUE self, VALUE painter, VALUE opt, VALUE idx) {
+  qcast<QStyledItemDelegate>(self)->QStyledItemDelegate::paint(
+      painter_of(painter), *get_val<QStyleOptionViewItem>(opt), *get_val<QModelIndex>(idx));
+  return Qnil;
+}
+static VALUE delegate_create_editor(VALUE self, VALUE parent, VALUE opt, VALUE idx) {
+  QStyleOptionViewItem none;
+  QWidget *w = qcast<QStyledItemDelegate>(self)->QStyledItemDelegate::createEditor(
+      ruby_unwrap_widget(parent), NIL_P(opt) ? none : *get_val<QStyleOptionViewItem>(opt),
+      *get_val<QModelIndex>(idx));
+  return ruby_wrap_qobject(w);   // the view owns the editor
+}
+static VALUE delegate_set_editor_data(VALUE self, VALUE editor, VALUE idx) {
+  qcast<QStyledItemDelegate>(self)->QStyledItemDelegate::setEditorData(
+      ruby_unwrap_widget(editor), *get_val<QModelIndex>(idx));
+  return Qnil;
+}
+static VALUE delegate_set_model_data(VALUE self, VALUE editor, VALUE model, VALUE idx) {
+  qcast<QStyledItemDelegate>(self)->QStyledItemDelegate::setModelData(
+      ruby_unwrap_widget(editor), qobject_cast<QAbstractItemModel *>(get_obj(model)),
+      *get_val<QModelIndex>(idx));
+  return Qnil;
 }
 
 // ---- bindings COSMOS calls that were never defined -------------------------
@@ -5937,6 +6059,7 @@ extern "C" void Init_qt6(void) {
 
   cAbstractItemModel = rb_define_class_under(mQt, "AbstractItemModel", cQtObject);
   QDEF(cAbstractItemModel, "index", RUBY_METHOD_FUNC(model_index), -1);
+  QDEF(cAbstractItemModel, "setData", RUBY_METHOD_FUNC(model_set_data), -1);
   VALUE cStringListModel = rb_define_class_under(mQt, "StringListModel", cAbstractItemModel);
   rb_define_alloc_func(cStringListModel, qtobj_alloc);
   QDEF(cStringListModel, "initialize", RUBY_METHOD_FUNC(slmodel_init), -1);
@@ -5983,6 +6106,10 @@ extern "C" void Init_qt6(void) {
   VALUE cStyledItemDelegate = rb_define_class_under(mQt, "StyledItemDelegate", cQtObject);
   register_ctor(cStyledItemDelegate, ctor_plain<RubyItemDelegate>);   // virtuals -> Ruby
   QDEF(cStyledItemDelegate, "initStyleOption", RUBY_METHOD_FUNC(delegate_init_style_option), 2);
+  QDEF(cStyledItemDelegate, "paint",         RUBY_METHOD_FUNC(delegate_paint), 3);
+  QDEF(cStyledItemDelegate, "createEditor",  RUBY_METHOD_FUNC(delegate_create_editor), 3);
+  QDEF(cStyledItemDelegate, "setEditorData", RUBY_METHOD_FUNC(delegate_set_editor_data), 2);
+  QDEF(cStyledItemDelegate, "setModelData",  RUBY_METHOD_FUNC(delegate_set_model_data), 3);
   QDEF(cStyledItemDelegate, "commitData",  RUBY_METHOD_FUNC(delegate_commit_data), 1);
   QDEF(cStyledItemDelegate, "closeEditor", RUBY_METHOD_FUNC(delegate_close_editor), -1);
 
@@ -6404,6 +6531,9 @@ extern "C" void Init_qt6(void) {
   register_qt_class("QAbstractButton", cAbstractButton);
   // Completer#popup's QListView, and any other bare item view Qt hands back.
   register_qt_class("QAbstractItemView", cAbstractItemView);
+  // The model a delegate's setModelData is handed (QTableWidget's is the
+  // private QTableModel); it came back as a bare Qt::Object with no setData.
+  register_qt_class("QAbstractItemModel", cAbstractItemModel);
   // The static MessageBox.critical/warning/... boxes are built in C++; found
   // through topLevelWidgets they came back as a bare Qt::Dialog.
   register_qt_class("QMessageBox", cMessageBox);
