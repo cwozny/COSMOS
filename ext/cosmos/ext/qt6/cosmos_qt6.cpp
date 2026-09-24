@@ -4611,9 +4611,11 @@ static VALUE guard_3(VALUE self, VALUE a, VALUE b, VALUE c) {
 static VALUE guard_4(VALUE self, VALUE a, VALUE b, VALUE c, VALUE d) {
   return ((VALUE (*)(VALUE, VALUE, VALUE, VALUE, VALUE))guarded_target())(self, a, b, c, d);
 }
+// (rb_define_method)(...) calls the function, not the Ruby 2.7+ macro of the
+// same name, which only takes a compile-time arity; this one is a variable.
 static void define_guarded(VALUE owner, const char *name, AnyFn fn, int arity) {
   for (const char *u : kUnguarded)
-    if (!strcmp(u, name)) { rb_define_method(owner, name, fn, arity); return; }
+    if (!strcmp(u, name)) { (rb_define_method)(owner, name, fn, arity); return; }
   AnyFn tramp;
   switch (arity) {
     case -1: tramp = RUBY_METHOD_FUNC(guard_m1); break;
@@ -4625,7 +4627,7 @@ static void define_guarded(VALUE owner, const char *name, AnyFn fn, int arity) {
     default: rb_fatal("qt6 binding: no main-thread guard for arity %d (%s)", arity, name);
   }
   g_bound[BoundKey{owner, rb_intern(name)}] = fn;
-  rb_define_method(owner, name, tramp, arity);
+  (rb_define_method)(owner, name, tramp, arity);
 }
 // A Qt class's own (singleton) method, e.g. Qt::MessageBox.warning.
 #define QCDEF(klass, name, fn, arity) \
