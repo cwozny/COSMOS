@@ -1,12 +1,20 @@
 # Runs vendor/installers/windows/INSTALL_COSMOS.bat on a clean Windows runner
-# and then starts two COSMOS tools from what it installed. Only pushes that change
-# the installer (or this file) run it: it downloads and builds everything, which
-# takes a while. The pushed branch's checkout is what gets installed.
+# and then starts two COSMOS tools from what it installed. It downloads and
+# builds everything, which takes a while, so only changes to the installer (or
+# this file) run it: pushes to cosmos4-qt6, and pull requests into it, where
+# every update of such a pull request runs it on the PR's own code. The
+# checkout is what gets installed.
 
 name: Windows Installer
 
 on:
   push:
+    branches: [cosmos4-qt6]
+    paths:
+      - "vendor/installers/windows/**"
+      - ".github/workflows/windows_installer.yml"
+  pull_request:
+    branches: [cosmos4-qt6]
     paths:
       - "vendor/installers/windows/**"
       - ".github/workflows/windows_installer.yml"
