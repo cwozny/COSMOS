@@ -38,11 +38,16 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
           COSMOS_USERPATH: C:\COSMOS\Demo
+          # The Demo's tools run under its Gemfile (tool_launch.rb requires
+          # bundler/setup first). tool_smoke.rb's stand-in Gemfile instead
+          # has Bundler resolve after the tool redirects its output, and
+          # "Resolving dependencies..." then opens a dialog.
+          BUNDLE_GEMFILE: C:\COSMOS\Demo\Gemfile
         # Not the Launcher: it opens the modal Legal dialog first, and
         # tool_smoke.rb reports no main window for it.
         run: |
           call C:\COSMOS\cosmosenv.bat
           ruby -e "require 'ruby_installer/runtime'; puts 'MSYS2: ' + RubyInstaller::Runtime.msys2_installation.msys_path"
           for /d %%G in (C:\COSMOS\Vendor\Ruby\lib\ruby\gems\2.6.0\gems\cosmos-*) do set "COSMOS_GEM_DIR=%%G"
-          ruby "%COSMOS_GEM_DIR%\ext\cosmos\ext\qt6\tool_smoke.rb" cosmos/tools/packet_viewer/packet_viewer Cosmos::PacketViewer 10 || exit /b 1
-          ruby "%COSMOS_GEM_DIR%\ext\cosmos\ext\qt6\tool_smoke.rb" cosmos/tools/tlm_grapher/tlm_grapher Cosmos::TlmGrapher 10 || exit /b 1
+          call bundle exec ruby "%COSMOS_GEM_DIR%\ext\cosmos\ext\qt6\tool_smoke.rb" cosmos/tools/packet_viewer/packet_viewer Cosmos::PacketViewer 10 || exit /b 1
+          call bundle exec ruby "%COSMOS_GEM_DIR%\ext\cosmos\ext\qt6\tool_smoke.rb" cosmos/tools/tlm_grapher/tlm_grapher Cosmos::TlmGrapher 10 || exit /b 1

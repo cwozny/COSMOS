@@ -493,7 +493,7 @@ if errorlevel 1 (
 ) else (
   @echo Successfully created cosmos Basic >> !COSMOS_INSTALL!\INSTALL.log
 )
-cd !COSMOS_INSTALL!\Basic\config\dart && call bundle install
+cd /d !COSMOS_INSTALL!\Basic\config\dart && call bundle install
 call cosmos demo !COSMOS_INSTALL!\Demo
 if errorlevel 1 (
   echo ERROR: Problem creating cosmos Demo
@@ -504,8 +504,8 @@ if errorlevel 1 (
 ) else (
   @echo Successfully created cosmos Demo >> !COSMOS_INSTALL!\INSTALL.log
 )
-cd !COSMOS_INSTALL!\Demo\config\dart && call bundle install
-cd %curdir%
+cd /d !COSMOS_INSTALL!\Demo\config\dart && call bundle install
+cd /d %curdir%
 
 :::::::::::::::::::::
 :: Perform offline configuration
