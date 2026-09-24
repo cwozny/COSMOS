@@ -364,7 +364,9 @@ module Qt
   end
 
   class << self
-    alias_method :__post_to_main_thread, :post_to_main_thread
+    # Once only: a second load of this file would alias the wrapper below to
+    # itself, and every post would recurse until SystemStackError.
+    alias_method :__post_to_main_thread, :post_to_main_thread unless method_defined?(:__post_to_main_thread)
 
     # Register the block with RubyThreadFix.queue before posting, so a drain
     # loop can run anything the event loop has not reached yet.

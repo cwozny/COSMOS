@@ -2925,6 +2925,45 @@ chk('an item of the wrong type names both types') do
     'wrong argument type Qt::ListWidgetItem (expected Qt::TreeWidgetItem)' || raise(m)
 end
 
+puts "\n91. Only four of Qt's global colors existed (Qt::blue was undefined)"
+puts "   (black, white, red and lightGray are all COSMOS itself uses; qtbindings"
+puts "    had every Qt::GlobalColor, which screens and tools outside the repo"
+puts "    may use)"
+chk('every Qt::GlobalColor is defined and names its color') do
+  expected = {
+    blue: [0, 0, 255], green: [0, 255, 0], yellow: [255, 255, 0], cyan: [0, 255, 255],
+    magenta: [255, 0, 255], gray: [160, 160, 164], darkGray: [128, 128, 128],
+    darkRed: [128, 0, 0], darkGreen: [0, 128, 0], darkBlue: [0, 0, 128],
+    darkCyan: [0, 128, 128], darkMagenta: [128, 0, 128], darkYellow: [128, 128, 0],
+    color0: [255, 255, 255], color1: [0, 0, 0], transparent: [0, 0, 0],
+  }
+  wrong = expected.reject do |name, rgb|
+    c = Qt::Color.new(Qt.__send__(name))
+    [c.red, c.green, c.blue] == rgb
+  end
+  wrong.empty? || raise("wrong: #{wrong.keys.join(', ')}")
+end
+
+puts "\n92. Loading lib/Qt.rb a second time made every post recurse"
+puts "   (its post_to_main_thread wrapper aliases the binding's method first;"
+puts "    a second load aliased the wrapper to itself, and the next post"
+puts "    raised SystemStackError. COSMOS itself only requires it, once.)"
+DOUBLE_LOAD = <<~'RUBY'
+  $stdout.sync = true
+  require 'Qt'
+  load File.join(ARGV[0], 'Qt.rb')
+  app = Qt::Application.new([])
+  ran = false
+  Qt.post_to_main_thread { ran = true }
+  app.processEvents
+  puts(ran ? 'ran' : 'not run')
+RUBY
+chk('a second load of lib/Qt.rb leaves post_to_main_thread working') do
+  lib = File.expand_path('../../../../lib', __dir__)
+  out = IO.popen([RbConfig.ruby, '-I', lib, '-e', DOUBLE_LOAD, lib, err: [:child, :out]], &:read)
+  out.include?('ran') || raise(out.lines.grep(/Error/).first.to_s.strip)
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'

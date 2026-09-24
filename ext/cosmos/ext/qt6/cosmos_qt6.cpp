@@ -5549,6 +5549,17 @@ extern "C" void Init_qt6(void) {
   rb_define_singleton_method(mQt, "white",     RUBY_METHOD_FUNC((global_color<(int)Qt::white>)), 0);
   rb_define_singleton_method(mQt, "red",       RUBY_METHOD_FUNC((global_color<(int)Qt::red>)), 0);
   rb_define_singleton_method(mQt, "lightGray", RUBY_METHOD_FUNC((global_color<(int)Qt::lightGray>)), 0);
+  // The rest of Qt::GlobalColor, which qtbindings had; COSMOS uses only the
+  // four above, but screens and tools outside the repo may use any.
+#define DEF_GLOBAL_COLOR(n) \
+  rb_define_singleton_method(mQt, #n, RUBY_METHOD_FUNC((global_color<(int)Qt::n>)), 0)
+  DEF_GLOBAL_COLOR(color0);     DEF_GLOBAL_COLOR(color1);    DEF_GLOBAL_COLOR(darkGray);
+  DEF_GLOBAL_COLOR(gray);       DEF_GLOBAL_COLOR(green);     DEF_GLOBAL_COLOR(blue);
+  DEF_GLOBAL_COLOR(cyan);       DEF_GLOBAL_COLOR(magenta);   DEF_GLOBAL_COLOR(yellow);
+  DEF_GLOBAL_COLOR(darkRed);    DEF_GLOBAL_COLOR(darkGreen); DEF_GLOBAL_COLOR(darkBlue);
+  DEF_GLOBAL_COLOR(darkCyan);   DEF_GLOBAL_COLOR(darkMagenta); DEF_GLOBAL_COLOR(darkYellow);
+  DEF_GLOBAL_COLOR(transparent);
+#undef DEF_GLOBAL_COLOR
 
   rb_define_const(mQt, "MidButton", INT2NUM((int)Qt::MiddleButton));  // renamed in Qt6
   rb_define_const(mQt, "MiddleButton", INT2NUM((int)Qt::MiddleButton));
