@@ -343,7 +343,18 @@ begin
   buttons = 5.times.map { |i| Qt::PushButton.new("b#{i}") }
   buttons.each { |b| b.connect(SIGNAL("clicked()")) { fired_total += 1 } }
 
-  churn = Thread.new { 300.times { Qt::Label.new("x"); sleep 0.001 } }
+  # The labels are made on the main thread, from a timer inside the event
+  # loop: the binding refuses Qt calls from any other thread, as qtbindings
+  # did (test_regressions.rb section 69). They become garbage that gcer's
+  # sweeps free off the main thread.
+  churned = 0
+  churn = Qt::Timer.new
+  churn.connect(SIGNAL("timeout()")) do
+    10.times { Qt::Label.new("x") }
+    churned += 10
+    churn.stop if churned >= 300
+  end
+  churn.start(1)
   gcer  = Thread.new { 20.times { GC.start; sleep 0.01 } }
   poster = Thread.new do
     30.times { Qt.execute_in_main_thread(false) { fired_total += 0 }; sleep 0.005 }
@@ -351,13 +362,15 @@ begin
 
   40.times { buttons.each(&:click) }
   app.exec_for(1200)
-  [churn, gcer, poster].each { |t| t.join(3) }
+  [gcer, poster].each { |t| t.join(3) }
+  churn.stop
   GC.start
 rescue Exception => e
   stress_errors << "#{e.class}: #{e.message}"
 end
 chk("survives concurrent signal/thread/GC load") { stress_errors.empty? ? true : stress_errors }
 chk("all signal dispatches landed")              { fired_total >= 200 }
+chk("the event loop churned 300 labels")          { churned >= 300 }
 
 puts
 if $fail.empty?

@@ -18,14 +18,15 @@
 # only covers receivers it can resolve.
 require 'set'   # Array#to_set; not autoloaded on Ruby 2.6
 
-ROOT = File.expand_path('../../../..', __dir__)
+# QT6_SCAN_ROOT points the scan at another tree (test_regressions.rb's fixture).
+ROOT = ENV['QT6_SCAN_ROOT'] || File.expand_path('../../../..', __dir__)
 
 bound = []
 cpp = File.read(File.join(ROOT, 'ext/cosmos/ext/qt6/cosmos_qt6.cpp'))
 # The class argument is any expression, not just an identifier: some classes
 # are registered through an array (the drag/drop event classes), and missing
 # that reported already-bound methods as unbound.
-bound += cpp.scan(/QS?DEF\(\s*[^,]+?\s*,\s*"([^"]+)"/).flatten   # QDEF and QSDEF (class methods)
+bound += cpp.scan(/Q[SC]?DEF\(\s*[^,]+?\s*,\s*"([^"]+)"/).flatten   # QDEF, and QSDEF/QCDEF (class methods)
 bound += cpp.scan(/rb_define_(?:singleton_)?method\(\s*[^,]+?\s*,\s*"([^"]+)"/).flatten
 # rb_define_attr defines real readers/writers and was not counted at all.
 cpp.scan(/rb_define_attr\(\s*[^,]+?\s*,\s*"([^"]+)"\s*,\s*(\d)\s*,\s*(\d)\s*\)/) do |name, r, w|
@@ -123,7 +124,7 @@ add = lambda do |kls, name|
   kls = kls.strip
   if kls =~ /\A[A-Za-z_]\w*\z/ then methods_of_var[kls] << name else UNATTRIBUTABLE << name end
 end
-cpp.scan(/QS?DEF\(\s*([^,]+?)\s*,\s*"([^"]+)"/)                               { |k, m| add.call(k, m) }
+cpp.scan(/Q[SC]?DEF\(\s*([^,]+?)\s*,\s*"([^"]+)"/)                            { |k, m| add.call(k, m) }
 cpp.scan(/rb_define_(?:singleton_)?method\(\s*([^,]+?)\s*,\s*"([^"]+)"/)      { |k, m| add.call(k, m) }
 cpp.scan(/rb_define_attr\(\s*([^,]+?)\s*,\s*"([^"]+)"\s*,\s*(\d)\s*,\s*(\d)\s*\)/) do |k, m, _r, w|
   add.call(k, m)
@@ -134,16 +135,36 @@ end
 ruby_methods_of_name = Hash.new { |h, k| h[k] = Set.new }
 (Dir.glob(File.join(ROOT, 'lib/cosmos/**/*.rb')) + [File.join(ROOT, 'lib/Qt.rb')]).each do |f|
   current = nil
+  indent = nil
   in_qt_module = false
   File.readlines(f, encoding: 'BINARY').each do |line|
     in_qt_module = true if line =~ /^\s*module\s+Qt\s*$/
-    if (md = line.match(/^\s*class\s+Qt::(\w+)/)) then current = md[1]
-    elsif in_qt_module && (md = line.match(/^\s*class\s+([A-Z]\w*)/)) then current = md[1]
+    if (md = line.match(/^(\s*)class\s+Qt::(\w+)/)) then current, indent = md[2], md[1]
+    elsif in_qt_module && (md = line.match(/^(\s*)class\s+([A-Z]\w*)/)) then current, indent = md[2], md[1]
     elsif line =~ /^\s*(class|module)\s/ then current = nil
+    # The class ends at its `end`: a def after it (qt.rb's removeAll, in a
+    # class_eval loop) is not the last-opened class's.
+    elsif current && line =~ /^#{indent}end\b/ then current = nil
     end
     if current && (md = line.match(/^\s*def\s+(?:self\.)?([a-zA-Z_]\w*[?!=]?)/))
       ruby_methods_of_name[current] << md[1]
     end
+  end
+end
+
+# qt.rb adds removeAll to six layout classes in one loop:
+#   %w(GridLayout BoxLayout ...).each do |klass|
+#     "Qt::#{klass}".to_class.class_eval do
+#       def removeAll
+# Those defs belong to each class listed.
+Dir.glob(File.join(ROOT, 'lib/cosmos/**/*.rb')).each do |f|
+  lines = File.readlines(f, encoding: 'BINARY')
+  lines.each_with_index do |line, i|
+    md = line.match(/^(\s*)%w\(([^)]*)\)\.each\s+do\s+\|(\w+)\|/)
+    next unless md && lines[i + 1].to_s.include?("\"Qt::\#{#{md[3]}}\".to_class.class_eval do")
+    last = (i + 1...lines.size).find { |j| lines[j] =~ /^#{md[1]}end\b/ } || lines.size - 1
+    defs = lines[i..last].map { |l| l[/^\s*def\s+([a-zA-Z_]\w*[?!=]?)/, 1] }.compact
+    md[2].split.each { |k| ruby_methods_of_name[k].merge(defs) }
   end
 end
 
@@ -185,6 +206,28 @@ end
 
 # Anything Object already answers is never a binding gap.
 OBJECT_METHODS = Object.instance_methods.map(&:to_s).to_set
+# lib/Qt.rb mixes modules into every Qt class (`k.send(:include,
+# ValueDispose)` gives each value type dispose; MethodAliases adds
+# method_missing), so the instance methods of those modules count as bound
+# on every class.
+GENERIC_DEFS = Set.new
+qt_rb = File.readlines(File.join(ROOT, 'lib/Qt.rb'), encoding: 'BINARY')
+mixed_in = qt_rb.join.scan(/\.send\(:include,\s*(\w+)\)/).flatten.to_set
+qt_rb.each_with_index do |line, i|
+  md = line.match(/^(\s*)module\s+(\w+)\s*$/)
+  next unless md && mixed_in.include?(md[2])
+  last = (i + 1...qt_rb.size).find { |j| qt_rb[j] =~ /^#{md[1]}end\b/ } || qt_rb.size - 1
+  qt_rb[i..last].each { |l| (m = l[/^\s*def\s+(?!self\.)([a-zA-Z_]\w*[?!=]?)/, 1]) && GENERIC_DEFS << m }
+end
+# lib/cosmos/gui/opengl/opengl.rb includes the opengl gem's OpenGL and GLU
+# modules at top level, which makes their gl*/glu* functions callable with no
+# receiver anywhere. They are not Qt methods.
+GEM_FUNCTION = /\Aglu?[A-Z]/
+# String literals hold signal and slot signatures -- SIGNAL('itemClicked(...)')
+# -- which look like calls.
+def code_only(line)
+  line.gsub(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"/, '""')
+end
 
 # Resolve receivers from `var = Qt::X.new`. Locals are scoped to the enclosing
 # def -- a file-wide map made `box` in one method pick up the class of a `box`
@@ -218,18 +261,135 @@ Dir.glob(File.join(ROOT, 'lib/cosmos/{gui,tools}/**/*.rb')).each do |f|
 
     # (?<![.\w@:]) keeps the receiver to the FIRST segment of a chain: in
     # `item.text.scan(...)` the receiver of scan is a String, not the widget.
-    line.scan(/(?<![.\w@:])(@?[a-z_]\w*)\.([a-zA-Z_]\w*[?!]?)\s*(=[^=~]|[(\s]|$)/) do |recv, meth, tail|
+    code_only(line).scan(/(?<![.\w@:])(@?[a-z_]\w*)\.([a-zA-Z_]\w*[?!]?)\s*(=[^=~]|[(\s]|$)/) do |recv, meth, tail|
       klass = recv.start_with?('@') ? single_qt_class(ivars, recv) : single_qt_class(locals, recv)
       next unless klass && var_of_name.key?(klass)
       # `x.foo = v` is a call to foo=, not to foo.
       meth = "#{meth}=" if tail.to_s.start_with?('=')
-      next if OBJECT_METHODS.include?(meth) || UNATTRIBUTABLE.include?(meth)
-      next if cosmos_defs.include?(meth)
+      next if OBJECT_METHODS.include?(meth) || UNATTRIBUTABLE.include?(meth) || GENERIC_DEFS.include?(meth)
+      # No blanket skip for names COSMOS defines somewhere: COSMOS's own
+      # Qt::Dialog#exec hid the unbound Qt::Menu#exec that way. COSMOS reopens
+      # of this class are already in methods_for.
       next if spelling_ok?(meth, methods_for.call(klass))
       class_hits << ["Qt::#{klass}##{meth}", "#{f.sub(ROOT + '/', '')}:#{i + 1}"]
     end
   end
 end
+# ---------------------------------------------------------------------------
+# IMPLICIT pass: calls with no receiver inside a COSMOS subclass of a Qt
+# class -- MatrixbycolumnsWidget < Qt::GridLayout calls setHorizontalSpacing,
+# AdaptiveGridLayout calls addItem -- are checked against the Qt class the
+# chain ends in, plus what the COSMOS classes in the chain (and the modules
+# they include) define. Only camelCase names, which is what Qt's API looks
+# like and COSMOS's own helpers mostly do not.
+# ---------------------------------------------------------------------------
+cosmos_classes = {}   # simple name -> { super:, defs:, includes: }
+module_defs = Hash.new { |h, k| h[k] = Set.new }
+class_bodies = []     # [file, first line index, last line index, class name]
+Dir.glob(File.join(ROOT, 'lib/**/*.rb')).each do |f|
+  lines = File.readlines(f, encoding: 'BINARY')
+  lines.each_with_index do |line, i|
+    md = line.match(/^(\s*)(class|module)\s+([A-Z][\w:]*)(?:\s*<\s*([A-Z][\w:]*))?/)
+    next unless md
+    indent, kind, full, sup = md[1], md[2], md[3], md[4]
+    # A reopened Qt class (`class Qt::MainWindow`, classification_banner.rb)
+    # makes bare calls on that Qt class. It is keyed by its full name so it
+    # cannot merge with a COSMOS class of the same simple name.
+    reopen = kind == 'class' && sup.nil? && full.start_with?('Qt::')
+    name = reopen ? full : full.split('::').last
+    last = (i + 1...lines.size).find { |j| lines[j] =~ /^#{indent}end\b/ } || lines.size - 1
+    body = lines[i..last]
+    defs = body.map { |l| l[/^\s*def\s+(?:self\.)?([a-zA-Z_]\w*[?!=]?)/, 1] }.compact.to_set
+    body.each { |l| l.scan(/attr_(?:accessor|reader|writer)\s+(.+)/).flatten.each { |a| defs += a.scan(/:([a-zA-Z_]\w*)/).flatten } }
+    # `signals 'enterKeyPressed(int)'` defines enterKeyPressed (lib/Qt.rb
+    # RubySignals#signals), which COSMOS calls bare: emit enterKeyPressed(row).
+    body.each { |l| l.scan(/^\s*signals\s+(.+)/).flatten.each { |a| defs += a.scan(/['"]([a-zA-Z_]\w*)\s*\(/).flatten } }
+    if kind == 'module'
+      module_defs[name] += defs
+    else
+      entry = (cosmos_classes[name] ||= { super: nil, defs: Set.new, includes: Set.new })
+      entry[:qt] = full.sub('Qt::', '') if reopen
+      entry[:super] ||= sup
+      entry[:defs] += defs
+      body.each { |l| (m = l[/^\s*include\s+([A-Z][\w:]*)/, 1]) && entry[:includes] << m.split('::').last }
+      class_bodies << [f, i, last, name] if f.include?('/lib/cosmos/')
+    end
+  end
+end
+# Methods a COSMOS class answers from its own chain, and the Qt class it ends in.
+chain_of = lambda do |name|
+  defs = Set.new
+  seen = Set.new
+  qt = nil
+  while name && !seen.include?(name)
+    seen << name
+    entry = cosmos_classes[name]
+    break unless entry
+    defs += entry[:defs]
+    entry[:includes].each { |m| defs += module_defs[m] }
+    if entry[:qt]
+      qt = entry[:qt]
+      break
+    end
+    sup = entry[:super]
+    if sup && sup.start_with?('Qt::')
+      qt = sup.sub('Qt::', '')
+      break
+    end
+    name = sup && sup.split('::').last
+  end
+  [qt, defs]
+end
+bare_calls = lambda do |line|
+  return [] if line.lstrip.start_with?('#')
+  # Drop a def's own name -- `def setFoo(x)` is not a call -- but not the
+  # rest of the line: a one-line def's body is.
+  code_only(line).sub(/^\s*def\s+(?:self\.)?[\w?!=]+/, '').scan(/(?<![.\w@:$])([a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*)\(/).flatten.reject do |meth|
+    OBJECT_METHODS.include?(meth) || UNATTRIBUTABLE.include?(meth) || GENERIC_DEFS.include?(meth) || meth =~ GEM_FUNCTION
+  end
+end
+# A constructor block without parameters -- Qt::VBoxLayout.new do
+# addWidget(ok) end -- is instance_eval'd on the new object (run_ctor_block in
+# cosmos_qt6.cpp), so its bare calls are on that Qt class, not on the class
+# the block is written in. The innermost block owns a line.
+ctor_blocks = Hash.new { |h, k| h[k] = [] }   # file -> [[line range, Qt class]]
+Dir.glob(File.join(ROOT, 'lib/cosmos/**/*.rb')).each do |f|
+  lines = File.readlines(f, encoding: 'BINARY')
+  lines.each_with_index do |line, i|
+    md = code_only(line).match(/^(\s*).*\bQt::(\w+)\.new(?:\((?:[^()]|\([^()]*\))*\))?\s+do\s*$/)
+    next unless md && var_of_name.key?(md[2])
+    last = (i + 1...lines.size).find { |j| lines[j] =~ /^#{md[1]}end\b/ }
+    ctor_blocks[f] << [(i + 1)..(last - 1), md[2]] if last
+  end
+end
+ctor_blocks.each do |f, blocks|
+  lines = File.readlines(f, encoding: 'BINARY')
+  blocks.each do |range, qt|
+    range.each do |n|
+      next unless blocks.select { |r, _| r.cover?(n) }.max_by { |r, _| r.first }.first == range
+      bare_calls.call(lines[n]).each do |meth|
+        next if spelling_ok?(meth, methods_for.call(qt))
+        class_hits << ["Qt::#{qt}##{meth} (no receiver, Qt::#{qt}.new block)", "#{f.sub(ROOT + '/', '')}:#{n + 1}"]
+      end
+    end
+  end
+end
+class_bodies.each do |f, first, last, name|
+  qt, defs = chain_of.call(name)
+  next unless qt && var_of_name.key?(qt)
+  known_here = methods_for.call(qt) + defs
+  # A nested class's body is scanned as its own class, not as this one's.
+  nested = class_bodies.select { |g, a, b, _| g == f && a > first && b <= last }.map { |_, a, b, _| (a..b) }
+  File.readlines(f, encoding: 'BINARY')[first..last].each_with_index do |line, k|
+    n = first + k
+    next if nested.any? { |r| r.cover?(n) } || ctor_blocks[f].any? { |r, _| r.cover?(n) }
+    bare_calls.call(line).each do |meth|
+      next if spelling_ok?(meth, known_here)
+      class_hits << ["Qt::#{qt}##{meth} (no receiver, #{name})", "#{f.sub(ROOT + '/', '')}:#{n + 1}"]
+    end
+  end
+end
+
 class_hits.uniq!(&:first)
 class_hits.sort_by!(&:first)
 class_hits.each { |sig, loc| puts format('      %-40s %s', sig, loc) }

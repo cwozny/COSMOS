@@ -3,8 +3,11 @@ require 'mkmf'
 # `gem install cosmos` runs every extconf.rb in the gemspec, so aborting here
 # would fail the entire install on any machine without Qt6. When Qt6 is absent
 # we write a do-nothing Makefile instead and let lib/Qt.rb report a useful
-# message if something actually tries to use the GUI.
+# message if something actually tries to use the GUI. Where the GUI is the
+# point -- the CI qt6 job -- COSMOS_QT6_REQUIRED=1 makes this a failure: the
+# stub let that job pass with nothing built.
 def write_stub_makefile(reason)
+  abort "cosmos/ext/qt6: #{reason} (COSMOS_QT6_REQUIRED is set)" if ENV['COSMOS_QT6_REQUIRED']
   warn "cosmos/ext/qt6: #{reason}; skipping the Qt6 extension"
   File.write('Makefile', <<~MAKE)
     all:
@@ -43,10 +46,15 @@ def locate_qt6
     inc  = `pkg-config --cflags #{mods} 2>/dev/null`.chomp
     link = `pkg-config --libs   #{mods} 2>/dev/null`.chomp
     return nil if inc.empty? || link.empty?
-    moc = `pkg-config --variable=host_bins Qt6Core 2>/dev/null`.chomp
-    moc = File.join(moc, 'moc') unless moc.empty?
-    moc = 'moc' unless !moc.empty? && File.executable?(moc)
-    [" #{inc}", " #{link}", moc]
+    # Qt 6's .pc files have no host_bins (Qt 5's did): moc is in libexecdir,
+    # e.g. /usr/lib/qt6/libexec/moc on Ubuntu 24.04, and not on PATH. Looking
+    # only at host_bins fell back to a bare `moc`, which failed, so the build
+    # wrote the stub Makefile and "succeeded" with no GUI.
+    moc = %w[libexecdir host_libexecs host_bins bindir].map do |var|
+      dir = `pkg-config --variable=#{var} Qt6Core 2>/dev/null`.chomp
+      File.join(dir, 'moc') unless dir.empty?
+    end.compact.find { |path| File.executable?(path) }
+    [" #{inc}", " #{link}", moc || 'moc']
   end
 end
 

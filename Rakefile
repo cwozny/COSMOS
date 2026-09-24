@@ -185,11 +185,12 @@ task :build => [:devkit] do
         FileUtils.rm_f dest
         FileUtils.copy(built, dest)
         system("codesign -f -s - #{dest.inspect}") if RUBY_PLATFORM =~ /darwin/
-      elsif extension_name == 'qt6' && make_ok
+      elsif extension_name == 'qt6' && make_ok && !ENV['COSMOS_QT6_REQUIRED']
         # Only qt6 is allowed to produce nothing: its extconf.rb writes a stub
         # Makefile when Qt6 is absent rather than aborting, so a machine with
         # no Qt6 can still build the rest of COSMOS. Every other extension
-        # producing nothing is a real build failure and must not be silent.
+        # producing nothing is a real build failure and must not be silent --
+        # nor qt6 when COSMOS_QT6_REQUIRED is set (the CI qt6 job).
         puts "  qt6: Qt6 not found - skipping (COSMOS GUI tools will not run)"
       else
         build_error = "#{extension_name}: build FAILED - " +

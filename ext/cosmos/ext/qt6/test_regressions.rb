@@ -7,6 +7,7 @@ $LOAD_PATH.unshift File.expand_path('../../../../lib', __dir__)
 require 'cosmos/ext/qt6'
 require 'Qt'
 require 'tmpdir'
+require 'fileutils'
 
 STDOUT.sync = true
 $failures = []
@@ -279,10 +280,10 @@ chk('execute_in_main_thread returns while exec() runs') do
   result == 42
 end
 chk('a delayed post is deferred, not run inline') do
-  # packet_viewer.rb:366 uses the delay to escape the current call frame;
-  # running it inline recursed instead of unwinding.
+  # packet_viewer.rb:366 passes delay_execution (the 3rd argument) to escape
+  # the current call frame; running it inline recursed instead of unwinding.
   n = 0
-  Qt.execute_in_main_thread(false, 0.001) { n += 1 }
+  Qt.execute_in_main_thread(false, 0.001, true) { n += 1 }
   deferred = (n == 0)
   Qt::Application.processEvents
   t0 = Time.now
@@ -853,6 +854,1631 @@ chk('Qt::ActionGroup#addAction still resolves') do
   g = Qt::ActionGroup.new(nil)
   g.addAction(Qt::Action.new('a'))
   true
+end
+
+puts "\n29. Qt::Palette.new(palette) raised TypeError"
+puts "   (every non-Integer argument went down the QColor path. ScriptRunner's"
+puts "    Toggle Disconnect copies RED_PALETTE at script_runner_frame.rb:1198,"
+puts "    after the status bar already says 'Targets disconnected' and before"
+puts "    set_disconnected_targets runs, so scripts kept commanding the real"
+puts "    targets)"
+red_palette = Qt::Palette.new(Qt::red)   # qt.rb:236 RED_PALETTE
+def window_pixel(palette)
+  w = Qt::Widget.new
+  w.setAutoFillBackground(true)
+  w.setPalette(palette)
+  w.resize(8, 8)
+  w.grab.toImage.pixelColor(4, 4)
+end
+chk('Palette.new(palette) returns a Qt::Palette') do
+  Qt::Palette.new(red_palette).is_a?(Qt::Palette)
+end
+chk('the copy keeps the source colours') do
+  window_pixel(Qt::Palette.new(red_palette)) == Qt::Color.new(255, 0, 0)
+end
+chk('the copy is independent of the source') do
+  copy = Qt::Palette.new(red_palette)
+  copy.setColor(Qt::Palette::Window, Qt::Color.new(0, 255, 0))
+  window_pixel(red_palette) == Qt::Color.new(255, 0, 0) &&
+    window_pixel(copy) == Qt::Color.new(0, 255, 0)
+end
+
+puts "\n30. TableWidgetItem#row/#column/#flags and TableWidget#itemAt were unbound"
+puts "   (CmdSender's itemChanged handler died on item.row at cmd_params.rb:337"
+puts "    before it set the state column to MANUALLY, so a raw value typed for"
+puts "    a state parameter was dropped and the displayed state was sent."
+puts "    item.flags is the itemClicked handler (:251), itemAt the context"
+puts "    menu (:163).)"
+table = Qt::TableWidget.new
+table.setRowCount(2)
+table.setColumnCount(3)
+cells = {}
+2.times { |r| 3.times { |c| table.setItem(r, c, cells[[r, c]] = Qt::TableWidgetItem.new("#{r},#{c}")) } }
+chk('TableWidgetItem#row and #column') { [cells[[1, 2]].row, cells[[1, 2]].column] == [1, 2] }
+chk('row and column are -1 outside a table') do
+  item = Qt::TableWidgetItem.new('x')
+  [item.row, item.column] == [-1, -1]
+end
+chk('row and column of the item itemChanged passes') do
+  seen = nil
+  table.connect(SIGNAL('itemChanged(QTableWidgetItem*)')) { |item| seen = [item.row, item.column] }
+  cells[[1, 1]].setText('edited')
+  seen == [1, 1]
+end
+chk('TableWidgetItem#flags returns what setFlags set') do
+  item = Qt::TableWidgetItem.new('x')
+  item.setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled)
+  item.flags == (Qt::ItemIsSelectable | Qt::ItemIsEnabled) &&
+    (item.flags & Qt::ItemIsEditable) == 0
+end
+chk('TableWidget#itemAt(point) returns the cell under it') do
+  table.resize(400, 200)
+  table.show
+  APP.processEvents
+  item = table.itemAt(Qt::Point.new(5, 5))
+  item && item.text == '0,0' && [item.row, item.column] == [0, 0]
+end
+chk('TableWidget#itemAt past the last cell is nil') { table.itemAt(Qt::Point.new(390, 150)).nil? }
+table.hide
+
+puts "\n31. QTabWidget#tabBar came back as a plain Qt::Widget"
+puts "   (there was no Qt::TabBar for best_ruby_class to pick, so ScriptRunner's"
+puts "    run_callback died on tabBar.setTabIcon (script_runner.rb:754) before"
+puts "    a script could start, and the tab context menus in ScriptRunner,"
+puts "    ConfigEditor, DataViewer and TlmGrapher died on tabBar.count/tabRect)"
+tabs = Qt::TabWidget.new
+tabs.addTab(Qt::Widget.new, 'one')
+tabs.addTab(Qt::Widget.new, 'two')
+chk('tabBar is a Qt::TabBar') { tabs.tabBar.is_a?(Qt::TabBar) }
+chk('tabBar.count') { tabs.tabBar.count == 2 }
+chk('tabBar.setTabIcon sets the icon of that tab only') do
+  tabs.tabBar.setTabIcon(1, Qt::Icon.new(Qt::Pixmap.new(8, 8)))
+  !tabs.tabBar.tabIcon(1).isNull && tabs.tabBar.tabIcon(0).isNull
+end
+chk('tabBar.setTabIcon(i, Qt::Icon.new) clears it') do
+  tabs.tabBar.setTabIcon(1, Qt::Icon.new)   # script_runner.rb:766 (@no_icon)
+  tabs.tabBar.tabIcon(1).isNull
+end
+chk('tabBar.tabRect(i).contains(point) finds the tab') do
+  tabs.resize(300, 200)
+  tabs.show
+  APP.processEvents
+  r = tabs.tabBar.tabRect(1)
+  point = Qt::Point.new(r.x + r.width / 2, r.y + 2)
+  (0...tabs.tabBar.count).find { |i| tabs.tabBar.tabRect(i).contains(point) } == 1
+end
+chk('tabBar.isTabEnabled follows setTabEnabled') do
+  tabs.setTabEnabled(0, false)
+  result = !tabs.tabBar.isTabEnabled(0) && tabs.tabBar.isTabEnabled(1)
+  tabs.setTabEnabled(0, true)
+  result
+end
+tabs.hide
+
+puts "\n32. Qt::Dialog#done was unbound"
+puts "   (ProgressDialog#close_done calls done(0) at progress_dialog.rb:162."
+puts "    Worker threads got the NoMethodError back from"
+puts "    execute_in_main_thread and showed 'Error During Progress' --"
+puts "    ScriptRunner instruments every script that way"
+puts "    (script_runner_frame.rb:551) -- and the Done button did nothing."
+puts "    Also about_dialog.rb:110/150 and limits_monitor.rb:802. These checks"
+puts "    avoid exec: see test_cosmos_tools.rb section 4 for the modal path.)"
+chk('Dialog#done hides a shown dialog') do
+  d = Qt::Dialog.new
+  d.show
+  d.done(0)
+  result = !d.isVisible
+  d.dispose
+  result
+end
+chk('Dialog#done from a Ruby subclass (ProgressDialog shape)') do
+  klass = Class.new(Qt::Dialog) { def close_done; done(0) unless disposed?; end }
+  d = klass.new
+  d.show
+  d.close_done
+  result = !d.isVisible
+  d.dispose
+  result
+end
+
+puts "\n33. Qt::TextCharFormat#setBackground was unbound"
+puts "   (ScriptRunner and TestRunner highlight each line before running it --"
+puts "    script_runner_frame.rb:658-660 -> completion_text_edit.rb:174 -- so"
+puts "    every script raised NoMethodError before its first line ran)"
+palegreen = Qt::Color.new(152, 251, 152)
+chk('setBackground(Brush)') { Qt::TextCharFormat.new.setBackground(Qt::Brush.new(palegreen)); true }
+chk('setBackground(Color)') { Qt::TextCharFormat.new.setBackground(palegreen); true }
+chk('the highlight_line sequence paints the current line') do
+  # completion_text_edit.rb:45-47 and :172-178
+  editor = Qt::PlainTextEdit.new
+  editor.setPlainText("puts 1\nputs 2\n")
+  editor.resize(240, 80)
+  editor.show
+  APP.processEvents
+  format = Qt::TextCharFormat.new
+  format.setProperty(Qt::TextFormat::FullWidthSelection, Qt::Variant.new(true))
+  format.setBackground(Qt::Brush.new(palegreen))
+  selection = Qt::TextEdit::ExtraSelection.new
+  selection.format = format
+  selection.cursor = editor.textCursor
+  editor.setExtraSelections([selection])
+  APP.processEvents
+  image = editor.viewport.grab.toImage
+  line1 = image.pixelColor(200, 8)
+  editor.hide
+  line1 == palegreen || raise("line 1 right margin is #{[line1.red, line1.green, line1.blue]}")
+end
+
+puts "\n34. Qt::Pixmap#fill was unbound"
+puts "   (Qt::ColorListWidget#addItemColor fills a 20x14 colour swatch for each"
+puts "    entry at qt.rb:671; TlmGrapher adds its first entry while building"
+puts "    the left frame (overview_tabbed_plots.rb:978), so startup failed)"
+def pixmap_pixels(pixmap, *points)
+  image = pixmap.toImage
+  points.map { |x, y| c = image.pixelColor(x, y); [c.red, c.green, c.blue] }
+end
+chk('Pixmap#fill(Color) fills every pixel') do
+  pixmap = Qt::Pixmap.new(20, 14)
+  pixmap.fill(Qt::Color.new(255, 0, 0))
+  pixmap_pixels(pixmap, [0, 0], [19, 13]) == [[255, 0, 0], [255, 0, 0]]
+end
+chk('Pixmap#fill(Qt::GlobalColor)') do
+  pixmap = Qt::Pixmap.new(4, 4)
+  pixmap.fill(Qt::red)   # Qt::red is a plain Integer here
+  pixmap_pixels(pixmap, [1, 1]) == [[255, 0, 0]]
+end
+chk('Pixmap#fill with no argument fills white') do
+  pixmap = Qt::Pixmap.new(4, 4)
+  pixmap.fill
+  pixmap_pixels(pixmap, [2, 2]) == [[255, 255, 255]]
+end
+
+puts "\n35. Qt::ListWidget#addItem(item) raised TypeError"
+puts "   (addItem only took a String. ColorListWidget#addItemColor passes a"
+puts "    ListWidgetItem at qt.rb:677, the line after its swatch fill, and"
+puts "    LimitsMonitor's Ignored Telemetry Items dialog adds its entries that"
+puts "    way at limits_monitor.rb:780)"
+chk('addItem(ListWidgetItem) adds that item') do
+  list = Qt::ListWidget.new
+  list.addItem(Qt::ListWidgetItem.new('INST HEALTH_STATUS TEMP1'))
+  list.count == 1 && list.item(0).text == 'INST HEALTH_STATUS TEMP1'
+end
+chk('addItem(ListWidgetItem.new(icon, text)) (qt.rb:676-677)') do
+  list = Qt::ListWidget.new
+  pixmap = Qt::Pixmap.new(20, 14)
+  pixmap.fill(Qt::red)
+  list.addItem(Qt::ListWidgetItem.new(Qt::Icon.new(pixmap), 'No Plot Selected'))
+  list.count == 1 && list.item(0).text == 'No Plot Selected'
+end
+chk('addItem(String) still works') do
+  list = Qt::ListWidget.new
+  list.addItem('plain')
+  list.count == 1 && list.item(0).text == 'plain'
+end
+
+puts "\n36. GridLayout#addWidget(widget) and Layout#addItem were unbound"
+puts "   (addWidget required 3-5 arguments, and Qt::AdaptiveGridLayout, which"
+puts "    TlmGrapher adds every plot through, calls super(widget) at"
+puts "    qt.rb:791/802/805. Growing to 2 and 3 columns it also re-places"
+puts "    taken items with addItem(item, row, column) at qt.rb:790/797-800.)"
+def laid_out(layout)
+  host = Qt::Widget.new
+  host.setLayout(layout)
+  host.resize(300, 200)
+  host.show
+  APP.processEvents
+  host
+end
+chk('GridLayout#addWidget(widget) fills the next free cell') do
+  grid = Qt::GridLayout.new
+  labels = Array.new(2) { |i| Qt::Label.new("w#{i}") }
+  labels.each { |l| grid.addWidget(l) }
+  host = laid_out(grid)
+  result = grid.count == 2 && labels[1].pos.y > labels[0].pos.y   # one column
+  host.hide
+  result
+end
+chk('Layout#addItem(item, row, column) re-places a taken item') do
+  grid = Qt::GridLayout.new
+  a = Qt::Label.new('a')
+  b = Qt::Label.new('b')
+  grid.addWidget(a, 0, 0)
+  grid.addWidget(b, 1, 0)
+  grid.addItem(grid.takeAt(1), 0, 1)
+  host = laid_out(grid)
+  result = grid.count == 2 && b.pos.x > a.pos.x && b.pos.y == a.pos.y
+  host.hide
+  result
+end
+chk('Layout#addItem(item) appends on a box layout') do
+  box = Qt::VBoxLayout.new
+  box.addWidget(Qt::Label.new('a'))
+  item = box.takeAt(0)
+  box.addItem(item)
+  box.count == 1
+end
+
+puts "\n37. Widget#cursor, #x, #y and #window were unbound"
+puts "   (LineGraph's paintEvent reads cursor.pos once the mouse has moved over"
+puts "    it (line_graph_drawing.rb:416). The NoMethodError skipped"
+puts "    @painter.dispose at line_graph.rb:358-359, so every later paint"
+puts "    returned at `return if @painter` and the graph froze. Help > About"
+puts "    reads parent.x and parent.y (about_dialog.rb:95/99).)"
+chk('Widget#x and #y') do
+  w = Qt::Widget.new
+  w.move(30, 40)
+  [w.x, w.y] == [30, 40]
+end
+chk('Widget#cursor.pos is the global cursor position') do
+  c = Qt::Widget.new.cursor
+  c.is_a?(Qt::Cursor) && [c.pos.x, c.pos.y] == [Qt::Cursor.pos.x, Qt::Cursor.pos.y]
+end
+chk('Widget#window is the top-level window') do
+  top = Qt::MainWindow.new
+  child = Qt::Widget.new(top)
+  child.window.equal?(top) && top.window.equal?(top)
+end
+
+puts "\n38. Qt::RadialGradient and Qt::SpacerItem were empty classes"
+puts "   (LedWidget#value= builds its brush from RadialGradient.new(5, 5, 50,"
+puts "    5, 5) at led_widget.rb:75, so a TlmViewer LED's first value ended"
+puts "    its screen's update thread. SpacerWidget adds SpacerItem.new(w, h,"
+puts "    hpolicy, vpolicy) to its layout (spacer_widget.rb:24-28), so a SPACER"
+puts "    screen did not open.)"
+def led_gradient
+  gradient = Qt::RadialGradient.new(5, 5, 50, 5, 5)
+  gradient.setColorAt(0, Qt::Color.new(0, 255, 0))
+  gradient.setColorAt(1, Qt::Color.new(0, 0, 0))
+  gradient
+end
+chk('RadialGradient.new(cx, cy, radius, fx, fy) and setColorAt') { led_gradient.is_a?(Qt::RadialGradient) }
+chk('Brush.new(RadialGradient) paints the gradient') do
+  brush = Qt::Brush.new(led_gradient)   # before the painter, so a raise leaves none active
+  pixmap = Qt::Pixmap.new(20, 20)
+  pixmap.fill(Qt::white)
+  painter = Qt::Painter.new(pixmap)
+  painter.setBrush(brush)
+  painter.drawRect(0, 0, 20, 20)
+  painter.end
+  c = pixmap.toImage.pixelColor(5, 5)   # the focal point: colour stop 0
+  (c.green > 200 && c.red < 60 && c.blue < 60) || raise("focal pixel #{[c.red, c.green, c.blue]}")
+end
+chk('SpacerItem.new(w, h, hpolicy, vpolicy) goes into a layout') do
+  box = Qt::VBoxLayout.new
+  box.addItem(Qt::SpacerItem.new(10, 20, Qt::SizePolicy::Fixed, Qt::SizePolicy::Fixed))
+  box.count == 1
+end
+chk('a fixed SpacerItem holds its height between two widgets') do
+  box = Qt::VBoxLayout.new
+  top = Qt::Label.new('top')
+  bottom = Qt::Label.new('bottom')
+  box.addWidget(top)
+  box.addItem(Qt::SpacerItem.new(10, 40, Qt::SizePolicy::Fixed, Qt::SizePolicy::Fixed))
+  box.addWidget(bottom)
+  host = laid_out(box)
+  gap = bottom.pos.y - (top.pos.y + top.height)
+  host.hide
+  gap >= 40 || raise("gap #{gap}")
+end
+
+puts "\n39. GridLayout#setHorizontalSpacing / #setVerticalSpacing were unbound"
+puts "   (TlmViewer's MATRIXBYCOLUMNS is a Qt::GridLayout subclass that sets both"
+puts "    in its constructor (matrixbycolumns_widget.rb:27-28), so any screen"
+puts "    using it failed to build)"
+chk('setHorizontalSpacing') do
+  grid = Qt::GridLayout.new
+  grid.setHorizontalSpacing(7)
+  grid.horizontalSpacing == 7
+end
+chk('setVerticalSpacing') do
+  grid = Qt::GridLayout.new
+  grid.setVerticalSpacing(9)
+  grid.verticalSpacing == 9
+end
+
+puts "\n40. execute_in_main_thread(true, 0.05) deferred its block on the GUI thread"
+puts "   (the shim read the 2nd argument as a delay. In qtbindings 4.8.6.5"
+puts "    (lib/Qt4.rb:101) it is sleep_period, the poll interval while"
+puts "    blocking; only the 3rd, delay_execution, defers on the GUI thread."
+puts "    script_module_gui.rb:74 passes 0.05 for every prompt and file dialog,"
+puts "    so on the GUI thread -- CmdSender's hazardous prompt, TlmViewer BUTTON"
+puts "    code -- the call returned nil and the answer was discarded)"
+chk('(true, 0.05) on the GUI thread runs the block inline') do
+  ran = false
+  result = Qt.execute_in_main_thread(true, 0.05) { ran = true; 42 }
+  ran && result == 42
+end
+chk('(false, 0.001) on the GUI thread runs the block inline') do
+  ran = false
+  Qt.execute_in_main_thread(false, 0.001) { ran = true }
+  ran
+end
+
+puts "\n41. Qt::Menu#exec was unbound"
+puts "   (menu.exec(global_point) opens every COSMOS context menu -- 14 sites"
+puts "    in 11 files, e.g. cmd_params.rb:194, script_runner.rb:889 -- and"
+puts "    resolved to the private Kernel#exec: NoMethodError, no menu)"
+chk('Qt::Menu#exec is a public method') { Qt::Menu.public_method_defined?(:exec) }
+chk('and it is the binding, not Kernel#exec') { Qt::Menu.instance_method(:exec).owner != Kernel }
+# The modal path is test_cosmos_tools.rb section 12: modal loops return at
+# once in this file after section 8.
+
+puts "\n42. GC on a non-GUI thread deleted Ruby-owned QObjects there"
+puts "   (qtwrap_free deleted an owned widget on whichever Ruby thread ran the"
+puts "    GC, and each child's destroyed() hookup used the child as its"
+puts "    context, so off the GUI thread it was queued to an object being"
+puts "    destroyed and never ran: the child wrapper kept a dangling pointer"
+puts "    and the next call on it segfaulted. Run in a child process, since"
+puts "    the failure is a segfault.)"
+GC_OWNED_TREE = <<~'RUBY'
+  require 'Qt'
+  app = Qt::Application.new([])
+  $child = nil
+  def build
+    root = Qt::Widget.new                  # parentless: Ruby owns it
+    $child = Qt::Label.new('child', root)  # Qt owns it; Ruby keeps its wrapper
+    nil
+  end
+  build
+  def clobber(n = 50); n.zero? ? 0 : clobber(n - 1) + 1; end
+  clobber                                  # no stale reference to root on the stack
+  before = Qt.object_count
+  if ARGV[0] == 'thread'
+    Thread.new { GC.start; GC.start }.join
+  else
+    GC.start; GC.start
+  end
+  collected = Qt.object_count < before
+  3.times { Qt::Application.processEvents }
+  touched = begin
+    $child.objectName
+    'no error'
+  rescue RuntimeError => e
+    e.message
+  end
+  puts "collected=#{collected} disposed=#{$child.disposed?} touch=#{touched}"
+RUBY
+def gc_owned_tree(where)
+  lib = File.expand_path('../../../../lib', __dir__)
+  out = IO.popen([RbConfig.ruby, '-I', lib, '-e', GC_OWNED_TREE, where, err: [:child, :out]], &:read)
+  [$?, out.lines.grep(/collected=/).first.to_s.strip]
+end
+%w[main thread].each do |where|
+  chk("GC on #{where == 'main' ? 'the GUI' : 'a background'} thread: child wrapper marked destroyed") do
+    status, line = gc_owned_tree(where)
+    expected = 'collected=true disposed=true touch=Qt object has already been destroyed'
+    (status.success? && line == expected) ||
+      raise("#{status.signaled? ? "died with SIG#{Signal.signame(status.termsig)}" : "exit #{status.exitstatus}"}: #{line.inspect}")
+  end
+end
+
+puts "\n43. wrap_obj handed back wrappers that lazy sweep had condemned"
+puts "   (g_objmap is weak: an unreferenced wrapper stays in it until its free"
+puts "    function runs. Between the GC's mark and its lazy sweep, findChild &"
+puts "    co. returned that condemned VALUE; once swept, Ruby held a freed slot"
+puts "    and the next touch segfaulted. logging_tab.rb:53-72 re-fetches its"
+puts "    widgets this way every second. Child process: the failure is a"
+puts "    segfault.)"
+LAZY_SWEEP = <<~'RUBY'
+  require 'Qt'
+  app = Qt::Application.new([])
+  # Menus Qt builds (MenuBar#addMenu) get weak wrappers; a Ruby-constructed
+  # parented object would be pinned (section 59) and never condemned.
+  bar = Qt::MenuBar.new
+  n = 20000
+  names = Array.new(n) { |i| "c#{i}" }
+  keep = Array.new(n) { |i| m = bar.addMenu(names[i]); m.setObjectName(names[i]); m }
+  GC.start
+  picks = [0, n / 4, n / 2, (3 * n) / 4, n - 1]
+  ids = picks.map { |k| keep[k].__id__ }
+  keep.clear
+  GC.start(full_mark: true, immediate_mark: true, immediate_sweep: false)
+  found = picks.map { |k| bar.findChild(names[k]) }   # while the old wrappers are condemned
+  condemned = found.each_with_index.map { |o, k| o.__id__ == ids[k] }
+  junk = []
+  (n * 4).times { junk << ('s' * 24) }                 # finish the sweep, refill freed slots
+  GC.start
+  puts "condemned=#{condemned.inspect} names=#{found.map(&:objectName) == picks.map { |k| names[k] }}"
+RUBY
+chk('findChild during lazy sweep returns live wrappers') do
+  lib = File.expand_path('../../../../lib', __dir__)
+  out = IO.popen([RbConfig.ruby, '-I', lib, '-e', LAZY_SWEEP, err: [:child, :out]], &:read)
+  line = out.lines.grep(/condemned=/).first.to_s.strip
+  ($?.success? && line == 'condemned=[false, false, false, false, false] names=true') ||
+    raise("#{$?.signaled? ? "died with SIG#{Signal.signame($?.termsig)}" : "exit #{$?.exitstatus}"}: #{line.inspect}")
+end
+
+puts "\n44. SIGINT and SIGTERM were not serviced while an event loop idled"
+puts "   (every exec released the GVL with RUBY_UBF_IO, which only interrupts a"
+puts "    blocking syscall; Qt's dispatcher retries it, so exec never returned"
+puts "    to let Ruby run the signal. Ctrl-C and `kill` did nothing to an idle"
+puts "    tool or an open dialog. Child process per signal.)"
+IDLE_LOOP = <<~'RUBY'
+  $stdout.sync = true
+  require 'Qt'
+  app = Qt::Application.new([])
+  target = ARGV[0] == 'dialog' ? Qt::Dialog.new : app
+  puts 'READY'
+  begin
+    target.exec
+    puts 'exec returned'
+  rescue Exception => e
+    puts "exec raised #{e.class}"
+  end
+RUBY
+# Starts an idle app.exec or dialog.exec in a child, sends +sig+ once it is
+# looping, and returns [exited within 3 s, output].
+def signal_idle_loop(kind, sig)
+  lib = File.expand_path('../../../../lib', __dir__)
+  rd, wr = IO.pipe
+  pid = Process.spawn(RbConfig.ruby, '-I', lib, '-e', IDLE_LOOP, kind, out: wr, err: wr)
+  wr.close
+  out = +''
+  deadline = Time.now + 20
+  until out.include?('READY') || Time.now > deadline
+    begin
+      out << rd.read_nonblock(4096)
+    rescue IO::WaitReadable
+      IO.select([rd], nil, nil, 0.1)
+    rescue EOFError
+      break
+    end
+  end
+  sleep 0.5                           # let it enter exec
+  Process.kill(sig, pid)
+  exited = nil
+  30.times { break if (exited = Process.waitpid(pid, Process::WNOHANG)); sleep 0.1 }
+  unless exited
+    Process.kill('KILL', pid)
+    Process.waitpid(pid)
+  end
+  out << rd.read.to_s
+  rd.close
+  [!exited.nil?, out]
+end
+{ 'TERM' => 'SignalException', 'INT' => 'Interrupt' }.each do |sig, error|
+  %w[app dialog].each do |kind|
+    chk("SIG#{sig} ends an idle #{kind}.exec with #{error}") do
+      exited, out = signal_idle_loop(kind, sig)
+      (exited && out.include?("exec raised #{error}")) ||
+        raise(exited ? "output #{out.lines.last.to_s.strip.inspect}" : 'still running 3 s after the signal')
+    end
+  end
+end
+
+puts "\n45. exit, Interrupt and SignalException raised in slots, timers and posted"
+puts "    blocks were swallowed"
+puts "   (contain_error reported them like any error and the loop carried on;"
+puts "    single_shot/post_to_main_thread dropped them outright. A trap('TERM')"
+puts "    { exit } that ran inside a slot kept the tool alive, `exit` in a"
+puts "    button handler did nothing, and Ctrl-C during a GUI block only killed"
+puts "    the thread that posted it. Child process per case.)"
+EXIT_FROM_LOOP = <<~'RUBY'
+  $stdout.sync = true
+  require 'Qt'
+  app = Qt::Application.new([])
+  button = Qt::PushButton.new('b')
+  case ARGV[0]
+  when 'trap_in_slot'      # the signal lands while a slot's Ruby code runs
+    Signal.trap('TERM') { exit 2 }
+    timer = Qt::Timer.new
+    timer.connect(SIGNAL('timeout()')) { t0 = Time.now; nil while Time.now - t0 < 0.05 }
+    timer.start(0)
+  when 'exit_in_slot'
+    button.connect(SIGNAL('clicked()')) { exit 3 }
+    Qt.single_shot(20) { button.click }
+  when 'exit_in_single_shot'
+    Qt.single_shot(20) { exit 4 }
+  when 'exit_in_async_post'
+    Qt.single_shot(20) { Thread.new { Qt.execute_in_main_thread(false) { exit 5 } } }
+  when 'interrupt_in_blocking_post'
+    Qt.single_shot(20) { Thread.new { Qt.execute_in_main_thread(true) { raise Interrupt } rescue nil } }
+  end
+  Qt.single_shot(3000) { puts 'STILL ALIVE'; app.quit }
+  puts 'READY'
+  begin
+    app.exec
+    puts 'exec returned'
+  rescue SystemExit => e
+    puts "exec raised SystemExit status=#{e.status}"
+  rescue Exception => e
+    puts "exec raised #{e.class}"
+  end
+RUBY
+# Runs EXIT_FROM_LOOP's +kind+ in a child; with +sig+, sends it once the child
+# is looping. Returns its output once it exits (or is killed after 8 s).
+def exit_from_loop(kind, sig = nil)
+  lib = File.expand_path('../../../../lib', __dir__)
+  rd, wr = IO.pipe
+  pid = Process.spawn(RbConfig.ruby, '-I', lib, '-e', EXIT_FROM_LOOP, kind, out: wr, err: wr)
+  wr.close
+  if sig
+    out = +''
+    deadline = Time.now + 20
+    until out.include?('READY') || Time.now > deadline
+      begin
+        out << rd.read_nonblock(4096)
+      rescue IO::WaitReadable
+        IO.select([rd], nil, nil, 0.1)
+      rescue EOFError
+        break
+      end
+    end
+    sleep 0.5
+    Process.kill(sig, pid)
+  end
+  exited = nil
+  80.times { break if (exited = Process.waitpid(pid, Process::WNOHANG)); sleep 0.1 }
+  unless exited
+    Process.kill('KILL', pid)
+    Process.waitpid(pid)
+  end
+  result = (out || '') + rd.read.to_s
+  rd.close
+  result
+end
+{
+  ['trap_in_slot', 'TERM'] => 'exec raised SystemExit status=2',
+  ['exit_in_slot', nil] => 'exec raised SystemExit status=3',
+  ['exit_in_single_shot', nil] => 'exec raised SystemExit status=4',
+  ['exit_in_async_post', nil] => 'exec raised SystemExit status=5',
+  ['interrupt_in_blocking_post', nil] => 'exec raised Interrupt'
+}.each do |(kind, sig), expected|
+  chk("#{kind.tr('_', ' ')} ends app.exec") do
+    out = exit_from_loop(kind, sig)
+    out.include?(expected) || raise("got #{out.lines.map(&:strip).grep(/exec |STILL/).join(' | ').inspect}")
+  end
+end
+
+puts "\n46. Linux builds looked for moc in pkg-config's host_bins, which Qt 6 lacks"
+puts "   (Qt 6's .pc files have no host_bins; moc is in libexecdir, e.g."
+puts "    /usr/lib/qt6/libexec/moc on Ubuntu 24.04, off PATH. The bare `moc`"
+puts "    fallback failed, extconf.rb wrote the stub Makefile, and the build"
+puts "    'succeeded' with no GUI. Runs the real extconf.rb in a temporary copy"
+puts "    with the Linux branch forced and a stand-in pkg-config/moc laid out"
+puts "    like Qt 6's.)"
+chk('extconf.rb finds moc in libexecdir and writes a real Makefile') do
+  Dir.mktmpdir('qt6_extconf') do |dir|
+    src = File.join(dir, 'src')
+    bin = File.join(dir, 'bin')
+    libexec = File.join(dir, 'libexec')
+    [src, bin, libexec].each { |d| Dir.mkdir(d) }
+    %w[extconf.rb rubycallback.h rubywidget.h].each { |f| FileUtils.cp(File.join(__dir__, f), src) }
+    File.write(File.join(bin, 'pkg-config'), <<~SH)
+      #!/bin/sh
+      case "$*" in
+        *--cflags*) echo "-I#{dir}/include" ;;
+        *--libs*) echo "-L#{dir}/lib -lQt6Core" ;;
+        *--variable=libexecdir*) echo "#{libexec}" ;;
+        *) echo "" ;;
+      esac
+    SH
+    File.write(File.join(libexec, 'moc'), <<~SH)
+      #!/bin/sh
+      while [ $# -gt 0 ]; do [ "$1" = "-o" ] && touch "$2"; shift; done
+    SH
+    FileUtils.chmod(0755, [File.join(bin, 'pkg-config'), File.join(libexec, 'moc')])
+    force_linux = "Object.send(:remove_const, :RUBY_PLATFORM); RUBY_PLATFORM = 'x86_64-linux'.freeze; load 'extconf.rb'"
+    out = IO.popen({ 'PATH' => "#{bin}:#{ENV['PATH']}" }, [RbConfig.ruby, '-e', force_linux,
+                   chdir: src, err: [:child, :out]], &:read)
+    makefile = File.read(File.join(src, 'Makefile')) rescue ''
+    (!makefile.include?('qt6 extension skipped') && makefile.include?('moc_rubycallback')) ||
+      raise(out.lines.grep(/skipping|moc/).first.to_s.strip.then { |l| l.empty? ? 'no Makefile' : l })
+  end
+end
+
+puts "\n47. Qt::Completer#popup, #widget, #complete and #completionPrefix were unbound"
+puts "   (every keyPressEvent in the Ruby editors and CmdSender's history asks"
+puts "    popup.isVisible first (completion_text_edit.rb:92,"
+puts "    cmd_sender_text_edit.rb:25), so COSMOS's key handling died on every key"
+puts "    and only Qt's default editing ran. Completion's create_popup also uses"
+puts "    widget and complete(rect), insertCompletion completionPrefix"
+puts "    (completion.rb:43-63).)"
+completer_editor = Qt::PlainTextEdit.new
+completer = Qt::Completer.new(completer_editor)
+completer.setWidget(completer_editor)
+chk('Completer#popup is the (hidden) completion view') do
+  completer.popup.is_a?(Qt::AbstractItemView) && !completer.popup.isVisible
+end
+chk('Completer#widget is the widget it completes for') { completer.widget.equal?(completer_editor) }
+chk('Completer#completionPrefix') { completer.setCompletionPrefix('IN'); completer.completionPrefix == 'IN' }
+chk('complete(rect) pops up the matching rows') do
+  completer.setModel(Qt::StringListModel.new(%w[INST INST2 EXAMPLE], completer))
+  completer.setCompletionPrefix('')
+  completer_editor.resize(300, 100)
+  completer_editor.show
+  APP.processEvents
+  rect = completer_editor.cursorRect
+  rect.setWidth(completer.popup.sizeHintForColumn(0) + completer.popup.verticalScrollBar.sizeHint.width)
+  completer.complete(rect)
+  APP.processEvents
+  shown = completer.popup.isVisible
+  completer.popup.close
+  completer_editor.hide
+  shown
+end
+
+puts "\n48. Qt::Boolean#nil? did not match qtbindings"
+puts "   (qtbindings' Boolean#nil? is `!@value` (qtruby4.rb:404-406), which is"
+puts "    how COSMOS reads Cancel off InputDialog's out-parameter. Ours returned"
+puts "    @value.nil?, so Cancel was never seen: `ask` without blanks reopened"
+puts "    forever, and ConfigEditor's Create Target (config_editor.rb:610) and"
+puts "    TlmGrapher's Edit Tab (overview_tabbed_plots.rb:228) went on with nil)"
+chk('Boolean.new(false).nil? -- Cancel') { Qt::Boolean.new(false).nil? == true }
+chk('Boolean.new(true).nil? -- OK') { Qt::Boolean.new(true).nil? == false }
+chk('Boolean.new.nil? -- not set yet') { Qt::Boolean.new.nil? == true }
+
+puts "\n49. A message box's button box could not be found, typed, or turned vertical"
+puts "   (script vertical_message_box (script_module_gui.rb:268) reached the"
+puts "    buttons through box.layout.itemAt(2) -- the button box in Qt 4's"
+puts "    QMessageBox layout, a Label in Qt 6's -- and a QDialogButtonBox came"
+puts "    back as a plain Qt::Widget without setOrientation anyway, so every"
+puts "    call raised)"
+def two_button_box
+  box = Qt::MessageBox.new(nil)
+  box.setText('Pick one')
+  box.addButton('First', Qt::MessageBox::AcceptRole)
+  box.addButton('Second', Qt::MessageBox::AcceptRole)
+  box
+end
+chk('the button box comes back as a Qt::DialogButtonBox') do
+  two_button_box.findChildren.any? { |c| c.is_a?(Qt::DialogButtonBox) }
+end
+chk('DialogButtonBox#setOrientation(Qt::Vertical) stacks the buttons') do
+  box = two_button_box
+  box.findChildren.find { |c| c.is_a?(Qt::DialogButtonBox) }.setOrientation(Qt::Vertical)
+  box.show
+  APP.processEvents
+  first, second = %w[First Second].map { |t| box.findChildren.find { |c| c.is_a?(Qt::PushButton) && c.text == t } }
+  stacked = first.pos.x == second.pos.x && first.pos.y != second.pos.y
+  box.hide
+  stacked || raise("First at #{[first.pos.x, first.pos.y]}, Second at #{[second.pos.x, second.pos.y]}")
+end
+
+puts "\n50. Widget#layout returned C++-created layouts as a plain Qt::Layout"
+puts "   (no layout class was registered for best_ruby_class, so a QMessageBox's"
+puts "    own QGridLayout had no grid addWidget: script combo_box"
+puts "    (script_module_gui.rb:202) raised on every call)"
+chk("a QMessageBox's layout is a Qt::GridLayout") { Qt::MessageBox.new(nil).layout.is_a?(Qt::GridLayout) }
+chk('and takes a grid addWidget(w, row, col, rows, cols)') do
+  box = Qt::MessageBox.new(nil)
+  box.layout.addWidget(Qt::Label.new('combo'), 2, 0, 1, 2)
+  true
+end
+chk('a layout made in Ruby still comes back as itself') do
+  w = Qt::Widget.new
+  layout = Qt::VBoxLayout.new
+  w.setLayout(layout)
+  w.layout.equal?(layout)
+end
+
+puts "\n51. FormLayout#addRow(widget) and #addRow(layout) were unbound"
+puts "   (only the two-argument forms existed. The Details dialog adds its"
+puts "    States and Limits group boxes as full-width rows"
+puts "    (details_dialog.rb:78/87), so Details raised for every item with"
+puts "    states or limits)"
+chk('addRow(widget) adds a full-width row') do
+  form = Qt::FormLayout.new
+  form.addRow('Name:', Qt::LineEdit.new)    # two items
+  form.addRow(Qt::GroupBox.new('States'))   # one
+  form.count == 3
+end
+chk('addRow(layout) adds a full-width row') do
+  form = Qt::FormLayout.new
+  form.addRow(Qt::HBoxLayout.new)
+  form.count == 1
+end
+chk('Layout#minimumSize -- the States box sizes its scroll area by it') do
+  form = Qt::FormLayout.new   # details_dialog.rb:131-135
+  host = Qt::Widget.new
+  host.setLayout(form)
+  3.times { |i| form.addRow("STATE#{i}:", Qt::Label.new(i.to_s)) }
+  form.minimumSize.height > 0
+end
+
+puts "\n53. GridLayout#addLayout was unbound (only box layouts had addLayout)"
+puts "   (CmdSender's Send Raw dialog adds its file and button rows to a grid"
+puts "    (cmd_sender.rb:341/350), and TlmViewer's MATRIXBYCOLUMNS adds nested"
+puts "    layouts with super(layout, row, column)"
+puts "    (matrixbycolumns_widget.rb:32), so both raised)"
+chk('GridLayout#addLayout(layout, row, column)') do
+  grid = Qt::GridLayout.new
+  grid.addLayout(Qt::HBoxLayout.new, 1, 1)
+  grid.count == 1
+end
+chk('GridLayout#addLayout(layout, row, column, rows, columns)') do
+  grid = Qt::GridLayout.new
+  grid.addLayout(Qt::HBoxLayout.new, 2, 0, 1, 2)
+  grid.count == 1
+end
+
+puts "\n54. ComboBox item data was stored as the Variant's toString"
+puts "   (addItem(text, variant) kept only toString, so a Float came back as a"
+puts "    String and Variant.new(nil) as \"\". Replay's \"Realtime\" speed is"
+puts "    Variant.new(nil) (replay_tab.rb:187-192), and \"\".to_f made it a 0.0"
+puts "    delay: No Delay. itemData also answered nil for invalid data, where"
+puts "    qtbindings handed back the (invalid) Variant.)"
+def item_data_of(variant)
+  combo = Qt::ComboBox.new
+  combo.addItem('x', variant)
+  combo.itemData(0)
+end
+chk('a Float stays a Float') do
+  value = item_data_of(Qt::Variant.new(0.001)).value
+  (value.is_a?(Float) && value == 0.001) || raise("got #{value.inspect}")
+end
+chk('Variant.new(nil) comes back as a Variant whose value is nil') do
+  data = item_data_of(Qt::Variant.new(nil))
+  (data.is_a?(Qt::Variant) && data.value.nil?) || raise("got #{data.inspect}")
+end
+chk('a String stays a String') { item_data_of(Qt::Variant.new('INST SCREEN;file.txt')).value == 'INST SCREEN;file.txt' }
+
+puts "\n55. cursor.selection.toPlainText kept Qt's U+2029 paragraph separators"
+puts "   (the shim fed selectedText, which separates blocks with U+2029;"
+puts "    qtbindings went through QTextDocumentFragment, which gives \\n."
+puts "    PlainTextEdit#selected_lines (qt.rb:530) hands this to ScriptRunner's"
+puts "    Execute Selected Lines, so multi-line selections ran as one garbled"
+puts "    line)"
+chk('a two-line selection comes back with a newline') do
+  editor = Qt::PlainTextEdit.new
+  editor.setPlainText("puts 1\nputs 2")
+  cursor = editor.textCursor
+  cursor.movePosition(Qt::TextCursor::Start)
+  cursor.movePosition(Qt::TextCursor::End, Qt::TextCursor::KeepAnchor)
+  (text = cursor.selection.toPlainText) == "puts 1\nputs 2" || raise("got #{text.inspect}")
+end
+
+puts "\n56. TextEdit/PlainTextEdit#find ignored its flags"
+puts "   (only the text was passed to Qt, so direction, Match Case and Whole"
+puts "    Words had no effect -- find_replace_dialog.rb:57/76/214-233 pass them"
+puts "    all -- and a zero-argument call read argv[0] out of bounds)"
+def find_in(text, needle, flags, at_end: false)
+  editor = Qt::PlainTextEdit.new
+  editor.setPlainText(text)
+  cursor = editor.textCursor
+  cursor.movePosition(at_end ? Qt::TextCursor::End : Qt::TextCursor::Start)
+  editor.setTextCursor(cursor)
+  found = editor.find(needle, flags)
+  [found, found ? editor.textCursor.selectionStart : nil]
+end
+chk('FindBackward searches toward the start') { find_in('tlm tlm', 'tlm', Qt::TextDocument::FindBackward, at_end: true) == [true, 4] }
+chk('FindCaseSensitively skips other cases') { find_in('TLM tlm', 'tlm', Qt::TextDocument::FindCaseSensitively) == [true, 4] }
+# Qt counts only letters and digits as word characters: tlm_x would match.
+chk('FindWholeWords skips partial words') { find_in('tlmx tlm', 'tlm', Qt::TextDocument::FindWholeWords) == [true, 5] }
+chk('find with no text is an ArgumentError, not a wild read') do
+  begin
+    Qt::PlainTextEdit.new.find
+    false
+  rescue ArgumentError
+    true
+  end
+end
+
+puts "\n57. Standard shortcuts were built as raw key codes"
+puts "   (Qt::KeySequence::Save and friends were plain Integers, so"
+puts "    KeySequence.new(Qt::KeySequence::Save) took the key-code constructor:"
+puts "    TableManager's New/Open/Save were dead and Save As (63) was the ? key,"
+puts "    and ScriptRunner/TestRunner zoom and LimitsMonitor's Delete were dead"
+puts "    -- table_manager.rb:293-313, script_runner.rb:175/180,"
+puts "    test_runner.rb:114/118, limits_monitor.rb:782)"
+{ 'Save' => 'Ctrl+S', 'New' => 'Ctrl+N', 'Open' => 'Ctrl+O', 'ZoomIn' => 'Ctrl++',
+  'ZoomOut' => 'Ctrl+-', 'Delete' => 'Del' }.each do |name, text|
+  chk("KeySequence.new(KeySequence::#{name}) is #{text}") do
+    (got = Qt::KeySequence.new(Qt::KeySequence.const_get(name)).toString) == text || raise("got #{got.inspect}")
+  end
+end
+chk('KeySequence::SaveAs is not the ? key') do
+  (got = Qt::KeySequence.new(Qt::KeySequence::SaveAs).toString) != '?' || raise("got #{got.inspect}")
+end
+chk('a key code still makes a one-key sequence') { Qt::KeySequence.new(Qt::Key_F5).toString == 'F5' }
+chk('the constants still act as their Integer values') do
+  Qt::KeySequence::Save.to_i == 5 && Qt::KeySequence::Save == 5 && Qt::KeySequence::SaveAs.to_i == 63
+end
+
+puts "\n58. The close button (and Esc) skipped Ruby reject overrides"
+puts "   (QDialog's close and Esc handling call the virtual reject(), which"
+puts "    RubyDialog did not forward, so ScriptRunnerDialog's refusal to close"
+puts "    mid-script (script_runner_frame.rb:65-69) and the raw dialogs' timer"
+puts "    shutdown (cmd_tlm_raw_dialog.rb:129, interface_raw_dialog.rb:125,"
+puts "    pry_dialog.rb:153) never ran)"
+$rejects = []
+counting_dialog = Class.new(Qt::Dialog) { def reject; $rejects << :ruby; super; end }
+chk('closing a dialog runs its Ruby reject, whose super closes it') do
+  d = counting_dialog.new
+  d.show
+  APP.processEvents
+  d.close
+  APP.processEvents
+  result = $rejects == [:ruby] && !d.isVisible
+  d.dispose
+  result || raise("rejects #{$rejects.inspect}, visible=#{d.isVisible rescue '?'}")
+end
+chk('a Ruby reject that refuses keeps the dialog open') do
+  refusing_dialog = Class.new(Qt::Dialog) { def reject; end }
+  d = refusing_dialog.new
+  d.show
+  APP.processEvents
+  d.close
+  APP.processEvents
+  result = d.isVisible
+  d.hide
+  d.dispose
+  result
+end
+chk('dialog.reject from Ruby, with no override, still closes it') do
+  d = Qt::Dialog.new
+  d.show
+  d.reject
+  result = !d.isVisible
+  d.dispose
+  result
+end
+
+puts "\n59. Qt-owned Ruby objects lost their Ruby side at the next GC"
+puts "   (the wrapper map is weak, so a Ruby object only Qt held -- CmdSender's"
+puts "    CmdParamTableItemDelegate, set on its table at cmd_params.rb:244 --"
+puts "    was collected, and Qt's default editor and painting took over)"
+$delegate_calls = Hash.new(0)
+class CountingDelegate < Qt::StyledItemDelegate
+  def initialize(table, tag); super(table); @tag = tag; end
+  def createEditor(parent, option, index)
+    $delegate_calls[@tag] += 1
+    Qt::ComboBox.new(parent)
+  end
+end
+def table_with_delegate(tag)
+  table = Qt::TableWidget.new
+  table.setRowCount(1)
+  table.setColumnCount(1)
+  table.setItem(0, 0, Qt::TableWidgetItem.new('a'))
+  table.setItemDelegate(CountingDelegate.new(table, tag))   # nothing in Ruby keeps it
+  table.show
+  APP.processEvents
+  table
+end
+chk('a delegate only its table holds still edits after GC') do
+  table = table_with_delegate(:after_gc)
+  4.times { GC.start }
+  table.editItem(table.item(0, 0))
+  APP.processEvents
+  table.hide
+  $delegate_calls[:after_gc] == 1 || raise("createEditor ran #{$delegate_calls[:after_gc]} time(s)")
+end
+class TaggedWidget < Qt::Widget
+  attr_reader :tag
+  def initialize(parent); super(parent); @tag = :kept; end
+end
+chk("a Ruby widget only its parent holds keeps its class and state after GC") do
+  parent = Qt::Widget.new
+  TaggedWidget.new(parent)
+  4.times { GC.start }
+  child = parent.findChildren.find { |c| c.is_a?(TaggedWidget) }
+  (child && child.tag == :kept) || raise("found #{parent.findChildren.map(&:class).inspect}")
+end
+
+puts "\n60. Painter#drawText(x, y, width, height, flags, text) was unbound"
+puts "   (the Ruby editors number their lines with it (ruby_editor.rb:357), so"
+puts "    every line-number paint raised, the gutter stayed blank, and the"
+puts "    painter was left active -- see section 61)"
+chk('drawText(x, y, w, h, flags, text) draws right-aligned text') do
+  pixmap = Qt::Pixmap.new(60, 20)
+  pixmap.fill(Qt::white)
+  painter = Qt::Painter.new(pixmap)
+  begin
+    painter.setPen(Qt::Color.new(0, 0, 0))
+    painter.drawText(0, 0, 60, 20, Qt::AlignRight, '888')
+  ensure
+    painter.end
+  end
+  image = pixmap.toImage
+  dark = ->(x) { (0...20).any? { |y| image.pixelColor(x, y).red < 128 } }
+  (!dark.call(2) && (40...60).any? { |x| dark.call(x) }) || raise('no right-aligned text drawn')
+end
+chk('drawText(rect, flags, text)') do
+  pixmap = Qt::Pixmap.new(20, 20)
+  painter = Qt::Painter.new(pixmap)
+  begin
+    painter.drawText(Qt::Rect.new(0, 0, 20, 20), Qt::AlignRight, '1')
+  ensure
+    painter.end
+  end
+  true
+end
+
+puts "\n61. A painter left active on a widget that was then destroyed crashed the GC"
+puts "   (painter_free ended and deleted it, touching the freed widget. A Ruby"
+puts "    exception mid-paintEvent leaves its painter active -- section 60's"
+puts "    drawText did, in ScriptRunner's paused-script dialog, which is then"
+puts "    disposed. Child process: the failure is a segfault.)"
+ORPHANED_PAINTER = <<~'RUBY'
+  require 'Qt'
+  app = Qt::Application.new([])
+  class Abandons < Qt::Widget
+    def paintEvent(event)
+      $painter = Qt::Painter.new(self)   # begun on this widget ...
+      raise 'mid-paint error'            # ... and never ended
+    end
+  end
+  def build
+    dialog = Qt::Dialog.new               # the paused-script dialog's shape
+    layout = Qt::VBoxLayout.new
+    layout.addWidget(Abandons.new)
+    dialog.setLayout(layout)
+    dialog.resize(80, 80)
+    dialog.show
+    3.times { Qt::Application.processEvents }
+    dialog
+  end
+  build.dispose                           # the device goes away first
+  state = begin
+    $painter.isActive
+  rescue RuntimeError => e
+    e.message
+  end
+  $painter = nil
+  4.times { GC.start }                    # then the painter's wrapper is swept
+  puts "after dispose: #{state}; survived"
+RUBY
+chk('a painter whose widget is gone says so, and its sweep does not crash') do
+  lib = File.expand_path('../../../../lib', __dir__)
+  out = IO.popen([RbConfig.ruby, '-I', lib, '-e', ORPHANED_PAINTER, err: [:child, :out]], &:read)
+  line = out.lines.grep(/after dispose/).first.to_s.strip
+  ($?.success? && line == 'after dispose: Qt::Painter: its paint device has been destroyed; survived') ||
+    raise($?.signaled? ? "died with SIG#{Signal.signame($?.termsig)}" : "#{line.inspect}")
+end
+
+puts "\n62. Qt::ActionGroup.new(parent) ignored the parent"
+puts "   (so Ruby owned the group, and PacketViewer's formatting group -- a"
+puts "    local at packet_viewer.rb:169 -- was deleted by the next GC: the"
+puts "    formatting options stopped being mutually exclusive)"
+chk('ActionGroup.new(parent) belongs to the parent') do
+  owner = Qt::Widget.new
+  Qt::ActionGroup.new(owner).parent.equal?(owner)
+end
+def exclusive_pair(owner)
+  a1 = Qt::Action.new('a1', owner)
+  a2 = Qt::Action.new('a2', owner)
+  [a1, a2].each { |a| a.setCheckable(true) }
+  group = Qt::ActionGroup.new(owner)   # dropped, as in packet_viewer.rb:169
+  group.addAction(a1)
+  group.addAction(a2)
+  [a1, a2]
+end
+# Overwrites stale VALUEs left on the machine stack, which Ruby's
+# conservative scan would otherwise treat as live references.
+def scrub_stack(n = 60); n.zero? ? 0 : scrub_stack(n - 1) + 1; end
+chk('a group only its parent holds stays exclusive after GC') do
+  owner = Qt::Widget.new
+  a1, a2 = exclusive_pair(owner)
+  scrub_stack
+  4.times { GC.start }
+  a1.setChecked(true)
+  a2.setChecked(true)
+  (!a1.isChecked && a2.isChecked) || raise("a1=#{a1.isChecked} a2=#{a2.isChecked}")
+end
+
+puts "\n63. Exceptions in single_shot and posted blocks were dropped unreported"
+puts "   (one_shot_with_gvl cleared any exception without a word, and a"
+puts "    non-blocking execute_in_main_thread's wrapper kept it where nothing"
+puts "    looked; slot errors, by contrast, are reported on stderr)"
+# Runs the block, pumps events, and returns what the binding wrote to $stderr.
+def stderr_of
+  saved = $stderr
+  $stderr = StringIO.new
+  yield
+  t0 = Time.now
+  APP.processEvents while Time.now - t0 < 0.3
+  $stderr.string
+ensure
+  $stderr = saved
+end
+chk('a raising single_shot block is reported') do
+  stderr_of { Qt.single_shot(0) { raise 'boom-single-shot' } }.include?('boom-single-shot')
+end
+chk('a raising post_to_main_thread block is reported') do
+  stderr_of { Qt.post_to_main_thread { raise 'boom-posted' } }.include?('boom-posted')
+end
+chk('a raising non-blocking execute_in_main_thread from a worker is reported') do
+  stderr_of { Thread.new { Qt.execute_in_main_thread(false) { raise 'boom-async' } }.join }.include?('boom-async')
+end
+
+puts "\n64. The CI qt6 job passed when the extension was not built"
+puts "   (with no Qt6 or no moc, extconf.rb writes a do-nothing Makefile so"
+puts "    `gem install cosmos` still works without a GUI; rake build and"
+puts "    qt6_test then skip. COSMOS_QT6_REQUIRED=1 -- set by the workflow's qt6"
+puts "    job -- makes all three fail instead.)"
+# Runs extconf.rb in a temporary copy with the Linux branch forced and no
+# Qt6 found; returns [exit status, whether it wrote the stub Makefile].
+def extconf_without_qt(required)
+  Dir.mktmpdir('qt6_extconf_noqt') do |dir|
+    bin = File.join(dir, 'bin')
+    Dir.mkdir(bin)
+    FileUtils.cp(File.join(__dir__, 'extconf.rb'), dir)
+    File.write(File.join(bin, 'pkg-config'), "#!/bin/sh\nexit 1\n")   # no Qt6 modules
+    FileUtils.chmod(0755, File.join(bin, 'pkg-config'))
+    env = { 'PATH' => "#{bin}:#{ENV['PATH']}", 'COSMOS_QT6_REQUIRED' => required ? '1' : nil }
+    force_linux = "Object.send(:remove_const, :RUBY_PLATFORM); RUBY_PLATFORM = 'x86_64-linux'.freeze; load 'extconf.rb'"
+    IO.popen(env, [RbConfig.ruby, '-e', force_linux, chdir: dir, err: [:child, :out]], &:read)
+    stub = File.exist?(File.join(dir, 'Makefile')) && File.read(File.join(dir, 'Makefile')).include?('qt6 extension skipped')
+    [$?.exitstatus, stub]
+  end
+end
+chk('without COSMOS_QT6_REQUIRED a missing Qt6 still gives the stub (gem install)') do
+  (r = extconf_without_qt(false)) == [0, true] || raise("got #{r.inspect}")
+end
+chk('with COSMOS_QT6_REQUIRED a missing Qt6 fails extconf.rb') do
+  (r = extconf_without_qt(true)) == [1, false] || raise("got #{r.inspect}")
+end
+chk('rake build and qt6_test fail instead of skipping when it is required') do
+  rakefile = File.read(File.join(ROOT, 'Rakefile'))
+  qt6_rake = File.read(File.join(ROOT, 'tasks', 'qt6.rake'))
+  rakefile.include?("ENV['COSMOS_QT6_REQUIRED']") && qt6_rake.include?("ENV['COSMOS_QT6_REQUIRED']")
+end
+chk("the workflow's qt6 job requires the extension") do
+  File.read(File.join(ROOT, '.github', 'workflows', 'build_v4.yml')).include?('COSMOS_QT6_REQUIRED: 1')
+end
+
+puts "\n65. scan_unbound.rb reported TOTAL 0 while calls were unbound"
+puts "   (the class pass skipped any name COSMOS defines anywhere -- COSMOS's"
+puts "    own Qt::Dialog#exec hid Qt::Menu#exec (S9) -- and calls with no"
+puts "    explicit receiver were never read, so MatrixbycolumnsWidget's"
+puts "    setHorizontalSpacing (F14a) and AdaptiveGridLayout's addItem (F5)"
+puts "    were not seen. Runs the scanner over a fixture tree with exactly those"
+puts "    shapes, and with the shapes that made reading bare calls report bound"
+puts "    ones: constructor blocks, signals, strings, nested classes, mixins.)"
+def scan_fixture
+  Dir.mktmpdir('qt6_scan_fixture') do |root|
+    ext = File.join(root, 'ext', 'cosmos', 'ext', 'qt6')
+    gui = File.join(root, 'lib', 'cosmos', 'gui')
+    FileUtils.mkdir_p([ext, gui])
+    File.write(File.join(ext, 'cosmos_qt6.cpp'), <<~CPP)
+      cWidget = rb_define_class_under(mQt, "Widget", cQtBase);
+      cDialog = rb_define_class_under(mQt, "Dialog", cWidget);
+      cMenu = rb_define_class_under(mQt, "Menu", cWidget);
+      cLayout = rb_define_class_under(mQt, "Layout", cQtBase);
+      cGridLayout = rb_define_class_under(mQt, "GridLayout", cLayout);
+      QDEF(cDialog, "accept", RUBY_METHOD_FUNC(f), 0);
+      QDEF(cMenu, "addAction", RUBY_METHOD_FUNC(f), 1);
+      QDEF(cGridLayout, "addWidget", RUBY_METHOD_FUNC(f), -1);
+      QDEF(cGridLayout, "setRowStretch", RUBY_METHOD_FUNC(f), 2);
+    CPP
+    File.write(File.join(root, 'lib', 'Qt.rb'), <<~'RUBY')
+      module Qt
+        module ValueDispose
+          def dispose; nil; end
+        end
+        class TextCursor
+          def selection; end
+        end
+        constants.each { |c| const_get(c).send(:include, ValueDispose) }
+      end
+    RUBY
+    File.write(File.join(gui, 'fixture.rb'), <<~'RUBY')
+      class Qt::Dialog
+        def exec(*args); end          # COSMOS reopens Dialog#exec ...
+      end
+      class Qt::Menu
+        def tear_off
+          showTearOffMenu()           # a reopened class's bare call is on it
+        end
+      end
+      %w(GridLayout).each do |klass|
+        "Qt::#{klass}".to_class.class_eval do
+          def removeAll; end
+        end
+      end
+      module Cosmos
+        class Popup
+          def show_menu(point)
+            menu = Qt::Menu.new
+            menu.addAction(nil)
+            menu.exec(point)          # ... which hid Menu#exec
+          end
+        end
+        class Matrix < Qt::GridLayout
+          def initialize
+            super()
+            setHorizontalSpacing(2)   # no receiver
+            addWidget(nil)
+          end
+        end
+        class Adaptive < Qt::GridLayout
+          def addWidget(widget)
+            addItem(takeAt(1), 0, 1)  # no receiver
+            super(widget)
+          end
+        end
+        class Picker < Qt::Dialog
+          signals 'rowPicked(int)'
+          def initialize
+            super()
+            connect(SIGNAL('customContextMenuRequested(const QPoint&)')) { }
+            grid = Qt::GridLayout.new do
+              addWidget(nil)          # instance_eval'd on the layout
+              setVerticalSpacing(1)   # ... where it is unbound
+            end
+            grid.removeAll
+            Qt::GridLayout.new do |g|
+              g.addWidget(nil)
+              doneLater(1)            # yielded, so this is on the dialog
+            end
+            glBegin(1)                # the opengl gem's, included at top level
+            emit rowPicked(0)
+            menu = Qt::Menu.new
+            menu.dispose              # lib/Qt.rb mixes dispose into every class
+            menu.selection            # lib/Qt.rb defines this on TextCursor only
+            menu.removeAll            # class_eval put this on GridLayout only
+          end
+          class Cell < Qt::GridLayout
+            def fill
+              setRowStretch(0, 1)     # nested: on the layout
+            end
+          end
+          def spacing; horizontalSpacing(); end   # a one-line def's body
+        end
+      end
+    RUBY
+    `QT6_SCAN_ROOT=#{root.inspect} #{RbConfig.ruby.inspect} -rset #{File.join(__dir__, 'scan_unbound.rb').inspect} 2>&1`
+  end
+end
+fixture_scan = scan_fixture
+chk('it reports Qt::Menu#exec despite COSMOS defining exec elsewhere') { fixture_scan.include?('Qt::Menu#exec') }
+chk('it reports setHorizontalSpacing called with no receiver') { fixture_scan.include?('setHorizontalSpacing') }
+chk('it reports addItem and takeAt called with no receiver') do
+  fixture_scan.include?('Qt::GridLayout#addItem') && fixture_scan.include?('Qt::GridLayout#takeAt')
+end
+chk('it does not report what is bound or defined in the class') do
+  !fixture_scan.include?('#addWidget') && !fixture_scan.include?('#addAction')
+end
+chk('a constructor block without parameters is read as calls on the new object') do
+  fixture_scan.include?('Qt::GridLayout#setVerticalSpacing') && !fixture_scan.include?('Qt::Dialog#addWidget')
+end
+chk('a constructor block with a parameter stays on the enclosing class') do
+  fixture_scan.include?('Qt::Dialog#doneLater')
+end
+chk('a reopened Qt class is checked as that class') { fixture_scan.include?('Qt::Menu#showTearOffMenu') }
+chk('signal strings, signals declarations and opengl gem functions are not calls') do
+  %w[customContextMenuRequested rowPicked glBegin].none? { |m| fixture_scan.include?(m) }
+end
+chk('a nested class is scanned as itself, not as the class around it') do
+  !fixture_scan.include?('setRowStretch')
+end
+chk("a one-line def's body is scanned") { fixture_scan.include?('Qt::Dialog#horizontalSpacing') }
+chk("lib/Qt.rb's mixins count on every class, its reopens on one class") do
+  !fixture_scan.include?('Qt::Menu#dispose') && fixture_scan.include?('Qt::Menu#selection')
+end
+chk('class_eval defs count only on the classes the loop lists') do
+  !fixture_scan.include?('Qt::GridLayout#removeAll') && fixture_scan.include?('Qt::Menu#removeAll')
+end
+
+puts "\n66. Methods the corrected scan_unbound.rb (section 65) found unbound"
+puts "   (ToolBar#addWidget, for the classification banner; Widget#showMaximized"
+puts "    and showMinimized, for --maximized and --minimized; Completer#"
+puts "    setCurrentRow; and AbstractItemModel#index, which completion.rb calls"
+puts "    on the line before it. isMaximized/isMinimized are bound to observe.)"
+bar = Qt::ToolBar.new
+bar_action = bar.addWidget(Qt::Frame.new) rescue $!
+chk('ToolBar#addWidget returns the action it added to the bar') do
+  (bar_action.is_a?(Qt::Action) && bar.actions.size == 1) || raise(bar_action.inspect)
+end
+%w[Maximized Minimized].each do |state|
+  win = Qt::MainWindow.new
+  shown = begin
+    win.send("show#{state}")
+    nil
+  rescue Exception => e
+    e
+  end
+  chk("Widget#show#{state} leaves the window #{state.downcase}") do
+    (shown.nil? && win.send("is#{state}")) || raise(shown || "is#{state} is false")
+  end
+  win.hide
+end
+completer = Qt::Completer.new(Qt::Widget.new)
+completer.setModel(Qt::StringListModel.new(%w[alpha beta], completer))
+chk('Completer#setCurrentRow returns what Qt returns') do
+  completer.setCurrentRow(1) == true && completer.setCurrentRow(5) == false
+end
+chk('AbstractItemModel#index returns that row and column') do
+  idx = completer.model.index(1, 0)
+  idx.row == 1 && idx.column == 0 && idx.data.toString == 'beta'
+end
+
+puts "\n67. Every connected block was kept for the life of the process (F21)"
+puts "   (connect anchored its block in one Ruby array, g_procs, and nothing"
+puts "    removed it, so a block -- and everything it captured -- outlived the"
+puts "    object it was connected to. And each single_shot/post_to_main_thread"
+puts "    block was removed from that array afterwards with rb_ary_delete, which"
+puts "    compares it with every block ever connected.)"
+require 'weakref'
+def f21_connect_then_dispose(count)
+  Array.new(count) do
+    edit = Qt::LineEdit.new
+    payload = Object.new
+    edit.connect(SIGNAL('textChanged(const QString&)')) { payload.to_s }
+    ref = WeakRef.new(payload)
+    edit.dispose
+    ref
+  end
+end
+def f21_connect_live
+  edit = Qt::LineEdit.new
+  seen = []
+  edit.connect(SIGNAL('textChanged(const QString&)')) { |text| seen << text }
+  [edit, seen]
+end
+f21_refs = f21_connect_then_dispose(50)
+f21_live, f21_seen = f21_connect_live
+scrub_stack
+4.times { GC.start }
+chk('a block connected to a destroyed object is released') do
+  alive = f21_refs.count(&:weakref_alive?)
+  alive <= 5 || raise("#{alive} of 50 captured objects still alive")
+end
+f21_live.setText('after GC')
+chk('a block connected to a live object still runs after GC') { f21_seen == ['after GC'] }
+# rb_ary_delete compares with ==, so a Proc#== that counts calls on the
+# blocks connected here shows each comparison. (A Proc subclass would not
+# do: a C method's block argument is re-made as a plain Proc.)
+f21_edits = Array.new(200) { Qt::LineEdit.new }
+f21_edits.each do |e|
+  blk = proc {}
+  $f21_mark ||= blk.source_location
+  Qt.connect_raw(e, Qt.__sig(SIGNAL('textChanged(const QString&)')), &blk)
+end
+$f21_compares = 0
+class Proc
+  def ==(other)
+    $f21_compares += 1 if source_location == $f21_mark
+    super
+  end
+end
+f21_ran = false
+Qt.post_to_main_thread { f21_ran = true }
+5.times { APP.processEvents }
+class Proc
+  remove_method :==
+end
+chk('removing a posted block does not compare it with every connected block') do
+  (f21_ran && $f21_compares.zero?) || raise("ran=#{f21_ran}, #{$f21_compares} comparisons")
+end
+f21_edits.each(&:dispose)
+
+puts "\n68. Every event on a Ruby-created widget took the GVL (F22)"
+puts "   (the binding defines paintEvent, resizeEvent, ... on Qt::Widget so that"
+puts "    super works, which made every widget look like it overrode them: each"
+puts "    paint, resize and show of every Qt::Label took the GVL and ran Qt's"
+puts "    default from Ruby. With a busy Ruby thread each acquisition waits out"
+puts "    that thread's time slice: 50 labels took 3.5 s to paint, not 0.1 s.)"
+# Calls into the binding's own pass-through (a method an Impl module owns) on
+# objects that do not override it -- i.e. calls made only to reach Qt's default.
+def f22_passthrough_calls
+  calls = 0
+  tp = TracePoint.new(:c_call) do |t|
+    next unless t.method_id.to_s.end_with?('Event')
+    owner = (t.self.method(t.method_id).owner rescue nil)
+    calls += 1 if owner && owner.name.to_s.end_with?('::Impl')
+  end
+  tp.enable
+  yield
+  tp.disable
+  calls
+end
+f22_win = Qt::Widget.new
+f22_box = Qt::VBoxLayout.new(f22_win)
+20.times { |i| f22_box.addWidget(Qt::Label.new("L#{i}")) }
+f22_win.show
+5.times { APP.processEvents }
+chk('repainting widgets that override nothing does not call into Ruby') do
+  calls = f22_passthrough_calls { f22_win.repaint; APP.processEvents }
+  calls.zero? || raise("#{calls} calls into Ruby for 21 widgets")
+end
+f22_win.hide
+# What each override recorded during one repaint of widget.
+$f22_seen = []
+def f22_painted(widget)
+  widget.show
+  5.times { APP.processEvents }
+  $f22_seen.clear
+  widget.repaint
+  APP.processEvents
+  $f22_seen.uniq
+end
+class F22Sub < Qt::Label
+  def paintEvent(e); $f22_seen << :subclass; super(e); end
+end
+class F22Late < Qt::Label; end
+module F22Mod
+  def paintEvent(e); $f22_seen << :module; super(e); end
+end
+f22_sub = F22Sub.new('sub')
+chk('a subclass override is called') { f22_painted(f22_sub) == [:subclass] }
+f22_single = Qt::Label.new('singleton')
+f22_painted(f22_single)                         # seen first with no override
+def f22_single.paintEvent(e); $f22_seen << :singleton; super(e); end
+chk('a singleton override added after the first paint is called') { f22_painted(f22_single) == [:singleton] }
+f22_late = F22Late.new('reopened')
+f22_painted(f22_late)
+class F22Late
+  def paintEvent(e); $f22_seen << :reopened; super(e); end
+end
+chk('an override added by reopening the class later is called') { f22_painted(f22_late) == [:reopened] }
+class F22Gone < Qt::Label
+  def paintEvent(e); $f22_seen << :gone; super(e); end
+end
+f22_gone = F22Gone.new('removed')
+f22_painted(f22_gone)                           # seen first with its override
+class F22Gone
+  remove_method :paintEvent
+end
+# A stale answer would only cost a call into Ruby (the binding's pass-through
+# records nothing), so that is what this counts.
+chk('an override removed later costs no more calls into Ruby') do
+  seen = nil
+  calls = f22_passthrough_calls { seen = f22_painted(f22_gone) }
+  (seen == [] && calls.zero?) || raise("seen #{seen.inspect}, #{calls} calls into Ruby")
+end
+f22_included = Class.new(Qt::Label).new('included')
+f22_painted(f22_included)
+f22_included.class.send(:include, F22Mod)
+chk('an override from a module included later is called') { f22_painted(f22_included) == [:module] }
+f22_extended = Qt::Label.new('extended')
+f22_painted(f22_extended)
+f22_extended.extend(F22Mod)
+chk('an override from a module extended later is called') { f22_painted(f22_extended) == [:module] }
+[f22_sub, f22_single, f22_late, f22_gone, f22_included, f22_extended].each(&:hide)
+F22_LATENCY = <<~'RUBY'
+  $stdout.sync = true
+  require 'Qt'
+  app = Qt::Application.new([])
+  $painted_at = nil
+  class Sentinel < Qt::Label           # painted last; the only override
+    def paintEvent(e)
+      $painted_at ||= Time.now
+      super(e)
+    end
+  end
+  win = Qt::Widget.new
+  grid = Qt::GridLayout.new(win)
+  50.times { |i| grid.addWidget(Qt::Label.new("L#{i}"), i / 10, i % 10) }
+  grid.addWidget(Sentinel.new('S'), 6, 0)
+  win.resize(900, 700)
+  Thread.new { loop { i = 0; i += 1 while i < 5_000_000 } }   # a CPU-bound Ruby thread
+  sleep 0.2
+  t0 = Time.now
+  win.show                             # the paints come from the loop, GVL released
+  app.exec_for(3000)
+  puts $painted_at ? "painted after #{(($painted_at - t0) * 1000).round} ms" : 'not painted in 3 s'
+  exit!(0)
+RUBY
+chk('with a busy Ruby thread, 50 plain labels paint in under 1.5 s') do
+  lib = File.expand_path('../../../../lib', __dir__)
+  out = IO.popen([RbConfig.ruby, '-I', lib, '-e', F22_LATENCY, err: [:child, :out]], &:read)
+  ms = out[/painted after (\d+) ms/, 1]
+  (ms && ms.to_i < 1500) || raise(out.lines.grep(/painted/).first.to_s.strip)
+end
+
+puts "\n69. Qt calls from a background Ruby thread went through (P1)"
+puts "   (qtbindings refused any Qt method, class method or constructor called"
+puts "    off the main thread -- Qt.cpp:837 and 1000, qtruby.cpp:1404 -- and"
+puts "    COSMOS depends on the refusal: backgroundbutton_widget.rb:43 turns it"
+puts "    into advice to use Qt.execute_in_main_thread. Here the calls ran on"
+puts "    the wrong thread, which Qt does not support for widgets.)"
+P1_REFUSAL = 'Qt methods cannot be called from outside of the main thread'
+def p1_off_main
+  Thread.new do
+    begin
+      yield
+      :no_error
+    rescue Exception => e
+      e
+    end
+  end.value
+end
+p1_label = Qt::Label.new('before')
+{
+  'an instance method (Label#setText)' => -> { p1_label.setText('from a thread') },
+  'a constructor (Qt::Label.new)'      => -> { Qt::Label.new('from a thread') },
+  'a value type (Qt::Color.new)'       => -> { Qt::Color.new(1, 2, 3) },
+  'a class method (Qt::Cursor.pos)'    => -> { Qt::Cursor.pos }
+}.each do |what, call|
+  chk("#{what} off the main thread raises qtbindings' error") do
+    r = p1_off_main(&call)
+    (r.is_a?(RuntimeError) && r.message == P1_REFUSAL) || raise(r.inspect)
+  end
+end
+chk('the refused setText left the label alone') { p1_label.text == 'before' }
+chk('execute_in_main_thread from a background thread still runs its block') do
+  got = nil
+  t = Thread.new { Qt.execute_in_main_thread(true) { got = [Qt.on_main_thread?, p1_label.text] } }
+  100.times { APP.processEvents; sleep 0.01; break unless t.alive? }
+  t.join(2)
+  got == [true, p1_label.text]
+end
+chk('disposed? still answers off the main thread (qtbindings did not guard it)') do
+  p1_off_main { p1_label.disposed? } == :no_error
+end
+
+puts "\n70. Blocks posted before the QApplication existed never ran (P2)"
+puts "   (the post went to qApp, still null, so nothing was queued, and a"
+puts "    blocking execute_in_main_thread waited forever; on the main thread"
+puts "    on_main_thread? was false with no application, so even that call"
+puts "    posted and hung. qtbindings queued such blocks and ran them once the"
+puts "    application's timers started (lib/Qt4.rb, qtruby4.rb:467), and ran a"
+puts "    main-thread call inline. Child processes: this one has its app.)"
+def p2_child(script)
+  lib = File.expand_path('../../../../lib', __dir__)
+  IO.popen([RbConfig.ruby, '-I', lib, '-e', "STDOUT.sync = true\nThread.new { sleep 8; STDOUT.puts 'HUNG'; exit!(3) }\n" + script,
+            err: [:child, :out]], &:read)
+end
+chk('a blocking post from a thread before the app runs once the app does') do
+  out = p2_child(<<~'RUBY')
+    require 'Qt'
+    ran = nil
+    waiter = Thread.new { Qt.execute_in_main_thread(true) { ran = Qt.on_main_thread? } }
+    sleep 0.3
+    app = Qt::Application.new([])
+    app.exec_for(1000)
+    waiter.join(1)
+    STDOUT.puts "ran=#{ran.inspect} waiter=#{waiter.alive? ? 'stuck' : 'returned'}"
+    exit!(0)
+  RUBY
+  out.include?('ran=true waiter=returned') || raise(out.lines.grep(/ran=|HUNG/).first.to_s.strip)
+end
+chk('execute_in_main_thread on the main thread before the app runs inline') do
+  out = p2_child(<<~'RUBY')
+    require 'Qt'
+    STDOUT.puts "result=#{Qt.execute_in_main_thread(true) { :inline }.inspect}"
+    exit!(0)
+  RUBY
+  out.include?('result=:inline') || raise(out.lines.grep(/result=|HUNG/).first.to_s.strip)
+end
+chk('a single_shot set before the app fires once the app runs') do
+  out = p2_child(<<~'RUBY')
+    require 'Qt'
+    fired = false
+    Qt.single_shot(10) { fired = true }
+    app = Qt::Application.new([])
+    app.exec_for(500)
+    STDOUT.puts "fired=#{fired}"
+    exit!(0)
+  RUBY
+  out.include?('fired=true') || raise(out.lines.grep(/fired=|HUNG/).first.to_s.strip)
+end
+
+puts "\n71. Qt::Pen.new(Qt::DashLine) was a solid black pen (F17)"
+puts "   (Qt::DashLine was a plain Integer and an Integer took the colour path:"
+puts "    DashLine is 2, which is also Qt::black. Cosmos::DASHLINE_PEN"
+puts "    (qt.rb:237) draws LineGraph's grid lines, so they were solid.)"
+# Which of 60 pixels a horizontal line drawn with +pen+ darkens on white.
+def f17_line(pen)
+  pixmap = Qt::Pixmap.new(60, 5)
+  pixmap.fill(Qt::white)
+  painter = Qt::Painter.new(pixmap)
+  begin
+    painter.setPen(pen)
+    painter.drawLine(0, 2, 59, 2)
+  ensure
+    painter.end
+  end
+  image = pixmap.toImage
+  (0...60).map { |x| image.pixelColor(x, 2).red < 128 }
+end
+chk('Pen.new(Qt::DashLine) draws a dashed line') do
+  dark = f17_line(Qt::Pen.new(Qt::DashLine)).count(true)
+  dark.between?(20, 50) || raise("#{dark} of 60 pixels dark")
+end
+chk('Painter#setPen(Qt::DashLine) draws a dashed line') do
+  dark = f17_line(Qt::DashLine).count(true)
+  dark.between?(20, 50) || raise("#{dark} of 60 pixels dark")
+end
+chk('Pen.new(color) is still a solid pen of that colour') do
+  f17_line(Qt::Pen.new(Qt::Color.new(0, 0, 0))).count(true) == 60 && Qt::Pen.new(Qt::red).color.red == 255
+end
+chk('Qt::DashLine still converts and compares as its Integer') do
+  Qt::DashLine == 2 && 2 == Qt::DashLine && Qt::DashLine.to_i == 2 && [Qt::DashLine].include?(2)
+end
+
+puts "\n72. Qt::KeyEvent.new(type, key, modifiers) was unbound (F14d)"
+puts "   (completion.rb:52 builds an Enter key event after inserting a picked"
+puts "    completion, to carry on with the line; it raised ArgumentError.)"
+chk('KeyEvent.new(type, key, modifiers) builds that key event') do
+  e = Qt::KeyEvent.new(Qt::Event::KeyPress, Qt::Key_Enter, Qt::NoModifier)
+  (e.type == Qt::Event::KeyPress && e.key == Qt::Key_Enter && e.modifiers == Qt::NoModifier &&
+   e.text == '' && e.isAccepted) || raise([e.type, e.key, e.modifiers, e.text].inspect)
+end
+chk('KeyEvent.new(type, key, modifiers, text) keeps the text') do
+  Qt::KeyEvent.new(Qt::Event::KeyPress, Qt::Key_Tab, Qt::NoModifier, "\t").text == "\t"
+end
+
+puts "\n73. connect to a signal that does not exist returned true (F19)"
+puts "   (connect filed any signal Qt did not know as a Ruby-declared one, so a"
+puts "    misspelt SIGNAL('clickd()') connected silently and never fired. Qt"
+puts "    warns and returns false, which qtbindings passed through.)"
+f19_button = Qt::PushButton.new
+f19_result = nil
+f19_err = stderr_of { f19_result = f19_button.connect(SIGNAL('clickd()')) { } }
+chk('connecting to a signal that does not exist returns false') { f19_result == false || raise(f19_result.inspect) }
+chk('and says so on stderr, as Qt does') { f19_err.include?('No such signal') || raise(f19_err.inspect) }
+class F19Emitter < Qt::Object
+  signals 'changed(int)'
+end
+class F19Child < F19Emitter; end
+chk('a signal declared in Ruby still connects and fires, on a subclass too') do
+  got = []
+  [F19Emitter.new, F19Child.new].each_with_index do |o, i|
+    r = o.connect(SIGNAL('changed(int)')) { |v| got << v }
+    raise "connect returned #{r.inspect}" unless r == true
+    o.emit(o.changed(i + 1))
+  end
+  got == [1, 2] || raise(got.inspect)
+end
+
+puts "\n74. Strings from Qt are what qtbindings returned (F26: not a divergence)"
+puts "   (qtbindings made them with rb_str_new2(s->toUtf8()) -- handlers.cpp:1041,"
+puts "    marshall_QString -- so ASCII-8BIT and cut at the first NUL, like ours."
+puts "    COSMOS source is ascii-8bit throughout; UTF-8 strings from Qt could"
+puts "    raise Encoding::CompatibilityError against binary telemetry strings.)"
+chk('a string from Qt is ASCII-8BIT') { Qt::Label.new('abc').text.encoding == Encoding::ASCII_8BIT }
+chk('and ends at an embedded NUL') { Qt::Label.new("a\0b").text == 'a' }
+
+puts "\n75. The missing-extension message named a rake task that does not exist (F24)"
+puts "   (lib/Qt.rb told the user to run 'rake build_extensions'; the task is"
+puts "    'rake build'.)"
+chk('the LoadError message names a rake task the Rakefile defines') do
+  named = File.read(File.join(ROOT, 'lib', 'Qt.rb'))[/then:\s+rake (\S+)/, 1]
+  tasks = Dir.chdir(ROOT) { `#{RbConfig.ruby.inspect} -S rake -P 2>/dev/null` }.lines.grep(/^rake /).map { |l| l.split[1] }
+  (named && tasks.include?(named)) || raise("the message names #{named.inspect}")
+end
+
+puts "\n76. The gem left out tasks/qt6.rake, which its Rakefile imports (F25)"
+puts "   (the gemspec takes its file list from Manifest.txt, which lacked it, so"
+puts "    any rake command in the built gem aborted with a LoadError)"
+chk('every file the Rakefile imports is in the gem') do
+  imports = File.read(File.join(ROOT, 'Rakefile')).scan(/^import '([^']+)'/).flatten
+  files = Dir.chdir(ROOT) { Gem::Specification.load('cosmos.gemspec').files }
+  missing = imports - files
+  missing.empty? || raise("not in the gem: #{missing.join(', ')}")
+end
+
+puts "\n52. on_destroyed raced the GC for the wrapper it was marking"
+puts "   (it read the wrapper VALUE from the weak map, dropped the lock and"
+puts "    waited for the GVL; meanwhile a sweep on another Ruby thread -- every"
+puts "    QtTool runs redirect_io's thread, qt_tool.rb:476 -- could free that"
+puts "    garbage wrapper, and the type check on the freed slot crashed. Seen in"
+puts "    test_cosmos_tools.rb: a QMessageBox label's QTextFrame destroyed by"
+puts "    dialog.exec's layout pass. Child process: 8 s of that path under a"
+puts "    GC-looping thread; it crashed in about 1 run in 4 at 5 s.)"
+DESTROY_RACE = <<~'RUBY'
+  $stdout.sync = true
+  require 'Qt'
+  app = Qt::Application.new([])
+  stop = false
+  gcs = 0
+  Thread.new { until stop; GC.start; gcs += 1; end }
+  host = Qt::Widget.new
+  layout = Qt::VBoxLayout.new
+  labels = Array.new(40) { |i| Qt::Label.new("<b>label</b> #{i}") }
+  labels.each { |l| layout.addWidget(l) }
+  host.setLayout(layout)
+  host.show
+  app.processEvents
+  t0 = Time.now
+  rounds = 0
+  while Time.now - t0 < (ARGV[0] || 4).to_f
+    labels.each { |l| l.findChildren }          # wrap the labels' internal text objects
+    labels.each_with_index { |l, i| l.setText("<i>round #{rounds}</i> label #{i}") }
+    app.exec_for(2)                             # relayout -> frames destroyed without the GVL
+    rounds += 1
+  end
+  stop = true
+  puts "survived #{rounds} rounds, #{gcs} background GCs"
+RUBY
+chk('Qt destroying objects whose wrappers are garbage, under GC from another thread') do
+  lib = File.expand_path('../../../../lib', __dir__)
+  out = IO.popen([RbConfig.ruby, '-I', lib, '-e', DESTROY_RACE, '8', err: [:child, :out]], &:read)
+  ($?.success? && out.include?('survived')) ||
+    raise($?.signaled? ? "died with SIG#{Signal.signame($?.termsig)}" : "exit #{$?.exitstatus}: #{out.lines.grep(/BUG/).first.to_s.strip}")
 end
 
 puts

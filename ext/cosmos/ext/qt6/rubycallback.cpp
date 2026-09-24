@@ -1,6 +1,8 @@
 #include "rubycallback.h"
 #include "rubywidget.h"   // ruby_wrap_model_index
 #include <ruby/thread.h>
+#include <QCoreApplication>
+#include <QThread>
 
 // Whether THIS thread currently holds the GVL. Ruby already knows, so ask it.
 // Tracking it locally did not work: "a Qt event loop released the GVL" was a
@@ -78,6 +80,7 @@ bool ruby_contain_error(int state, const char *context) {
 
 static bool contain_error(int state) {
   if (!state) return false;
+  if (ruby_defer_exit_exception(state)) return true;   // ends the app instead
   VALUE err = rb_errinfo();
   rb_set_errinfo(Qnil);
   if (NIL_P(err)) return true;   // contained, just nothing printable
@@ -119,13 +122,68 @@ void ruby_with_gvl(const std::function<void()> &fn) {
   ruby_run_with_gvl(run_std_fn, (void *)&fn);
 }
 
+// ---- Ruby interrupts while a Qt event loop runs ----------------------------
+// An exit-class exception (SystemExit, Interrupt, SignalException) raised
+// where Ruby cannot unwind -- inside the event loop -- waits here for every
+// loop to return; ruby_raise_pending_exit raises it in Ruby. The first wins.
+static VALUE g_pending_exit = Qnil;
+
+static bool is_exit_exception(VALUE err) {
+  return rb_obj_is_kind_of(err, rb_eSystemExit) || rb_obj_is_kind_of(err, rb_eSignal);
+}
+// GVL held. QCoreApplication::exit ends every event loop on this thread, the
+// modal ones nested in app.exec included, so each exec returns in turn.
+static void defer_exit(VALUE err) {
+  static bool registered = false;
+  if (!registered) { rb_gc_register_address(&g_pending_exit); registered = true; }
+  if (NIL_P(g_pending_exit)) g_pending_exit = err;
+  if (QCoreApplication::instance()) QCoreApplication::exit(0);
+}
+void ruby_raise_pending_exit(void) {
+  VALUE err = g_pending_exit;
+  if (NIL_P(err)) return;
+  g_pending_exit = Qnil;
+  rb_exc_raise(err);
+}
+
+bool ruby_defer_exit_exception(int state) {
+  if (!state) return false;
+  VALUE err = rb_errinfo();
+  if (NIL_P(err) || !is_exit_exception(err)) return false;
+  rb_set_errinfo(Qnil);
+  defer_exit(err);
+  return true;
+}
+
+static VALUE check_ints(VALUE) { rb_thread_check_ints(); return Qnil; }
+// Runs pending trap handlers, or raises the pending signal's default
+// exception, on the GUI thread with the GVL held.
+static void *service_interrupts(void *) {
+  int state = 0;
+  rb_protect(check_ints, Qnil, &state);
+  ruby_contain_error(state, "signal handler");   // defers exit-class exceptions
+  return NULL;
+}
+// The unblocking function Ruby calls, from another thread, to interrupt the
+// thread running a Qt event loop. RUBY_UBF_IO only interrupted syscalls with
+// EINTR, which Qt's dispatcher retries, so SIGINT/SIGTERM to an idle tool or
+// an open dialog were never serviced. Post the servicing into the loop.
+static void wake_event_loop(void *) {
+  if (QCoreApplication *app = QCoreApplication::instance())
+    QMetaObject::invokeMethod(app, [] { ruby_run_with_gvl(service_interrupts, NULL); },
+                              Qt::QueuedConnection);
+}
+
 // Runs a blocking Qt call with the GVL released so Ruby's other threads keep
 // getting scheduled. Every nested modal loop must go through this: a
 // QMessageBox that holds the GVL gives CmdTlmServer's interface, telemetry
 // and logging threads zero slices for as long as the dialog is on screen.
 void ruby_without_gvl(const std::function<void()> &fn) {
   if (!ruby_native_thread_p() || !ruby_thread_has_gvl_p()) { fn(); return; }
-  rb_thread_call_without_gvl(run_std_fn_v, (void *)&fn, RUBY_UBF_IO, NULL);
+  QCoreApplication *app = QCoreApplication::instance();
+  bool gui = app && QThread::currentThread() == app->thread();
+  rb_thread_call_without_gvl(run_std_fn_v, (void *)&fn,
+                             gui ? wake_event_loop : RUBY_UBF_IO, NULL);
 }
 
 void ruby_invoke_proc(VALUE proc) {
