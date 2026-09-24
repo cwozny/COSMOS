@@ -628,6 +628,7 @@ static QObject *ctor_slider(int argc, VALUE *argv) {
 // paints the palette's white text onto those white backgrounds, which is why
 // the Legal Agreement pane looks empty. Default to the light scheme COSMOS
 // was written against. COSMOS_QT_COLOR_SCHEME=dark|system opts out.
+static int g_color_scheme_requested = 0;   // see qt_color_scheme
 static void apply_color_scheme() {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
   const char *want = getenv("COSMOS_QT_COLOR_SCHEME");
@@ -635,6 +636,19 @@ static void apply_color_scheme() {
   Qt::ColorScheme scheme = Qt::ColorScheme::Light;
   if (want && !strcasecmp(want, "dark")) scheme = Qt::ColorScheme::Dark;
   if (QStyleHints *h = QGuiApplication::styleHints()) h->setColorScheme(scheme);
+  g_color_scheme_requested = (int)scheme;
+#endif
+}
+
+// The colour scheme apply_color_scheme asked Qt for: 0 none (system), 1
+// light, 2 dark; nil before Qt 6.8, which has no way to ask. For the suites:
+// offscreen, the platform ignores the request and the palette is light
+// either way, so only the request itself can be checked.
+static VALUE qt_color_scheme(VALUE) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+  return INT2NUM(g_color_scheme_requested);
+#else
+  return Qnil;
 #endif
 }
 
@@ -5183,6 +5197,7 @@ extern "C" void Init_qt6(void) {
   rb_define_singleton_method(mQt, "single_shot",  RUBY_METHOD_FUNC(qt_single_shot), -1);
   rb_define_singleton_method(mQt, "post_to_main_thread", RUBY_METHOD_FUNC(qt_post_to_main), -1);
   rb_define_singleton_method(mQt, "__overrides_changed", RUBY_METHOD_FUNC(qt_overrides_changed), 0);
+  rb_define_singleton_method(mQt, "__color_scheme",      RUBY_METHOD_FUNC(qt_color_scheme), 0);
   rb_define_singleton_method(mQt, "on_main_thread?",     RUBY_METHOD_FUNC(qt_on_main_thread_p), 0);
   rb_define_singleton_method(mQt, "object_count", RUBY_METHOD_FUNC(obj_object_count), 0);
 

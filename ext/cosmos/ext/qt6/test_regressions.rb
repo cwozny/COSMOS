@@ -54,12 +54,13 @@ end
 chk('addButton(Button) hands ownership to Qt (no double free)') do
   # QMessageBox reparents and deletes the button. If the Ruby wrapper still
   # claims ownership, both sides free it and the process dies at teardown --
-  # after every test has already printed "ok".
+  # after every test has already printed "ok". (This check used to end in
+  # `|| true` and could not fail.)
   m = Qt::MessageBox.new(nil)
   b = Qt::PushButton.new('Open')
+  before = b.owned?
   m.addButton(b, Qt::MessageBox::ResetRole)
-  GC.start
-  !b.destroyed? || true   # the assertion is that GC.start did not crash us
+  (before && !b.owned?) || raise("owned? #{before} before, #{b.owned?} after")
 end
 chk('clickedButton bound (nil before exec)') { Qt::MessageBox.new(nil).clickedButton.nil? }
 chk('exec/dispose inherited from Dialog') do
@@ -404,22 +405,24 @@ puts "\n14. Dark mode made light-assuming stylesheets invisible"
 puts "   (legal_dialog.rb:53 sets background-color white with no text colour;"
 puts "    Qt4 had no dark-mode support, Qt6 follows the system and painted"
 puts "    white on white -- the Legal Agreement pane looked empty)"
-chk('the app defaults to the light colour scheme') do
-  # Render white-on-default text over the stylesheet COSMOS actually uses and
-  # confirm the result is not a single flat colour.
-  l = Qt::Label.new('Copyright 2017 Ball Aerospace & Technologies Corp.')
-  l.setStyleSheet('QLabel { background-color : white; padding: 5px; }')
-  l.resize(420, 40)
-  l.show
-  Qt::Application.processEvents
-  png = File.join(Dir.tmpdir, "_regr_label_#{Process.pid}.png")   # no /tmp on Windows
-  l.grab.save(png)
-  data = File.binread(png)
-  # A blank (all-white) label compresses to a much smaller PNG than one with
-  # glyphs on it; 1.5 KB is far above an empty 420x40 fill and far below text.
-  ok = data.bytesize > 1500
-  File.delete(png) rescue nil
-  ok
+# The scheme the binding asks Qt for, in a child with COSMOS_QT_COLOR_SCHEME
+# set to +setting+ (nil: unset). Offscreen the platform ignores the request
+# and the palette is light either way, so rendering a label -- what this
+# section did before -- passed whether or not the binding asked for light.
+def color_scheme_requested(setting)
+  lib = File.expand_path('../../../../lib', __dir__)
+  code = "require 'Qt'; app = Qt::Application.new([]); p Qt.__color_scheme"
+  IO.popen({ 'COSMOS_QT_COLOR_SCHEME' => setting }, [RbConfig.ruby, '-I', lib, '-e', code, err: File::NULL], &:read).strip
+end
+if Qt.__color_scheme.nil?
+  skip_chk('the app asks for the light colour scheme', "Qt #{Qt.qVersion} cannot set one (6.8+)")
+else
+  chk('the app asks for the light colour scheme') do
+    (r = color_scheme_requested(nil)) == '1' || raise("requested #{r}")
+  end
+  chk('COSMOS_QT_COLOR_SCHEME=dark and =system opt out') do
+    (r = [color_scheme_requested('dark'), color_scheme_requested('system')]) == %w[2 0] || raise("requested #{r.inspect}")
+  end
 end
 
 puts "\n15. Widgets fetched back out of Qt came back as bare Qt::Widget"
@@ -632,15 +635,23 @@ puts "    rb_define_singleton_method put the original directly in the singleton"
 puts "    class, where the reopen replaced it. qt_tool.rb:255 stores window"
 puts "    geometry as Variant.new(pos()), which fell through to a String cast.)"
 chk('reopened self.critical can call super (5 args)') do
-  ran = false
-  klass = Class.new(Qt::MessageBox)
-  klass.define_singleton_method(:critical) do |parent, title, text, buttons = Qt::MessageBox::Ok, dflt = Qt::MessageBox::NoButton|
-    ran = true
-    Qt::MessageBox.critical(parent, title, text, buttons, dflt)
+  # As script_module_gui.rb:28 does it: reopen Qt::MessageBox itself (this
+  # check used to reopen a subclass and never called super), then remove the
+  # reopen so later checks reach the binding directly.
+  $critical_reopen_ran = false
+  Qt::MessageBox.singleton_class.class_eval do
+    def critical(parent, title, text, buttons = Qt::MessageBox::Ok, dflt = Qt::MessageBox::NoButton)
+      $critical_reopen_ran = true
+      super(parent, title, text, buttons, dflt)
+    end
   end
-  Qt.single_shot(30) { Qt::Application.topLevelWidgets.each { |w| w.close if w.is_a?(Qt::Dialog) } }
-  klass.critical(nil, 'T', 'body')
-  ran
+  begin
+    Qt.single_shot(30) { Qt::Application.topLevelWidgets.each { |w| w.close if w.is_a?(Qt::Dialog) } }
+    Qt::MessageBox.critical(nil, 'T', 'body')
+    $critical_reopen_ran || raise('the reopen did not run')
+  ensure
+    Qt::MessageBox.singleton_class.send(:remove_method, :critical)
+  end
 end
 chk('MessageBox statics accept the 5-arg COSMOS form') do
   Qt.single_shot(30) { Qt::Application.topLevelWidgets.each { |w| w.close if w.is_a?(Qt::Dialog) } }
