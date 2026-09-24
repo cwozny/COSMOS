@@ -28,7 +28,7 @@ class QAbstractItemModel;
 #include <QStyledItemDelegate>
 
 #ifndef Q_MOC_RUN
-#  include <ruby.h>
+#  include "ruby_compat.h"
 #else
    typedef unsigned long VALUE;
 #endif

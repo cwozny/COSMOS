@@ -62,8 +62,13 @@ app.exec_for(10_000)
 churning = false
 worker.join(5)
 
-ok = errors.empty? && plot.paints > 50
-puts "  paintEvent dispatched (#{plot.paints} repaints)#{' ' * [1, 12 - plot.paints.to_s.length].max}#{plot.paints > 50 ? 'ok' : 'FAIL'}"
+# Only shows that painting went through the contended path. Each repaint waits
+# for the GVL twice (the timer's block, then paintEvent) while the worker holds
+# it, so the count depends on the machine: GitHub's runners manage about 50 in
+# 10 s and a recent laptop about 70. Requiring more than 50 failed on 49.
+enough = plot.paints > 10
+ok = errors.empty? && enough
+puts "  paintEvent dispatched (#{plot.paints} repaints)#{' ' * [1, 12 - plot.paints.to_s.length].max}#{enough ? 'ok' : 'FAIL'}"
 puts "  no errors                                      #{errors.empty? ? 'ok' : 'FAIL'}"
 errors.each { |e| puts "    #{e}" }
 puts ok ? 'PAINT GVL OK' : 'PAINT GVL FAILED'
