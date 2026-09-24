@@ -55,6 +55,16 @@ at_exit do
     $cleanups.each(&:call)
     STDOUT.flush
     exit!(1)
+  elsif $!.is_a?(SystemExit) && !$!.success?
+    # The suite itself ends with exit!, which skips this. A tool that exits
+    # does not: ExceptionDialog exits after an "Error During Startup", and
+    # the suite used to end with no word of why. The dialogs say.
+    STDOUT.puts "EXIT #{$!.status} (in #{$current_check.inspect})"
+    ($!.backtrace || []).first(12).each { |line| STDOUT.puts "  #{line}" }
+    Array($message_boxes).zip(Array($message_texts)).each { |title, text| STDOUT.puts "  dialog #{title.inspect}: #{text.to_s[0, 500]}" }
+    $cleanups.each(&:call)
+    STDOUT.flush
+    exit!($!.status)
   end
 end
 
