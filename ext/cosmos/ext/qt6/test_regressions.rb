@@ -1217,8 +1217,9 @@ puts "    in 11 files, e.g. cmd_params.rb:194, script_runner.rb:889 -- and"
 puts "    resolved to the private Kernel#exec: NoMethodError, no menu)"
 chk('Qt::Menu#exec is a public method') { Qt::Menu.public_method_defined?(:exec) }
 chk('and it is the binding, not Kernel#exec') { Qt::Menu.instance_method(:exec).owner != Kernel }
-# The modal path is test_cosmos_tools.rb section 12: modal loops return at
-# once in this file after section 8.
+# The modal path, through the menus COSMOS opens, is test_cosmos_tools.rb
+# section 12. (All of section 12 and this section fail with Menu#exec
+# unbound; two of those checks were written after the fix.)
 
 puts "\n42. GC on a non-GUI thread deleted Ruby-owned QObjects there"
 puts "   (qtwrap_free deleted an owned widget on whichever Ruby thread ran the"
