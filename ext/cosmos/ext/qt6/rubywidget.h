@@ -5,6 +5,7 @@
 #include <QModelIndex>
 #include <functional>
 #include <cstring>
+#include <atomic>
 // The RubyForward template dereferences these, so full definitions are needed
 // in the header rather than the forward declarations Qt would otherwise give.
 #include <QKeyEvent>
@@ -42,16 +43,37 @@ void ruby_with_gvl(const std::function<void()> &fn);
 // (25 event handlers do), and without something for super to reach that is a
 // NoMethodError. Calling it runs Qt's default; it self-clears so a handler
 // cannot invoke the base twice.
-void ruby_call_base_event();
+QEvent *ruby_call_base_event();
 
 // RAII: installs the base-class thunk for the duration of one dispatch, so a
 // Ruby override's `super` can run Qt's default. Restores the previous thunk,
 // so nested dispatch is safe.
 struct BaseEventScopeT {
   std::function<void()> saved;
-  explicit BaseEventScopeT(std::function<void()> f);
+  QEvent *saved_event;
+  // e: the real event the base runs on, reported back to super (see
+  // ruby_call_base_event).
+  BaseEventScopeT(std::function<void()> f, QEvent *e);
   ~BaseEventScopeT();
 };
+
+// Which of an object's forwarded virtuals Ruby overrides, cached so that an
+// event with no override runs Qt's default without the GVL. Every event used
+// to take it -- each paint, resize and show of every Ruby-created Qt::Label,
+// since the binding's own pass-through (qt_base_event, there so `super`
+// works) made every widget look overridden -- and with a busy Ruby thread
+// each acquisition waits out that thread's time slice. lib/Qt.rb invalidates
+// every cache when an override can have appeared or gone (a method defined or
+// removed on a Qt class or object; a module included, prepended or extended
+// into one), and the next event recomputes under the GVL.
+struct RubyOverrides {
+  std::atomic<unsigned long> epoch{0};   // 0: not computed yet
+  std::atomic<unsigned> mask{0};
+};
+// False when obj's Ruby object does not override `method`: the caller runs
+// Qt's default and never takes the GVL. True otherwise, and for a name not
+// tracked here, when ruby_event_dispatch decides as before.
+bool ruby_overrides(const QObject *obj, RubyOverrides &cache, const char *method);
 
 // Invokes a Ruby-side override of a Qt virtual, if the wrapper defines one.
 // Returns true when Ruby handled the event, false to fall through to Qt's
@@ -105,6 +127,10 @@ protected:
   void mouseReleaseEvent(QMouseEvent *e) override;
   void mouseMoveEvent(QMouseEvent *e) override;
   void wheelEvent(QWheelEvent *e) override;
+
+
+private:
+  mutable RubyOverrides m_overrides;
 };
 
 // QStyledItemDelegate forwarding the virtuals COSMOS overrides in
@@ -121,6 +147,10 @@ public:
                     const QModelIndex &idx) const override;
   void paint(QPainter *p, const QStyleOptionViewItem &opt,
              const QModelIndex &idx) const override;
+
+
+private:
+  mutable RubyOverrides m_overrides;
 };
 
 class RubyWidget : public QWidget {
@@ -144,6 +174,10 @@ protected:
   void dragEnterEvent(QDragEnterEvent *e) override;
   void dragMoveEvent(QDragMoveEvent *e) override;
   void dropEvent(QDropEvent *e) override;
+
+
+private:
+  mutable RubyOverrides m_overrides;
 };
 
 // Ruby overrides of Qt virtuals only reach Ruby through a C++ subclass that
@@ -164,18 +198,28 @@ protected:
   void dragEnterEvent(QDragEnterEvent *e) override;
   void dragMoveEvent(QDragMoveEvent *e) override;
   void dropEvent(QDropEvent *e) override;
+
+
+private:
+  mutable RubyOverrides m_overrides;
 };
 
 class RubyDialog : public QDialog {
   Q_OBJECT
 public:
   explicit RubyDialog(QWidget *parent = nullptr) : QDialog(parent) {}
+  // QDialog's close handling and Esc call this virtual; see rubywidget.cpp.
+  void reject() override;
 
 protected:
   void closeEvent(QCloseEvent *e) override;
   void showEvent(QShowEvent *e) override;
   void resizeEvent(QResizeEvent *e) override;
   void keyPressEvent(QKeyEvent *e) override;
+
+
+private:
+  mutable RubyOverrides m_overrides;
 };
 
 // Event forwarding for every other Qt class COSMOS subclasses with an event
@@ -199,6 +243,7 @@ protected:
   // NoMethodError on nil; the raise was swallowed, so a closeEvent override
   // could not cancel a close and 16 COSMOS handlers were silently no-ops.
   bool fwd_ev(const char *method, int kind, QEvent *e) {
+    if (!ruby_overrides(this, m_overrides, method)) return false;
     bool handled = false, accepted = true;
     const int type = e ? (int)e->type() : 0;
     ruby_with_gvl([&] {
@@ -211,7 +256,8 @@ protected:
   }
 
   void paintEvent(QPaintEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::paintEvent(e); });
+    if (!ruby_overrides(this, m_overrides, "paintEvent")) { Base::paintEvent(e); return; }
+    BaseEventScopeT scope([this, e] { Base::paintEvent(e); }, e);
     bool handled = false;
     const QRect r = e->rect();
     const int type = (int)e->type();
@@ -223,34 +269,35 @@ protected:
     if (!handled) Base::paintEvent(e);
   }
   void resizeEvent(QResizeEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::resizeEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::resizeEvent(e); }, e);
     if (!fwd_ev("resizeEvent", RUBY_EV_RESIZE, e)) Base::resizeEvent(e);
   }
   void closeEvent(QCloseEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::closeEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::closeEvent(e); }, e);
     if (!fwd_ev("closeEvent", RUBY_EV_CLOSE, e)) Base::closeEvent(e);
   }
   void showEvent(QShowEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::showEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::showEvent(e); }, e);
     if (!fwd_ev("showEvent", RUBY_EV_SHOW, e)) Base::showEvent(e);
   }
   void leaveEvent(QEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::leaveEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::leaveEvent(e); }, e);
     if (!fwd_ev("leaveEvent", RUBY_EV_LEAVE, e)) Base::leaveEvent(e);
   }
   void focusInEvent(QFocusEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::focusInEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::focusInEvent(e); }, e);
     if (!fwd_ev("focusInEvent", RUBY_EV_FOCUS, e)) Base::focusInEvent(e);
   }
   void focusOutEvent(QFocusEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::focusOutEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::focusOutEvent(e); }, e);
     if (!fwd_ev("focusOutEvent", RUBY_EV_FOCUS, e)) Base::focusOutEvent(e);
   }
   // event.ignore() in a wheelEvent means "let the parent scroll instead"
   // (cmd_tlm_server_gui.rb:90), so a handled event must NOT fall through to
   // the base implementation, which would accept and absorb the wheel.
   void wheelEvent(QWheelEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::wheelEvent(e); });
+    if (!ruby_overrides(this, m_overrides, "wheelEvent")) { Base::wheelEvent(e); return; }
+    BaseEventScopeT scope([this, e] { Base::wheelEvent(e); }, e);
     bool handled = false, accepted = true;
     const int dx = e->angleDelta().x(), dy = e->angleDelta().y();
     const int mods = (int)e->modifiers(), type = (int)e->type();
@@ -263,7 +310,8 @@ protected:
     else         Base::wheelEvent(e);
   }
   void keyPressEvent(QKeyEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::keyPressEvent(e); });
+    if (!ruby_overrides(this, m_overrides, "keyPressEvent")) { Base::keyPressEvent(e); return; }
+    BaseEventScopeT scope([this, e] { Base::keyPressEvent(e); }, e);
     bool handled = false, accepted = true;
     const int key = e->key(), mods = (int)e->modifiers(), type = (int)e->type();
     const QByteArray txt = e->text().toUtf8();
@@ -282,20 +330,21 @@ protected:
   // setAcceptDrops(true) already worked, so these widgets advertised drop
   // support while the Ruby overrides were never reached.
   void dragEnterEvent(QDragEnterEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::dragEnterEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::dragEnterEvent(e); }, e);
     if (!fwd_dnd("dragEnterEvent", RUBY_EV_DRAGENTER, e)) Base::dragEnterEvent(e);
   }
   void dragMoveEvent(QDragMoveEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::dragMoveEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::dragMoveEvent(e); }, e);
     if (!fwd_dnd("dragMoveEvent", RUBY_EV_DRAGMOVE, e)) Base::dragMoveEvent(e);
   }
   void dropEvent(QDropEvent *e) override {
-    BaseEventScopeT scope([this, e] { Base::dropEvent(e); });
+    BaseEventScopeT scope([this, e] { Base::dropEvent(e); }, e);
     if (!fwd_dnd("dropEvent", RUBY_EV_DROP, e)) Base::dropEvent(e);
   }
 
 private:
   bool fwd_dnd(const char *method, int kind, QDropEvent *e) {
+    if (!ruby_overrides(this, m_overrides, method)) return false;
     bool handled = false, accepted = true, proposed = false;
     const QMimeData *md = e->mimeData();
     const int type = (int)e->type();
@@ -312,7 +361,8 @@ private:
   }
 
   void fwd_mouse(const char *method, QMouseEvent *e) {
-    BaseEventScopeT scope([this, method, e] { base_mouse(method, e); });
+    if (!ruby_overrides(this, m_overrides, method)) { base_mouse(method, e); return; }
+    BaseEventScopeT scope([this, method, e] { base_mouse(method, e); }, e);
     bool handled = false, accepted = true;
     const int x = (int)e->position().x(), y = (int)e->position().y();
     const int b = (int)e->button(), bs = (int)e->buttons();
@@ -330,6 +380,8 @@ private:
     else if (!strcmp(method, "mouseMoveEvent"))    Base::mouseMoveEvent(e);
     else                                            Base::mouseReleaseEvent(e);
   }
+
+  mutable RubyOverrides m_overrides;
 };
 
 #endif

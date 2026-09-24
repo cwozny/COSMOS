@@ -7,6 +7,7 @@
 QT6_SUITES = %w[
   test_qt6
   test_regressions
+  test_cosmos_tools
   test_gvl_race
   test_nested_gvl
   test_paint_gvl
@@ -16,6 +17,9 @@ desc 'Run the Qt6 binding test suites (headless)'
 task :qt6_test do
   ext = File.join('ext', 'cosmos', 'ext', 'qt6')
   unless File.exist?(File.join('lib', 'cosmos', 'ext', "qt6.#{RbConfig::CONFIG['DLEXT']}"))
+    # A skip is a pass, which is how the CI qt6 job went green with nothing
+    # built; COSMOS_QT6_REQUIRED (set there) turns it into a failure.
+    abort 'qt6 extension not built (COSMOS_QT6_REQUIRED is set)' if ENV['COSMOS_QT6_REQUIRED']
     puts 'qt6 extension not built - skipping (run rake build first)'
     next
   end

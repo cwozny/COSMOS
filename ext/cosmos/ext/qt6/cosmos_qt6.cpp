@@ -84,6 +84,7 @@
 #include <QTreeView>
 #include <QStyledItemDelegate>
 #include <QTextDocument>
+#include <QTextDocumentFragment>
 #include <QTextCharFormat>
 #include <QTextFormat>
 #include <QTextOption>
@@ -105,6 +106,7 @@
 #include <QMovie>
 #include <QTextBlock>
 #include <QThread>
+#include <QPointer>
 #include <QRadialGradient>
 #include <QOpenGLWidget>
 #include <QAbstractItemModel>
@@ -119,6 +121,12 @@
 
 #include <map>
 #include <mutex>
+#include <unordered_map>
+#include <set>
+#include <string>
+#include <vector>
+#include <atomic>
+#include <cstring>
 
 #include <ruby.h>
 #include <ruby/thread.h>
@@ -133,7 +141,6 @@ static VALUE cDialog, cMainWindow, cAbstractScrollArea, cAbstractItemView;
 static VALUE cAbstractItemModel;   // needed by the model read-back accessors
 static VALUE cLayout, cBoxLayout, cVBoxLayout, cHBoxLayout, cGridLayout, cAction;
 static VALUE cIcon;   // declared early: ctor_action below takes an icon overload
-static VALUE g_procs;   // GC anchor for connected Ruby blocks
 void ruby_invoke_proc_once(VALUE proc);   // runs a one-shot block, then unanchors it
 
 // ---------------------------------------------------------------------------
@@ -160,8 +167,24 @@ struct QtWrap {
 // arriving during a GC sweep can mark the wrapper dangling without touching
 // a Ruby object. qtwrap_free erases the map entry before it xfrees the
 // struct, so a live entry always means a live struct.
-struct ObjRef { VALUE v; QtWrap *w; };
-static std::map<QObject *, ObjRef> g_objmap;   // weak: entries removed on free
+// pinned: a wrapper Ruby made for an object Qt owns (constructed with a
+// parent, or handed over by addWidget/setItemDelegate/...). It is marked from
+// pinned_mark for as long as the QObject lives: a Ruby subclass instance that
+// only Qt holds -- CmdSender's CmdParamTableItemDelegate (cmd_params.rb:244) --
+// otherwise lost its Ruby side at the next GC, and dispatch found no override.
+// on_destroyed erases the entry, which unpins it. Wrappers made for objects
+// found through Qt (findChildren, signal arguments) stay weak.
+struct ObjRef { VALUE v; QtWrap *w; bool pinned = false; };
+static std::map<QObject *, ObjRef> g_objmap;   // weak unless pinned: entries removed on free
+
+// Weak entries outlive the mark phase: a wrapper the GC has condemned stays in
+// g_objmap until lazy sweep runs qtwrap_free. Handing that VALUE back to Ruby
+// (findChild, a signal argument, an event dispatch) left Ruby holding a slot
+// the sweep then freed -- a use-after-free. Exported by libruby, not in its
+// public headers, like ruby_thread_has_gvl_p. Only reads the GC bitmaps: no
+// allocation, no GVL wait, so it is safe under g_objmap_mutex.
+extern "C" int rb_objspace_garbage_object_p(VALUE obj);
+static inline bool wrapper_condemned(VALUE v) { return rb_objspace_garbage_object_p(v) != 0; }
 
 // app.exec() releases the GVL, so Qt's event loop and a Ruby background thread
 // run genuinely in parallel -- one mutating g_objmap from a destroyed() signal,
@@ -173,23 +196,36 @@ static std::map<QObject *, ObjRef> g_objmap;   // weak: entries removed on free
 static std::recursive_mutex g_objmap_mutex;
 typedef std::lock_guard<std::recursive_mutex> ObjMapLock;
 
-// True while we are deleting a QObject from inside Ruby's GC sweep. Deleting a
-// parent cascades into its children, firing destroyed() for each one, and the
-// handler must NOT dereference other Ruby wrappers at that point -- they may
-// already have been swept.
-static thread_local bool g_in_gc_free = false;
 
 static void qtwrap_free(void *p) {
   QtWrap *w = (QtWrap *)p;
-  if (w->ptr) {
-    QObject *o = w->ptr;
-    { ObjMapLock lk(g_objmap_mutex); g_objmap.erase(o); }
+  QObject *o = NULL;
+  bool owned = false;
+  {
+    // Read and clear the struct under the lock on_destroyed writes it under,
+    // and drop only our own entry: a take-over (wrap_obj) or a re-attach can
+    // have put another wrapper's entry under the same object.
+    ObjMapLock lk(g_objmap_mutex);
+    o = w->ptr;
+    owned = w->owned;
     w->ptr = NULL;
-    if (w->owned) {
-      bool prev = g_in_gc_free;
-      g_in_gc_free = true;
-      delete o;            // cascades to children; see on_destroyed()
-      g_in_gc_free = prev;
+    w->owned = false;
+    if (o) {
+      std::map<QObject *, ObjRef>::iterator it = g_objmap.find(o);
+      if (it != g_objmap.end() && it->second.w == w) g_objmap.erase(it);
+    }
+  }
+  if (o) {
+    if (owned) {
+      if (o->thread() == QThread::currentThread()) {
+        delete o;            // cascades to children; see on_destroyed()
+      } else {
+        // Any Ruby thread can run the GC, and deleting a widget off its own
+        // thread is undefined behaviour. Queue the delete to o's thread; the
+        // queued call is dropped if o is destroyed first. No Ruby API here:
+        // this runs inside the sweep.
+        QMetaObject::invokeMethod(o, [o] { delete o; }, Qt::QueuedConnection);
+      }
     }
   }
   xfree(p);
@@ -228,44 +264,20 @@ static QtWrap *get_wrap(VALUE self) {
   return w;
 }
 
-// Qt deleted the object out from under us -> mark the wrapper dangling.
-
-struct DanglingArg { VALUE wrapper; };
-static void *mark_dangling(void *p) {
-  QtWrap *w;
-  TypedData_Get_Struct(((DanglingArg *)p)->wrapper, QtWrap, &qtwrap_type, w);
-  w->ptr = NULL;
-  w->owned = false;
-  return NULL;
-}
-
+// Qt deleted the object out from under us -> mark the wrapper dangling by
+// clearing its QtWrap. The wrapper VALUE is never touched: the map is weak,
+// so it may be garbage that a sweep -- on another Ruby thread, while this
+// one waited for the GVL -- has already freed. Looking it up, releasing the
+// lock and then taking the GVL to mark it was exactly that window, and the
+// type check on the freed slot crashed. The QtWrap needs neither Ruby nor the
+// GVL, and it is safe to write under the lock: qtwrap_free takes the same
+// lock before it frees it.
 static void on_destroyed(QObject *o) {
-  VALUE v;
-  {
   ObjMapLock lk(g_objmap_mutex);
   std::map<QObject *, ObjRef>::iterator it = g_objmap.find(o);
   if (it == g_objmap.end()) return;      // already reaped by qtwrap_free
-  if (g_in_gc_free) {
-    // THIS thread is inside a GC sweep, so the wrapper VALUE may itself have
-    // been swept and must not be touched. The QtWrap behind it is still
-    // allocated, and clearing that needs no Ruby API and no GVL.
-    // Dropping only the map entry (as this used to) left a child wrapper that
-    // Ruby still referenced pointing at freed memory while disposed? answered
-    // false -- so every COSMOS `unless widget.disposed?` guard walked straight
-    // into a use-after-free.
-    if (it->second.w) { it->second.w->ptr = NULL; it->second.w->owned = false; }
-    g_objmap.erase(it);
-    return;
-  }
-  v = it->second.v;
+  if (it->second.w) { it->second.w->ptr = NULL; it->second.w->owned = false; }
   g_objmap.erase(it);
-  }   // lock released before re-entering Ruby (see LOCK ORDER above)
-  // Touching a Ruby object requires the GVL; this can run from Qt's event
-  // loop while the GVL is released, and doing it unguarded corrupts Ruby's
-  // heap (crashes surface later in unrelated Ruby threads).
-  DanglingArg arg;
-  arg.wrapper = v;
-  ruby_run_with_gvl(mark_dangling, &arg);
 }
 
 // Maps a Qt class name to the Ruby class we bound for it, so a QObject found
@@ -290,16 +302,20 @@ static VALUE wrap_obj(VALUE klass, QObject *p, bool owned = true) {
   {
     ObjMapLock lk(g_objmap_mutex);
     std::map<QObject *, ObjRef>::iterator it = g_objmap.find(p);
-    if (it != g_objmap.end()) return it->second.v;   // identity: one wrapper per object
+    // identity: one live wrapper per object
+    if (it != g_objmap.end() && !wrapper_condemned(it->second.v)) return it->second.v;
   }
   QtWrap *w;
+  // Allocating can run lazy sweep steps, which may free a condemned wrapper
+  // of p (and erase its entry) right here, so the map is re-read below.
   VALUE o = TypedData_Make_Struct(klass, QtWrap, &qtwrap_type, w);
   w->ptr = p;
   w->owned = owned;
+  bool hooked = false;
   {
     ObjMapLock lk(g_objmap_mutex);
     std::map<QObject *, ObjRef>::iterator it = g_objmap.find(p);
-    if (it != g_objmap.end()) {
+    if (it != g_objmap.end() && !wrapper_condemned(it->second.v)) {
       // Lost the race. Disarm our loser before dropping it: left armed, its
       // qtwrap_free would erase the WINNER's map entry (so the surviving
       // wrapper could never be marked dangling) and, when owned, delete a
@@ -308,9 +324,25 @@ static VALUE wrap_obj(VALUE klass, QObject *p, bool owned = true) {
       w->owned = false;
       return it->second.v;
     }
+    if (it != g_objmap.end()) {
+      // A condemned wrapper, not yet swept: take its place. Disarmed, its
+      // qtwrap_free neither erases our entry nor deletes p; ownership moves
+      // to the new wrapper. p's destroyed() hookup is still connected.
+      QtWrap *condemned = it->second.w;
+      if (condemned) {
+        w->owned = w->owned || condemned->owned;
+        condemned->ptr = NULL;
+        condemned->owned = false;
+      }
+      hooked = true;
+    }
     g_objmap[p] = ObjRef{o, w};
   }
-  QObject::connect(p, &QObject::destroyed, p, &on_destroyed);
+  // Direct, so the wrapper is marked dangling on whichever thread deletes p.
+  // Auto used p itself as the context: a delete on another thread queued the
+  // call to an object being destroyed, it never ran, and the wrapper kept a
+  // dangling pointer.
+  if (!hooked) QObject::connect(p, &QObject::destroyed, p, &on_destroyed, Qt::DirectConnection);
   return o;
 }
 
@@ -320,8 +352,55 @@ static VALUE qtobj_alloc(VALUE klass);
 // Qt took ownership via reparenting -- Ruby must not delete it any more.
 static void release_ownership(VALUE self) {
   QtWrap *w = get_wrap(self);
-  if (w) w->owned = false;
+  if (!w) return;
+  w->owned = false;
+  ObjMapLock lk(g_objmap_mutex);
+  if (w->ptr) {
+    std::map<QObject *, ObjRef>::iterator it = g_objmap.find(w->ptr);
+    if (it != g_objmap.end() && it->second.w == w) it->second.pinned = true;   // see ObjRef
+  }
 }
+// Marks every pinned wrapper (see ObjRef). The lock is safe to wait for here:
+// no holder waits on the GVL, and GC runs with it.
+static void pinned_mark(void *) {
+  ObjMapLock lk(g_objmap_mutex);
+  for (std::map<QObject *, ObjRef>::iterator it = g_objmap.begin(); it != g_objmap.end(); ++it)
+    if (it->second.pinned) rb_gc_mark(it->second.v);
+}
+static const rb_data_type_t pinned_root_type = {
+  "Qt::PinnedWrappers",
+  { pinned_mark, NULL, NULL, { NULL, NULL } },
+  NULL, NULL, 0
+};
+
+// Blocks held by C++ (see ruby_anchor_proc), with how many holders each has.
+// This was a Ruby array: nothing ever took a connected block out of it, and
+// taking a posted block out was an rb_ary_delete over every block ever
+// connected. Allocated and never freed, because a slot can be deleted during
+// static destruction at exit.
+static std::mutex *g_anchor_mutex = new std::mutex;
+static std::unordered_map<VALUE, long> *g_anchored = new std::unordered_map<VALUE, long>;
+void ruby_anchor_proc(VALUE proc) {
+  std::lock_guard<std::mutex> lk(*g_anchor_mutex);
+  ++(*g_anchored)[proc];
+}
+void ruby_release_proc(VALUE proc) {
+  std::lock_guard<std::mutex> lk(*g_anchor_mutex);
+  std::unordered_map<VALUE, long>::iterator it = g_anchored->find(proc);
+  if (it != g_anchored->end() && --it->second <= 0) g_anchored->erase(it);
+}
+// As in pinned_mark, the lock is safe to wait for: no holder allocates Ruby
+// objects or waits on the GVL.
+static void anchored_mark(void *) {
+  std::lock_guard<std::mutex> lk(*g_anchor_mutex);
+  for (std::unordered_map<VALUE, long>::iterator it = g_anchored->begin(); it != g_anchored->end(); ++it)
+    rb_gc_mark(it->first);
+}
+static const rb_data_type_t anchored_root_type = {
+  "Qt::AnchoredBlocks",
+  { anchored_mark, NULL, NULL, { NULL, NULL } },
+  NULL, NULL, 0
+};
 // COSMOS telemetry is binary (ascii-8bit) and packet items routinely carry
 // embedded NUL bytes. StringValueCStr REJECTS those outright
 // ("string contains null byte"), which crashed PacketViewer on any binary
@@ -350,22 +429,51 @@ static VALUE app_process_events(VALUE self) {
 // Splash.execute initialises CmdTlmServer on a Thread while the splash dialog
 // is modal (lib/cosmos/gui/dialogs/splash.rb:104). Holding the GVL here
 // starves that thread and the app hangs on the splash forever.
-static void *exec_app_thunk(void *) { QApplication::exec(); return NULL; }
-
 static VALUE app_exec(VALUE self) {
-  rb_thread_call_without_gvl(exec_app_thunk, NULL, RUBY_UBF_IO, NULL);
+  ruby_without_gvl([] { QApplication::exec(); });
+  ruby_raise_pending_exit();   // a signal or `exit` inside the loop ended it
   return INT2NUM(0);
 }
 
 // Runs the Qt event loop for `ms` with the GVL RELEASED, so Ruby's other
 // threads keep being scheduled. Any Ruby callback fired from inside the loop
 // re-acquires the GVL first (see RubyCallback::invoke).
-static void *run_exec(void *) { QApplication::exec(); return NULL; }
-
 static VALUE app_exec_for(VALUE self, VALUE ms) {
   QTimer::singleShot(NUM2INT(ms), qApp, &QCoreApplication::quit);
-  rb_thread_call_without_gvl(run_exec, NULL, RUBY_UBF_IO, NULL);
+  ruby_without_gvl([] { QApplication::exec(); });
+  ruby_raise_pending_exit();
   return Qnil;
+}
+
+// Blocks posted before the QApplication exists. qApp is null then, and
+// invokeMethod on a null object queues nothing, so such a block never ran and
+// a blocking execute_in_main_thread waited for it forever -- TlmViewer's
+// screen mode starts redirect_io's thread before it makes its application
+// (tlm_viewer.rb:589-591). qtbindings kept them in RubyThreadFix's queue and
+// ran them once the application's timers started (lib/Qt4.rb, qtruby4.rb:467);
+// here they wait until ctor_application posts them. Every caller is a Ruby
+// method, so the GVL serializes access.
+struct EarlyPost { VALUE proc; int delay; };   // delay < 0: post_to_main_thread
+static std::vector<EarlyPost> g_early_posts;
+static void post_proc(VALUE proc, int delay) {
+  if (!qApp) {
+    g_early_posts.push_back(EarlyPost{proc, delay});
+    return;
+  }
+  if (delay < 0) {
+    QMetaObject::invokeMethod(qApp, [proc]() { ruby_invoke_proc_once(proc); },
+                              Qt::QueuedConnection);
+    return;
+  }
+  // QTimer must be created on the thread that will run it.
+  QMetaObject::invokeMethod(qApp, [proc, delay]() {
+    QTimer::singleShot(delay, qApp, [proc]() { ruby_invoke_proc_once(proc); });
+  }, Qt::QueuedConnection);
+}
+static void post_early_posts() {
+  std::vector<EarlyPost> posts;
+  posts.swap(g_early_posts);
+  for (size_t i = 0; i < posts.size(); i++) post_proc(posts[i].proc, posts[i].delay);
 }
 
 // Fire a Ruby block from the Qt event loop after `ms`.
@@ -373,13 +481,8 @@ static VALUE qt_single_shot(int argc, VALUE *argv, VALUE self) {
   VALUE ms, blk;
   rb_scan_args(argc, argv, "10&", &ms, &blk);
   if (NIL_P(blk)) rb_raise(rb_eArgError, "single_shot requires a block");
-  rb_ary_push(g_procs, blk);
-  VALUE proc = blk;
-  int delay = NUM2INT(ms);
-  // QTimer must be created on the thread that will run it.
-  QMetaObject::invokeMethod(qApp, [proc, delay]() {
-    QTimer::singleShot(delay, qApp, [proc]() { ruby_invoke_proc_once(proc); });
-  }, Qt::QueuedConnection);
+  ruby_anchor_proc(blk);   // released once it has run (one_shot_with_gvl)
+  post_proc(blk, NUM2INT(ms) < 0 ? 0 : NUM2INT(ms));
   return Qtrue;
 }
 
@@ -405,8 +508,8 @@ static void attach(VALUE self, QObject *p, bool owned) {
   QtWrap *w = get_wrap(self);
   w->ptr = p;
   w->owned = owned;
-  { ObjMapLock lk(g_objmap_mutex); g_objmap[p] = ObjRef{self, w}; }
-  QObject::connect(p, &QObject::destroyed, p, &on_destroyed);
+  { ObjMapLock lk(g_objmap_mutex); g_objmap[p] = ObjRef{self, w, !owned}; }   // Qt owns it: pin
+  QObject::connect(p, &QObject::destroyed, p, &on_destroyed, Qt::DirectConnection);   // see wrap_obj
 }
 
 static VALUE qtobj_alloc(VALUE klass) {
@@ -523,10 +626,18 @@ static void apply_color_scheme() {
 static QObject *ctor_application(int, VALUE *) {
   QApplication *app = new QApplication(s_argc, s_argv);
   apply_color_scheme();
+  post_early_posts();   // blocks posted before the application existed
   return app;
 }
 // QActionGroup has no default constructor; it requires a parent QObject*.
-static QObject *ctor_action_group(int, VALUE *) { return new QActionGroup(NULL); }
+// The parent was ignored, so Ruby owned the group and the next GC deleted
+// one only a local held (packet_viewer.rb:169): its actions stopped being
+// mutually exclusive. Parented, Qt owns it and its wrapper is pinned.
+static QObject *ctor_action_group(int argc, VALUE *argv) {
+  QObject *parent = (argc > 0 && !NIL_P(argv[0])) ? get_obj(argv[0]) : NULL;
+  if (parent) g_ctor_took_parent = true;
+  return new QActionGroup(parent);
+}
 
 // COSMOS builds one directly: Qt::BoxLayout.new(Qt::Horizontal). Qt's
 // orientation enum is not QBoxLayout::Direction, so map it.
@@ -689,19 +800,22 @@ static VALUE layout_add_layout(int argc, VALUE *argv, VALUE self) {
 static VALUE layout_count(VALUE self) {
   return INT2NUM(qcast<QLayout>(self)->count());
 }
+// Defined with the value types below: if v is a Qt::Variant, its QVariant.
+static bool variant_arg(VALUE v, QVariant *out);
 // addItem(text), addItem(text, userData) and addItem(icon, text) are all used.
 static VALUE combo_add_item(int argc, VALUE *argv, VALUE self) {
   VALUE a, b; rb_scan_args(argc, argv, "11", &a, &b);
   QComboBox *c = qcast<QComboBox>(self);
   if (NIL_P(b)) { c->addItem(rb_to_qs(a)); return self; }
   if (RB_TYPE_P(a, T_STRING)) {
-    // The user-data arg may be a Qt::Variant; detect it by duck-typing so this
-    // does not depend on class VALUEs declared later in Init.
+    // A Qt::Variant is stored as itself. Keeping only its toString turned
+    // Replay's Float speeds into Strings and its Variant.new(nil) "Realtime"
+    // into "", which set_playback_delay read as 0.0 -- No Delay
+    // (replay_tab.rb:166-192).
     QVariant data;
-    if (RB_TYPE_P(b, T_FIXNUM))        data = QVariant(NUM2INT(b));
+    if (variant_arg(b, &data))         {}
+    else if (RB_TYPE_P(b, T_FIXNUM))   data = QVariant(NUM2INT(b));
     else if (RB_TYPE_P(b, T_STRING))   data = QVariant(rb_to_qs(b));
-    else if (rb_respond_to(b, rb_intern("toString")))
-      data = QVariant(rb_to_qs(rb_funcall(b, rb_intern("toString"), 0)));
     else                               data = QVariant();
     c->addItem(rb_to_qs(a), data);
   } else {
@@ -759,10 +873,58 @@ template <typename T> static T *get_val(VALUE self) {
 static VALUE cKeySequence, cVariant, cFont, cColor, cSize, cPoint, cSizePolicy;
 static VALUE cMessageBox, cFileDialog;
 
+static bool variant_arg(VALUE v, QVariant *out) {
+  if (!rb_obj_is_kind_of(v, cVariant)) return false;
+  *out = *get_val<QVariant>(v);
+  return true;
+}
+
+// The Details dialog's States box sizes its scroll area by the states
+// layout's minimum height (details_dialog.rb:131-135).
+static VALUE layout_minimum_size(VALUE self) {
+  return wrap_val<QSize>(cSize, qcast<QLayout>(self)->minimumSize());
+}
+
 // ---- Qt::KeySequence (110 uses in COSMOS: Qt::KeySequence.new('Ctrl+Q')) ---
+// Qt::KeySequence::Save and the other QKeySequence::StandardKey constants.
+// As plain Integers they were indistinguishable from key codes, so
+// KeySequence.new(Qt::KeySequence::Save) built the key with code 5:
+// TableManager's New/Open/Save were dead, Save As (63) was the ? key, and
+// ScriptRunner/TestRunner zoom and LimitsMonitor's Delete were dead
+// (table_manager.rb:293-313, script_runner.rb:175/180, test_runner.rb:114/118,
+// limits_monitor.rb:782). They still convert to and compare as their Integer.
+static VALUE cStandardKey = Qnil;
+// An enum value Qt overloads on, typed so the binding can tell it from an
+// Integer of another enum (see keyseq_new, pen_new). It still converts to and
+// compares as its Integer. `prefix` is what inspect shows before the name.
+static VALUE typed_enum_class(VALUE under, const char *name, const char *prefix) {
+  VALUE k = rb_define_class_under(under, name, rb_cObject);
+  std::string body =
+    "def to_i; @value; end\n"
+    "alias_method :to_int, :to_i\n"
+    "def ==(other); other.respond_to?(:to_int) && @value == other.to_int; end\n"
+    "alias_method :eql?, :==\n"
+    "def hash; @value.hash; end\n"
+    "def coerce(other); [other, @value]; end\n"
+    "def inspect; \"" + std::string(prefix) + "#{@name}\"; end\n";
+  rb_funcall(k, rb_intern("class_eval"), 1, rb_str_new_cstr(body.c_str()));
+  return k;
+}
+static VALUE typed_enum(VALUE klass, int value, const char *name) {
+  VALUE o = rb_obj_alloc(klass);
+  rb_ivar_set(o, rb_intern("@value"), INT2NUM(value));
+  rb_ivar_set(o, rb_intern("@name"), rb_str_new2(name));
+  return rb_obj_freeze(o);
+}
+static VALUE standard_key(int value, const char *name) {
+  return typed_enum(cStandardKey, value, name);
+}
 static VALUE keyseq_new(int argc, VALUE *argv, VALUE klass) {
   VALUE v; rb_scan_args(argc, argv, "01", &v);
   if (NIL_P(v)) return wrap_val<QKeySequence>(klass, QKeySequence());
+  if (!NIL_P(cStandardKey) && rb_obj_is_kind_of(v, cStandardKey))
+    return wrap_val<QKeySequence>(klass, QKeySequence(
+        (QKeySequence::StandardKey)NUM2INT(rb_ivar_get(v, rb_intern("@value")))));
   if (RB_TYPE_P(v, T_FIXNUM))
     return wrap_val<QKeySequence>(klass, QKeySequence(NUM2INT(v)));
   return wrap_val<QKeySequence>(klass, QKeySequence(rb_to_qs(v)));
@@ -878,14 +1040,17 @@ static VALUE msgbox_static(int argc, VALUE *argv, VALUE klass) {
   QMessageBox::StandardButtons b = NIL_P(buttons)
       ? QMessageBox::StandardButtons(QMessageBox::Ok)
       : QMessageBox::StandardButtons((int)NUM2INT(buttons));
-  QMessageBox box(ICON, rb_to_qs(title), rb_to_qs(text), b, opt_parent(parent));
-  if (!NIL_P(defaultButton) && RB_TYPE_P(defaultButton, T_FIXNUM)) {
-    int d = NUM2INT(defaultButton);
-    if (d != (int)QMessageBox::NoButton)
-      box.setDefaultButton((QMessageBox::StandardButton)d);
-  }
   int rc = 0;
-  ruby_without_gvl([&] { rc = box.exec(); });
+  {
+    QMessageBox box(ICON, rb_to_qs(title), rb_to_qs(text), b, opt_parent(parent));
+    if (!NIL_P(defaultButton) && RB_TYPE_P(defaultButton, T_FIXNUM)) {
+      int d = NUM2INT(defaultButton);
+      if (d != (int)QMessageBox::NoButton)
+        box.setDefaultButton((QMessageBox::StandardButton)d);
+    }
+    ruby_without_gvl([&] { rc = box.exec(); });
+  }
+  ruby_raise_pending_exit();   // after the parented stack box is destroyed
   return INT2NUM(rc);
 }
 
@@ -893,41 +1058,59 @@ static VALUE msgbox_static(int argc, VALUE *argv, VALUE klass) {
 static VALUE filedlg_open(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, caption, dir, filter;
   rb_scan_args(argc, argv, "04", &parent, &caption, &dir, &filter);
-  QWidget *pw = opt_parent(parent);
-  const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
-  QString f;
-  ruby_without_gvl([&] { f = QFileDialog::getOpenFileName(pw, cap, d, fl); });
-  return f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
+  VALUE result;
+  {
+    QWidget *pw = opt_parent(parent);
+    const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
+    QString f;
+    ruby_without_gvl([&] { f = QFileDialog::getOpenFileName(pw, cap, d, fl); });
+    result = f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
+  }
+  ruby_raise_pending_exit();
+  return result;
 }
 static VALUE filedlg_save(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, caption, dir, filter;
   rb_scan_args(argc, argv, "04", &parent, &caption, &dir, &filter);
-  QWidget *pw = opt_parent(parent);
-  const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
-  QString f;
-  ruby_without_gvl([&] { f = QFileDialog::getSaveFileName(pw, cap, d, fl); });
-  return f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
+  VALUE result;
+  {
+    QWidget *pw = opt_parent(parent);
+    const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
+    QString f;
+    ruby_without_gvl([&] { f = QFileDialog::getSaveFileName(pw, cap, d, fl); });
+    result = f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
+  }
+  ruby_raise_pending_exit();
+  return result;
 }
 static VALUE filedlg_open_many(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, caption, dir, filter;
   rb_scan_args(argc, argv, "04", &parent, &caption, &dir, &filter);
-  QWidget *pw = opt_parent(parent);
-  const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
-  QStringList fs;
-  ruby_without_gvl([&] { fs = QFileDialog::getOpenFileNames(pw, cap, d, fl); });
   VALUE ary = rb_ary_new();
-  for (int i = 0; i < fs.size(); i++)
-    rb_ary_push(ary, rb_str_new2(fs.at(i).toUtf8().constData()));
+  {
+    QWidget *pw = opt_parent(parent);
+    const QString cap = rb_to_qs(caption), d = rb_to_qs(dir), fl = rb_to_qs(filter);
+    QStringList fs;
+    ruby_without_gvl([&] { fs = QFileDialog::getOpenFileNames(pw, cap, d, fl); });
+    for (int i = 0; i < fs.size(); i++)
+      rb_ary_push(ary, rb_str_new2(fs.at(i).toUtf8().constData()));
+  }
+  ruby_raise_pending_exit();
   return ary;
 }
 static VALUE filedlg_dir(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, caption, dir;
   rb_scan_args(argc, argv, "03", &parent, &caption, &dir);
-  QWidget *pw = opt_parent(parent);
-  const QString cap = rb_to_qs(caption), d = rb_to_qs(dir);
-  QString f;
-  ruby_without_gvl([&] { f = QFileDialog::getExistingDirectory(pw, cap, d); });
-  return f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
+  VALUE result;
+  {
+    QWidget *pw = opt_parent(parent);
+    const QString cap = rb_to_qs(caption), d = rb_to_qs(dir);
+    QString f;
+    ruby_without_gvl([&] { f = QFileDialog::getExistingDirectory(pw, cap, d); });
+    result = f.isEmpty() ? Qnil : rb_str_new2(f.toUtf8().constData());
+  }
+  ruby_raise_pending_exit();
+  return result;
 }
 
 // ---- Qt::CoreApplication ---------------------------------------------------
@@ -996,6 +1179,13 @@ static VALUE tw_item(VALUE self, VALUE r, VALUE c) {
   return wrap_ptr<QTableWidgetItem>(cTableWidgetItem,
     qcast<QTableWidget>(self)->item(NUM2INT(r), NUM2INT(c)));
 }
+// The context menus (cmd_params.rb:163, packet_viewer.rb:564,
+// table_manager.rb:1070) pass customContextMenuRequested's point, which a
+// scroll area reports in viewport coordinates -- what itemAt expects.
+static VALUE tw_item_at(VALUE self, VALUE pt) {
+  return wrap_ptr<QTableWidgetItem>(cTableWidgetItem,
+    qcast<QTableWidget>(self)->itemAt(*get_val<QPoint>(pt)));
+}
 static VALUE tw_set_hheader(VALUE self, VALUE c, VALUE item) {
   qcast<QTableWidget>(self)
     ->setHorizontalHeaderItem(NUM2INT(c), get_ptr<QTableWidgetItem>(item));
@@ -1057,8 +1247,15 @@ static VALUE tr_top_count(VALUE self) {
 }
 
 // ---- list ------------------------------------------------------------------
+// Both overloads: a String, or a Qt::ListWidgetItem (qt.rb:677
+// ColorListWidget#addItemColor, limits_monitor.rb:780). The list owns an
+// added item, which item wrappers never free.
 static VALUE lw_add_item(VALUE self, VALUE t) {
-  qcast<QListWidget>(self)->addItem(rb_to_qs(t)); return self;
+  if (rb_obj_is_kind_of(t, cListWidgetItem))
+    qcast<QListWidget>(self)->addItem(get_ptr<QListWidgetItem>(t));
+  else
+    qcast<QListWidget>(self)->addItem(rb_to_qs(t));
+  return self;
 }
 static VALUE lw_item_text(VALUE self, VALUE i) {
   QListWidgetItem *it = qcast<QListWidget>(self)->item(NUM2INT(i));
@@ -1093,8 +1290,20 @@ static VALUE scroll_set_widget(VALUE self, VALUE w) {
 // Casting a QLayout to QWidget* yields NULL, and Qt then adds an EMPTY field
 // -- no error, the four buttons inside it are simply orphaned and never
 // appear. Found by diffing against the Qt4 reference: 10 buttons there, 6 here.
-static VALUE form_add_row(VALUE self, VALUE label, VALUE field) {
+static VALUE form_add_row(int argc, VALUE *argv, VALUE self) {
+  VALUE label, field; rb_scan_args(argc, argv, "11", &label, &field);
   QFormLayout *f = qcast<QFormLayout>(self);
+  // One argument: a widget or layout spanning both columns. The Details
+  // dialog adds its States and Limits boxes that way (details_dialog.rb:78/87),
+  // so Details raised for every item with states or limits.
+  if (argc == 1) {
+    QObject *o = get_obj(label);
+    if (QWidget *w = qobject_cast<QWidget *>(o))      f->addRow(w);
+    else if (QLayout *l = qobject_cast<QLayout *>(o)) f->addRow(l);
+    else rb_raise(rb_eArgError, "addRow expects a widget or a layout");
+    release_ownership(label);
+    return self;
+  }
   // addRow also takes a WIDGET as the label, not just a string
   // (find_replace_dialog.rb:111 passes a Qt::Label).
   if (!RB_TYPE_P(label, T_STRING)) {
@@ -1136,6 +1345,25 @@ static VALUE menu_add_separator(VALUE self) {
   if (QMenu *m = qobject_cast<QMenu *>(o))            m->addSeparator();
   else if (QToolBar *t = qobject_cast<QToolBar *>(o)) t->addSeparator();
   return self;
+}
+// menu.exec(global_point) opens every COSMOS context menu (14 sites in 11
+// files, e.g. cmd_params.rb:194, script_runner.rb:889). Unbound, it resolved
+// to the private Kernel#exec and raised, so no context menu opened. Runs the
+// popup's modal loop without the GVL, like Dialog#exec; returns the triggered
+// action, or nil when the menu is dismissed.
+static VALUE menu_exec(int argc, VALUE *argv, VALUE self) {
+  VALUE pt, at; rb_scan_args(argc, argv, "02", &pt, &at);
+  QMenu *m = qcast<QMenu>(self);
+  QAction *chosen = nullptr;
+  if (NIL_P(pt)) {
+    ruby_without_gvl([&] { chosen = m->exec(); });
+  } else {
+    const QPoint p = *get_val<QPoint>(pt);
+    QAction *first = NIL_P(at) ? nullptr : qobject_cast<QAction *>(get_obj(at));
+    ruby_without_gvl([&] { chosen = m->exec(p, first); });
+  }
+  ruby_raise_pending_exit();
+  return chosen ? wrap_obj(best_ruby_class(chosen, cAction), chosen, false) : Qnil;
 }
 static VALUE menubar_add_menu(VALUE self, VALUE title) {
   QMenu *m = qcast<QMenuBar>(self)->addMenu(rb_to_qs(title));
@@ -1193,11 +1421,14 @@ static const char *COMPAT_RUBY =
   "  # Only ever used in `x.is_a? Qt::Enum` tests. Our enums are plain\n"
   "  # Integers, so the test correctly returns false.\n"
   "  class Enum; end\n"
-  "  # Stand-in for a C++ bool& out-parameter.\n"
+  "  # Stand-in for a C++ bool& out-parameter. nil? is qtbindings' own\n"
+  "  # (qtruby4.rb:404-406): true unless the value is set and true, which\n"
+  "  # is how COSMOS reads Cancel off InputDialog.getText (script_module_gui\n"
+  "  # .rb:114-116, config_editor.rb:610, overview_tabbed_plots.rb:228).\n"
   "  class Boolean\n"
   "    attr_accessor :value\n"
   "    def initialize(v = false); @value = v; end\n"
-  "    def nil?; @value.nil?; end\n"
+  "    def nil?; !@value; end\n"
   "  end\n"
   "  # qtbindings needed a hand-rolled queue because Qt's event loop starved\n"
   "  # Ruby threads. This binding solves that properly (the GVL is released\n"
@@ -1255,6 +1486,10 @@ static VALUE palette_new(int argc, VALUE *argv, VALUE klass) {
   if (NIL_P(c)) return wrap_val<QPalette>(klass, QPalette());
   if (RB_TYPE_P(c, T_FIXNUM))
     return wrap_val<QPalette>(klass, QPalette(QColor((Qt::GlobalColor)NUM2INT(c))));
+  // Copy constructor: script_runner_frame.rb:1194/1198 copy DEFAULT_PALETTE
+  // and RED_PALETTE. Without it the Palette went to get_val<QColor> and raised.
+  if (rb_obj_is_kind_of(c, cPalette))
+    return wrap_val<QPalette>(klass, *get_val<QPalette>(c));
   return wrap_val<QPalette>(klass, QPalette(*get_val<QColor>(c)));
 }
 static VALUE widget_set_palette(VALUE self, VALUE p) {
@@ -1277,6 +1512,21 @@ static VALUE widget_set_cursor(VALUE self, VALUE c) {
   qcast<QWidget>(self)->setCursor(*get_val<QCursor>(c));
   return self;
 }
+// LineGraph's paintEvent reads cursor.pos once the mouse has moved over it
+// (line_graph_drawing.rb:416; also canvas_widget.rb:61-72). Unbound, the
+// raise skipped the painter dispose at line_graph.rb:358-359 and every later
+// paint returned at `return if @painter`. QCursor::pos is static; qtbindings
+// let it be called on an instance too.
+static VALUE widget_cursor(VALUE self) {
+  return wrap_val<QCursor>(cCursor, qcast<QWidget>(self)->cursor());
+}
+static VALUE cursor_pos_instance(VALUE self) {
+  return wrap_val<QPoint>(cPoint, QCursor::pos());
+}
+static VALUE widget_window(VALUE self) {
+  QWidget *top = qcast<QWidget>(self)->window();
+  return top ? wrap_obj(best_ruby_class(top, cWidget), top, false) : Qnil;
+}
 
 // ---- scroll bar policy on scroll areas -------------------------------------
 static VALUE scroll_set_hpolicy(VALUE self, VALUE v) {
@@ -1297,13 +1547,18 @@ static VALUE inputdlg_get_text(int argc, VALUE *argv, VALUE klass) {
   bool ok = false;
   QLineEdit::EchoMode mode = NIL_P(echo)
       ? QLineEdit::Normal : (QLineEdit::EchoMode)NUM2INT(echo);
-  QWidget *pw = opt_parent(parent);
-  const QString ti = rb_to_qs(title), la = rb_to_qs(label), tx = rb_to_qs(text);
-  QString r;
-  ruby_without_gvl([&] { r = QInputDialog::getText(pw, ti, la, mode, tx, &ok); });
+  VALUE result;
+  {
+    QWidget *pw = opt_parent(parent);
+    const QString ti = rb_to_qs(title), la = rb_to_qs(label), tx = rb_to_qs(text);
+    QString r;
+    ruby_without_gvl([&] { r = QInputDialog::getText(pw, ti, la, mode, tx, &ok); });
+    result = ok ? rb_str_new2(r.toUtf8().constData()) : Qnil;
+  }
+  ruby_raise_pending_exit();
   if (!NIL_P(okref) && rb_respond_to(okref, rb_intern("value=")))
     rb_funcall(okref, rb_intern("value="), 1, ok ? Qtrue : Qfalse);
-  return ok ? rb_str_new2(r.toUtf8().constData()) : Qnil;
+  return result;
 }
 
 // ---- line edit echo mode ---------------------------------------------------
@@ -1312,17 +1567,24 @@ static VALUE inputdlg_get_double(int argc, VALUE *argv, VALUE klass) {
   VALUE parent, title, label, value, lo, hi, dec, okref;
   rb_scan_args(argc, argv, "35", &parent, &title, &label, &value, &lo, &hi, &dec, &okref);
   bool ok = false;
-  QWidget *pw = opt_parent(parent);
-  const QString ti = rb_to_qs(title), la = rb_to_qs(label);
   const double v  = NIL_P(value) ? 0.0 : NUM2DBL(value);
   const double lv = NIL_P(lo) ? -2147483647.0 : NUM2DBL(lo);
   const double hv = NIL_P(hi) ?  2147483647.0 : NUM2DBL(hi);
   const int    dv = NIL_P(dec) ? 1 : NUM2INT(dec);
   double r = 0.0;
-  ruby_without_gvl([&] { r = QInputDialog::getDouble(pw, ti, la, v, lv, hv, dv, &ok); });
+  {
+    QWidget *pw = opt_parent(parent);
+    const QString ti = rb_to_qs(title), la = rb_to_qs(label);
+    ruby_without_gvl([&] { r = QInputDialog::getDouble(pw, ti, la, v, lv, hv, dv, &ok); });
+  }
+  ruby_raise_pending_exit();
   if (!NIL_P(okref) && rb_respond_to(okref, rb_intern("value=")))
     rb_funcall(okref, rb_intern("value="), 1, ok ? Qtrue : Qfalse);
-  return ok ? DBL2NUM(r) : Qnil;
+  // Qt returns the value it was given when the user cancels, and qtbindings
+  // passed that through. nil here was stored by PacketViewer's Options >
+  // Polling Rate (packet_viewer.rb:269), and its telemetry thread's
+  // `< @polling_rate` then raised.
+  return DBL2NUM(r);
 }
 static VALUE lineedit_set_echo(VALUE self, VALUE m) {
   qcast<QLineEdit>(self)->setEchoMode((QLineEdit::EchoMode)NUM2INT(m));
@@ -1331,6 +1593,7 @@ static VALUE lineedit_set_echo(VALUE self, VALUE m) {
 
 // ---- painting value types (Pen / Brush / Gradient / FontMetrics) ----------
 static VALUE cPen, cBrush, cLinearGradient, cFontMetrics, cPixmap, cImage, cSettings;
+static VALUE cRadialGradient;
 
 // COSMOS caches colours in Hashes (BRUSHES[color], PENS[color]), so QColor
 // wrappers need value equality and a matching hash, not object identity.
@@ -1349,10 +1612,17 @@ static QColor color_arg(VALUE v) {
   return QColor(rb_to_qs(v));
 }
 
+static VALUE cPenStyle = Qnil;
+static bool is_pen_style(VALUE v) { return !NIL_P(cPenStyle) && rb_obj_is_kind_of(v, cPenStyle); }
+// QPen(Qt::PenStyle) as well as QPen(QColor): Cosmos::DASHLINE_PEN is
+// Qt::Pen.new(Qt::DashLine) (qt.rb:237), LineGraph's grid pen. With DashLine
+// a plain Integer it took the colour path -- 2 is also Qt::black -- and the
+// grid drew solid.
 static VALUE pen_new(int argc, VALUE *argv, VALUE klass) {
   VALUE c; rb_scan_args(argc, argv, "01", &c);
-  return NIL_P(c) ? wrap_val<QPen>(klass, QPen())
-                  : wrap_val<QPen>(klass, QPen(color_arg(c)));
+  if (NIL_P(c)) return wrap_val<QPen>(klass, QPen());
+  if (is_pen_style(c)) return wrap_val<QPen>(klass, QPen((Qt::PenStyle)NUM2INT(c)));
+  return wrap_val<QPen>(klass, QPen(color_arg(c)));
 }
 static VALUE pen_set_color(VALUE self, VALUE c) { get_val<QPen>(self)->setColor(color_arg(c)); return self; }
 static VALUE pen_set_width(VALUE self, VALUE w) { get_val<QPen>(self)->setWidth(NUM2INT(w)); return self; }
@@ -1366,6 +1636,8 @@ static VALUE brush_new(int argc, VALUE *argv, VALUE klass) {
   if (NIL_P(c)) return wrap_val<QBrush>(klass, QBrush());
   if (rb_obj_is_kind_of(c, cLinearGradient))
     return wrap_val<QBrush>(klass, QBrush(*get_val<QLinearGradient>(c)));
+  if (rb_obj_is_kind_of(c, cRadialGradient))
+    return wrap_val<QBrush>(klass, QBrush(*get_val<QRadialGradient>(c)));
   if (NIL_P(style)) return wrap_val<QBrush>(klass, QBrush(color_arg(c)));
   return wrap_val<QBrush>(klass, QBrush(color_arg(c), (Qt::BrushStyle)NUM2INT(style)));
 }
@@ -1389,6 +1661,23 @@ static VALUE lingrad_set_coord_mode(VALUE self, VALUE m) {
 }
 static VALUE lingrad_set_color_at(VALUE self, VALUE pos, VALUE c) {
   get_val<QLinearGradient>(self)->setColorAt(NUM2DBL(pos), color_arg(c));
+  return self;
+}
+// LedWidget#value= builds its brush from RadialGradient.new(5, 5, 50, 5, 5)
+// (led_widget.rb:75). With an empty class a TlmViewer LED's first value
+// raised and ended its screen's update thread.
+static VALUE radgrad_new(int argc, VALUE *argv, VALUE klass) {
+  if (argc == 5)
+    return wrap_val<QRadialGradient>(klass,
+      QRadialGradient(NUM2DBL(argv[0]), NUM2DBL(argv[1]), NUM2DBL(argv[2]),
+                      NUM2DBL(argv[3]), NUM2DBL(argv[4])));
+  if (argc == 3)
+    return wrap_val<QRadialGradient>(klass,
+      QRadialGradient(NUM2DBL(argv[0]), NUM2DBL(argv[1]), NUM2DBL(argv[2])));
+  rb_raise(rb_eArgError, "RadialGradient.new expects (cx, cy, radius[, fx, fy])");
+}
+static VALUE radgrad_set_color_at(VALUE self, VALUE pos, VALUE c) {
+  get_val<QRadialGradient>(self)->setColorAt(NUM2DBL(pos), color_arg(c));
   return self;
 }
 
@@ -1436,6 +1725,14 @@ static VALUE pixmap_new(int argc, VALUE *argv, VALUE klass) {
   return wrap_val<QPixmap>(klass, QPixmap(NUM2INT(a), NUM2INT(b)));
 }
 static VALUE pixmap_width(VALUE self)  { return INT2NUM(get_val<QPixmap>(self)->width()); }
+// Qt::ColorListWidget#addItemColor (qt.rb:671) fills each entry's colour
+// swatch; TlmGrapher's left frame adds one at startup. QPixmap::fill's
+// colour defaults to Qt::white.
+static VALUE pixmap_fill(int argc, VALUE *argv, VALUE self) {
+  VALUE c; rb_scan_args(argc, argv, "01", &c);
+  get_val<QPixmap>(self)->fill(NIL_P(c) ? QColor(Qt::white) : color_arg(c));
+  return self;
+}
 static VALUE pixmap_height(VALUE self) { return INT2NUM(get_val<QPixmap>(self)->height()); }
 static VALUE pixmap_is_null(VALUE self){ return get_val<QPixmap>(self)->isNull() ? Qtrue : Qfalse; }
 
@@ -1480,6 +1777,17 @@ static VALUE cLayoutItem, cStackedLayout;
 static VALUE layout_take_at(VALUE self, VALUE i) {
   QLayoutItem *it = qcast<QLayout>(self)->takeAt(NUM2INT(i));
   return it ? wrap_ptr<QLayoutItem>(cLayoutItem, it) : Qnil;
+}
+// SpacerWidget adds SpacerItem.new(width, height, hpolicy, vpolicy) to its
+// screen's layout (spacer_widget.rb:24-28); with an empty class no SPACER
+// screen opened. Wrapped as the QLayoutItem it is, so Layout#addItem takes
+// it; the layout owns it once added.
+static VALUE spacer_new(int argc, VALUE *argv, VALUE klass) {
+  VALUE w, h, hp, vp; rb_scan_args(argc, argv, "22", &w, &h, &hp, &vp);
+  QLayoutItem *s = new QSpacerItem(NUM2INT(w), NUM2INT(h),
+      NIL_P(hp) ? QSizePolicy::Minimum : (QSizePolicy::Policy)NUM2INT(hp),
+      NIL_P(vp) ? QSizePolicy::Minimum : (QSizePolicy::Policy)NUM2INT(vp));
+  return wrap_ptr<QLayoutItem>(klass, s);
 }
 static VALUE layoutitem_widget(VALUE self) {
   QWidget *w = get_ptr<QLayoutItem>(self)->widget();
@@ -1621,6 +1929,13 @@ static VALUE tcf_set_foreground(VALUE self, VALUE v) {
   get_val<QTextCharFormat>(self)->setForeground(b);
   return self;
 }
+// completion_text_edit.rb:174 -- the current-line highlight ScriptRunner and
+// TestRunner draw before every line. Unbound, every script stopped at line 1.
+static VALUE tcf_set_background(VALUE self, VALUE v) {
+  QBrush b = rb_obj_is_kind_of(v, cBrush) ? *get_val<QBrush>(v) : QBrush(color_arg(v));
+  get_val<QTextCharFormat>(self)->setBackground(b);
+  return self;
+}
 static VALUE tcf_set_font_weight(VALUE self, VALUE w) {
   get_val<QTextCharFormat>(self)->setFontWeight(NUM2INT(w));
   return self;
@@ -1715,14 +2030,49 @@ static VALUE box_insert_widget(int argc, VALUE *argv, VALUE self) {
   release_ownership(w);
   return self;
 }
+// The one-argument form is QLayout::addWidget (next free cell), which
+// Qt::AdaptiveGridLayout#addWidget reaches through super(widget) for every
+// TlmGrapher plot (qt.rb:791/802/805).
 static VALUE grid_add_widget(int argc, VALUE *argv, VALUE self) {
-  VALUE w, row, col, rs, cs; rb_scan_args(argc, argv, "32", &w, &row, &col, &rs, &cs);
+  VALUE w, row, col, rs, cs; rb_scan_args(argc, argv, "14", &w, &row, &col, &rs, &cs);
   QGridLayout *g = qcast<QGridLayout>(self);
   QWidget *widget = qobject_cast<QWidget *>(get_obj(w));
-  if (NIL_P(rs)) g->addWidget(widget, NUM2INT(row), NUM2INT(col));
-  else           g->addWidget(widget, NUM2INT(row), NUM2INT(col),
-                              NUM2INT(rs), NIL_P(cs) ? 1 : NUM2INT(cs));
+  if (NIL_P(row))     g->addWidget(widget);
+  else if (NIL_P(col)) rb_raise(rb_eArgError, "addWidget(widget, row) needs a column");
+  else if (NIL_P(rs)) g->addWidget(widget, NUM2INT(row), NUM2INT(col));
+  else                g->addWidget(widget, NUM2INT(row), NUM2INT(col),
+                                   NUM2INT(rs), NIL_P(cs) ? 1 : NUM2INT(cs));
   release_ownership(w);
+  return self;
+}
+// CmdSender's Send Raw dialog (cmd_sender.rb:341/350) and TlmViewer's
+// MATRIXBYCOLUMNS (matrixbycolumns_widget.rb:32, super(layout, row, column))
+// add layouts to a grid; addLayout was bound on box layouts only.
+static VALUE grid_add_layout(int argc, VALUE *argv, VALUE self) {
+  VALUE l, row, col, rs, cs; rb_scan_args(argc, argv, "32", &l, &row, &col, &rs, &cs);
+  QGridLayout *g = qcast<QGridLayout>(self);
+  QLayout *child = qobject_cast<QLayout *>(get_obj(l));
+  if (!child) rb_raise(rb_eTypeError, "addLayout expects a layout");
+  if (NIL_P(rs)) g->addLayout(child, NUM2INT(row), NUM2INT(col));
+  else           g->addLayout(child, NUM2INT(row), NUM2INT(col),
+                              NUM2INT(rs), NIL_P(cs) ? 1 : NUM2INT(cs));
+  release_ownership(l);
+  return self;
+}
+// Qt::AdaptiveGridLayout re-places items it took out with takeAt when it
+// grows to 2 and 3 columns (qt.rb:790, 797-800): QGridLayout::addItem(item,
+// row, column[, rowSpan, columnSpan]). With only the item it is
+// QLayout::addItem, which every layout implements. The layout owns the item
+// afterwards; item wrappers never free it.
+static VALUE layout_add_item(int argc, VALUE *argv, VALUE self) {
+  VALUE it, row, col, rs, cs; rb_scan_args(argc, argv, "14", &it, &row, &col, &rs, &cs);
+  QLayout *l = qcast<QLayout>(self);
+  QLayoutItem *item = get_ptr<QLayoutItem>(it);
+  if (NIL_P(row)) { l->addItem(item); return self; }
+  QGridLayout *g = qobject_cast<QGridLayout *>(l);
+  if (!g || NIL_P(col)) rb_raise(rb_eArgError, "addItem(item, row, column) needs a Qt::GridLayout");
+  g->addItem(item, NUM2INT(row), NUM2INT(col),
+             NIL_P(rs) ? 1 : NUM2INT(rs), NIL_P(cs) ? 1 : NUM2INT(cs));
   return self;
 }
 static VALUE grid_set_row_stretch(VALUE self, VALUE r, VALUE v) {
@@ -1821,6 +2171,20 @@ static VALUE twitem_data(VALUE self, VALUE role) {
 static VALUE twitem_set_flags(VALUE self, VALUE f) {
   get_ptr<QTableWidgetItem>(self)->setFlags((Qt::ItemFlags)NUM2INT(f)); return self;
 }
+// cmd_params.rb:337 looks up the edited row with item.row. Unbound, CmdSender's
+// itemChanged handler died before writing MANUALLY, and the displayed state
+// was sent instead of the raw value typed for it. Also packet_viewer.rb:566
+// and table_manager.rb:1009-1095.
+static VALUE twitem_row(VALUE self) {
+  return INT2NUM(get_ptr<QTableWidgetItem>(self)->row());
+}
+static VALUE twitem_column(VALUE self) {
+  return INT2NUM(get_ptr<QTableWidgetItem>(self)->column());
+}
+// cmd_params.rb:251 and table_manager.rb:969 test bits with `flags & ...`.
+static VALUE twitem_flags(VALUE self) {
+  return INT2NUM(get_ptr<QTableWidgetItem>(self)->flags().toInt());
+}
 static VALUE twitem_set_check_state(VALUE self, VALUE st) {
   get_ptr<QTableWidgetItem>(self)->setCheckState((Qt::CheckState)NUM2INT(st)); return self;
 }
@@ -1911,18 +2275,18 @@ static QIcon icon_arg(VALUE v) {
   if (rb_obj_is_kind_of(v, cPixmap)) return QIcon(*get_val<QPixmap>(v));
   return QIcon(rb_to_qs(v));
 }
-struct DlgExec { QDialog *dlg; int result; };
-static void *exec_dialog_thunk(void *p) {
-  DlgExec *e = (DlgExec *)p;
-  e->result = e->dlg->exec();
-  return NULL;
+// Not virtual: RubyDialog::reject forwards to Ruby, and a Ruby override's
+// super lands here, so a virtual call would loop.
+static VALUE dialog_reject(VALUE self) {
+  qcast<QDialog>(self)->QDialog::reject();
+  return self;
 }
 static VALUE dialog_exec(VALUE self) {
-  DlgExec e;
-  e.dlg = qcast<QDialog>(self);
-  e.result = 0;
-  rb_thread_call_without_gvl(exec_dialog_thunk, &e, RUBY_UBF_IO, NULL);
-  return INT2NUM(e.result);
+  QDialog *dlg = qcast<QDialog>(self);
+  int result = 0;
+  ruby_without_gvl([&] { result = dlg->exec(); });
+  ruby_raise_pending_exit();
+  return INT2NUM(result);
 }
 // Qt::MessageBox had only static helpers and constants -- no constructor and
 // no instance methods -- so `Qt::MessageBox.new(parent)` raised ArgumentError
@@ -2026,12 +2390,19 @@ static VALUE widget_window_flags(VALUE self) {
 static VALUE tb_previous(VALUE self) {
   return wrap_val<QTextBlock>(cTextBlockKlass, get_val<QTextBlock>(self)->previous());
 }
+// find(text[, QTextDocument::FindFlags]). The flags were dropped, so Find /
+// Replace's direction, Match Case and Whole Words did nothing and Replace All
+// also replaced the matches they exclude (find_replace_dialog.rb:57/76/
+// 214-233); with no argument at all argv[0] was read out of bounds.
 static VALUE edit_find(int argc, VALUE *argv, VALUE self) {
-  QString needle = rb_to_qs(argv[0]);
+  VALUE text, flags; rb_scan_args(argc, argv, "11", &text, &flags);
+  QString needle = rb_to_qs(text);
+  QTextDocument::FindFlags f = NIL_P(flags) ? QTextDocument::FindFlags()
+                                            : QTextDocument::FindFlags(NUM2INT(flags));
   QObject *o = get_obj(self);
   bool found = false;
-  if (QPlainTextEdit *p = qobject_cast<QPlainTextEdit *>(o))      found = p->find(needle);
-  else if (QTextEdit *t = qobject_cast<QTextEdit *>(o))           found = t->find(needle);
+  if (QPlainTextEdit *p = qobject_cast<QPlainTextEdit *>(o))      found = p->find(needle, f);
+  else if (QTextEdit *t = qobject_cast<QTextEdit *>(o))           found = t->find(needle, f);
   else rb_raise(rb_eRuntimeError, "find: unsupported receiver");
   return found ? Qtrue : Qfalse;
 }
@@ -2062,6 +2433,24 @@ static VALUE doc_size(VALUE self) {
 static VALUE tabwidget_tab_bar(VALUE self) {
   QTabBar *b = qcast<QTabWidget>(self)->tabBar();
   return b ? wrap_obj(best_ruby_class(b, cWidget), b, false) : Qnil;
+}
+// ---- Qt::TabBar -------------------------------------------------------------
+// With no Qt::TabBar registered, tabBar came back as a plain Qt::Widget:
+// ScriptRunner's run_callback died on setTabIcon (script_runner.rb:754)
+// before any script could start, and the tab context menus
+// (script_runner.rb:857, config_editor.rb:734, data_viewer.rb:270,
+// overview_tabbed_plots.rb:1234) died on count/tabRect.
+static VALUE tabbar_set_tab_icon(VALUE self, VALUE i, VALUE ic) {
+  qcast<QTabBar>(self)->setTabIcon(NUM2INT(i), icon_arg(ic)); return self;
+}
+static VALUE tabbar_tab_icon(VALUE self, VALUE i) {
+  return wrap_val<QIcon>(cIcon, qcast<QTabBar>(self)->tabIcon(NUM2INT(i)));
+}
+static VALUE tabbar_tab_rect(VALUE self, VALUE i) {
+  return wrap_val<QRect>(cRect, qcast<QTabBar>(self)->tabRect(NUM2INT(i)));
+}
+static VALUE tabbar_is_tab_enabled(VALUE self, VALUE i) {
+  return qcast<QTabBar>(self)->isTabEnabled(NUM2INT(i)) ? Qtrue : Qfalse;
 }
 static VALUE widget_rect(VALUE self) {
   return wrap_val<QRect>(cRect, qcast<QWidget>(self)->rect());
@@ -2308,9 +2697,10 @@ static VALUE tree_resize_col(VALUE self, VALUE c) {
 static VALUE twi_set_expanded(VALUE self, VALUE b) {
   get_ptr<QTreeWidgetItem>(self)->setExpanded(RTEST(b)); return self;
 }
+// A Variant even when the data is not valid, as qtbindings did: Replay reads
+// itemData(i).value, and Realtime's data is Variant.new(nil).
 static VALUE cb_item_data(VALUE self, VALUE i) {
-  QVariant v = qcast<QComboBox>(self)->itemData(NUM2INT(i));
-  return v.isValid() ? wrap_val<QVariant>(cVariant, v) : Qnil;
+  return wrap_val<QVariant>(cVariant, qcast<QComboBox>(self)->itemData(NUM2INT(i)));
 }
 static VALUE cb_set_item_data(VALUE self, VALUE i, VALUE v) {
   qcast<QComboBox>(self)->setItemData(NUM2INT(i), *get_val<QVariant>(v)); return self;
@@ -2363,6 +2753,15 @@ static VALUE icon_add_pixmap(int argc, VALUE *argv, VALUE self) {
 static VALUE toolbar_set_floatable(VALUE self, VALUE b) {
   qcast<QToolBar>(self)->setFloatable(RTEST(b)); return self;
 }
+// classification_banner.rb:53 puts the banner on a toolbar, and every QtTool
+// (qt_tool.rb:67) and TlmViewer screen (screen.rb:266) adds the banner when
+// system.txt has CLASSIFICATION. Unbound, all of them failed to start then.
+// Returns the QWidgetAction the toolbar made for the widget, as qtbindings did.
+static VALUE toolbar_add_widget(VALUE self, VALUE w) {
+  QAction *act = qcast<QToolBar>(self)->addWidget(qobject_cast<QWidget *>(get_obj(w)));
+  release_ownership(w);
+  return wrap_obj(cAction, act, false);
+}
 static VALUE mw_add_toolbar(int argc, VALUE *argv, VALUE self) {
   QMainWindow *m = qcast<QMainWindow>(self);
   // addToolBar(area, bar) or addToolBar(bar)
@@ -2400,8 +2799,15 @@ static VALUE url_to_local_file(VALUE self) {
 // 25 COSMOS event handlers call super; without these it is a NoMethodError
 // ("super: no superclass method `closeEvent'"). Takes any args and ignores
 // them -- the event pointer is captured by the dispatching virtual.
-static VALUE qt_base_event(int, VALUE *, VALUE) {
-  ruby_call_base_event();
+static VALUE qt_base_event(int argc, VALUE *argv, VALUE) {
+  QEvent *e = ruby_call_base_event();
+  // Copy what Qt's default did to the event back into the Ruby snapshot the
+  // override was handed: the dispatcher writes the snapshot's flag onto the
+  // real event afterwards, and the untouched default (accepted) undid Qt's
+  // ignore() -- QDialog::closeEvent ignores the close when reject() declines,
+  // so a refusing Ruby reject still let the dialog close.
+  if (e && argc > 0 && rb_ivar_defined(argv[0], rb_intern("@accepted")))
+    rb_ivar_set(argv[0], rb_intern("@accepted"), e->isAccepted() ? Qtrue : Qfalse);
   return Qnil;
 }
 
@@ -2478,6 +2884,14 @@ static VALUE widget_actions(VALUE self) {
 // binding of its own; return a tiny object exposing toPlainText.
 static VALUE tc_selection_text(VALUE self) {
   return rb_str_new2(get_val<QTextCursor>(self)->selectedText().toUtf8().constData());
+}
+// selectedText separates blocks with U+2029; QTextDocumentFragment's
+// toPlainText gives \n, which is what qtbindings' selection.toPlainText
+// returned. ScriptRunner's Execute Selected Lines runs this text
+// (qt.rb:530 selected_lines); with U+2029 a multi-line selection was one
+// unparseable line. Backs Qt::TextCursor#selection in lib/Qt.rb.
+static VALUE tc_selection_plain_text(VALUE self) {
+  return rb_str_new2(get_val<QTextCursor>(self)->selection().toPlainText().toUtf8().constData());
 }
 static VALUE edit_paste(VALUE self) {
   QObject *o = get_obj(self);
@@ -2632,6 +3046,12 @@ static VALUE style_standard_icon(VALUE self, VALUE sp) {
 static VALUE textedit_set_text_color(VALUE self, VALUE c) {
   qcast<QTextEdit>(self)->setTextColor(color_arg(c)); return self;
 }
+// script vertical_message_box turns the box's buttons vertical
+// (script_module_gui.rb:268).
+static VALUE dbb_set_orientation(VALUE self, VALUE o) {
+  qcast<QDialogButtonBox>(self)->setOrientation((Qt::Orientation)NUM2INT(o));
+  return self;
+}
 static VALUE dbb_add_button(VALUE self, VALUE b) {
   QDialogButtonBox *box = qcast<QDialogButtonBox>(self);
   if (RB_TYPE_P(b, T_FIXNUM))
@@ -2698,8 +3118,10 @@ static VALUE widget_geometry(VALUE self) {
 static VALUE widget_layout(VALUE self) {
   QLayout *l = qcast<QWidget>(self)->layout();
   // wrap_obj consults the identity map, so a layout created from Ruby comes
-  // back as the original Ruby object with its original class.
-  return l ? wrap_obj(cLayout, l, false) : Qnil;
+  // back as the original Ruby object with its original class. One Qt built
+  // (a QMessageBox's QGridLayout, which script combo_box adds to at
+  // script_module_gui.rb:202) needs its real class, not plain Qt::Layout.
+  return l ? wrap_obj(best_ruby_class(l, cLayout), l, false) : Qnil;
 }
 static VALUE widget_parent_widget(VALUE self) {
   QWidget *p2 = qcast<QWidget>(self)->parentWidget();
@@ -2782,14 +3204,28 @@ static VALUE widget_move(int argc, VALUE *argv, VALUE self) {
 // COSMOS reopens Qt::Painter (lib/cosmos/gui/qt.rb:707) and calls super from
 // its own setPen/setBrush, so these must be real Ruby methods on the class.
 // ---------------------------------------------------------------------------
-struct PainterWrap { QPainter *p; bool owned; };
+// device: the widget painted on, when it is one. A Ruby exception mid-
+// paintEvent leaves the painter active (ruby_editor.rb's line-number painter
+// did, until drawText's 6-argument form was bound), and the widget can then be
+// destroyed first -- ScriptRunner's paused-script dialog is disposed after
+// use. Ending or deleting the painter touches the freed widget, which crashed
+// in painter_free at the next GC. With the widget gone the painter is
+// unusable: leak it, and have every call raise instead.
+struct PainterWrap { QPainter *p; bool owned; QPointer<QObject> *device; };
 
-static void painter_free(void *v) {
-  PainterWrap *w = (PainterWrap *)v;
-  if (w->p && w->owned) {          // borrowed painters (delegate paint) are Qt's
+static bool painter_device_gone(PainterWrap *w) { return w->device && w->device->isNull(); }
+static void painter_release(PainterWrap *w) {
+  if (w->p && w->owned && !painter_device_gone(w)) {   // borrowed ones are Qt's
     if (w->p->isActive()) w->p->end();
     delete w->p;
   }
+  w->p = NULL;
+  delete w->device;
+  w->device = NULL;
+}
+static void painter_free(void *v) {
+  PainterWrap *w = (PainterWrap *)v;
+  painter_release(w);
   xfree(w);
 }
 static size_t painter_size(const void *) { return sizeof(PainterWrap); }
@@ -2807,7 +3243,14 @@ static PainterWrap *painter_wrap(VALUE self) {
 static QPainter *painter_of(VALUE self) {
   PainterWrap *w = painter_wrap(self);
   if (!w->p) rb_raise(rb_eRuntimeError, "Qt::Painter is not initialized");
+  if (painter_device_gone(w)) rb_raise(rb_eRuntimeError, "Qt::Painter: its paint device has been destroyed");
   return w->p;
+}
+static void painter_track_device(PainterWrap *w, VALUE dev) {
+  delete w->device;
+  w->device = NULL;
+  if (!NIL_P(dev) && !rb_obj_is_kind_of(dev, cPixmap) && !rb_obj_is_kind_of(dev, cImage))
+    if (QWidget *widget = qobject_cast<QWidget *>(get_obj(dev))) w->device = new QPointer<QObject>(widget);
 }
 static VALUE painter_alloc(VALUE klass) {
   PainterWrap *w;
@@ -2830,10 +3273,13 @@ static VALUE painter_initialize(int argc, VALUE *argv, VALUE self) {
   VALUE dev; rb_scan_args(argc, argv, "01", &dev);
   w->p = NIL_P(dev) ? new QPainter() : new QPainter(paint_device(dev));
   w->owned = true;
+  painter_track_device(w, dev);
   return self;
 }
 static VALUE painter_begin(VALUE self, VALUE dev) {
-  return painter_of(self)->begin(paint_device(dev)) ? Qtrue : Qfalse;
+  QPainter *p2 = painter_of(self);
+  painter_track_device(painter_wrap(self), dev);
+  return p2->begin(paint_device(dev)) ? Qtrue : Qfalse;
 }
 static VALUE painter_end(VALUE self) {
   QPainter *p2 = painter_of(self);
@@ -2841,9 +3287,7 @@ static VALUE painter_end(VALUE self) {
 }
 static VALUE painter_is_active(VALUE self) { return painter_of(self)->isActive() ? Qtrue : Qfalse; }
 static VALUE painter_dispose(VALUE self) {
-  PainterWrap *w = painter_wrap(self);
-  if (w->p && w->owned) { if (w->p->isActive()) w->p->end(); delete w->p; }
-  w->p = NULL;
+  painter_release(painter_wrap(self));
   return Qnil;
 }
 static VALUE painter_save(VALUE self)    { painter_of(self)->save();    return self; }
@@ -2852,6 +3296,7 @@ static VALUE painter_restore(VALUE self) { painter_of(self)->restore(); return s
 // COSMOS passes a Qt::Color (from Cosmos.getColor) or a Qt::Pen.
 static VALUE painter_set_pen(VALUE self, VALUE v) {
   if (rb_obj_is_kind_of(v, cPen)) painter_of(self)->setPen(*get_val<QPen>(v));
+  else if (is_pen_style(v))       painter_of(self)->setPen((Qt::PenStyle)NUM2INT(v));
   else                            painter_of(self)->setPen(color_arg(v));
   return self;
 }
@@ -2896,12 +3341,23 @@ static VALUE painter_draw_ellipse(VALUE self, VALUE x, VALUE y, VALUE w, VALUE h
   painter_of(self)->drawEllipse(NUM2INT(x), NUM2INT(y), NUM2INT(w), NUM2INT(h));
   return self;
 }
+// Also drawText(rect, flags, text) and drawText(x, y, w, h, flags, text):
+// the Ruby editors number their lines with the 6-argument form
+// (ruby_editor.rb:357), so every line-number paint raised.
 static VALUE painter_draw_text(int argc, VALUE *argv, VALUE self) {
-  VALUE a, b, c; rb_scan_args(argc, argv, "21", &a, &b, &c);
-  if (NIL_P(c)) {   // drawText(rect, text)
-    painter_of(self)->drawText(*get_val<QRect>(a), rb_to_qs(b));
-  } else {          // drawText(x, y, text)
-    painter_of(self)->drawText(NUM2INT(a), NUM2INT(b), rb_to_qs(c));
+  QPainter *p2 = painter_of(self);
+  if (argc == 2) {                                     // (rect, text)
+    p2->drawText(*get_val<QRect>(argv[0]), rb_to_qs(argv[1]));
+  } else if (argc == 3 && rb_obj_is_kind_of(argv[0], cRect)) {   // (rect, flags, text)
+    p2->drawText(*get_val<QRect>(argv[0]), NUM2INT(argv[1]), rb_to_qs(argv[2]));
+  } else if (argc == 3) {                              // (x, y, text)
+    p2->drawText(NUM2INT(argv[0]), NUM2INT(argv[1]), rb_to_qs(argv[2]));
+  } else if (argc == 6) {                              // (x, y, w, h, flags, text)
+    p2->drawText(NUM2INT(argv[0]), NUM2INT(argv[1]), NUM2INT(argv[2]), NUM2INT(argv[3]),
+                 NUM2INT(argv[4]), rb_to_qs(argv[5]));
+  } else {
+    rb_raise(rb_eArgError, "drawText takes (rect, text), (x, y, text), (rect, flags, text) "
+                           "or (x, y, w, h, flags, text)");
   }
   return self;
 }
@@ -2957,6 +3413,9 @@ bool ruby_event_dispatch_n(QObject *obj, const char *method, int argc, VALUE *ar
     if (it == g_objmap.end()) return false;
     self = it->second.v;
   }
+  // A condemned wrapper must not be handed to Ruby (see wrapper_condemned);
+  // the C++ base implementation runs instead.
+  if (wrapper_condemned(self)) return false;
   ID mid = rb_intern(method);
   if (!rb_respond_to(self, mid)) return false;   // no Ruby override
   EvCall c;
@@ -3027,6 +3486,23 @@ VALUE ruby_make_key_event(int key, const char *text, int mods, int type) {
   rb_ivar_set(ev, rb_intern("@text"),      rb_str_new2(text ? text : ""));
   rb_ivar_set(ev, rb_intern("@modifiers"), INT2NUM(mods));
   return ev;
+}
+
+// Qt::KeyEvent.new(type, key, modifiers[, text, autorep, count]):
+// completion.rb:52 makes an Enter key event to feed handle_keypress after
+// inserting a pick, and raised ArgumentError here. Fills in the same snapshot
+// a forwarded key event gets (ruby_make_key_event); autorep and count are
+// accepted as Qt's constructor takes them, and not kept.
+static VALUE keyevent_init(int argc, VALUE *argv, VALUE self) {
+  VALUE type, key, mods, text, autorep, count;
+  rb_scan_args(argc, argv, "33", &type, &key, &mods, &text, &autorep, &count);
+  VALUE t = NIL_P(text) ? rb_str_new2("") : rb_str_dup(StringValue(text));
+  rb_ivar_set(self, rb_intern("@accepted"),  Qtrue);
+  rb_ivar_set(self, rb_intern("@type"),      INT2NUM(NUM2INT(type)));
+  rb_ivar_set(self, rb_intern("@key"),       INT2NUM(NUM2INT(key)));
+  rb_ivar_set(self, rb_intern("@text"),      t);
+  rb_ivar_set(self, rb_intern("@modifiers"), INT2NUM(NUM2INT(mods)));
+  return self;
 }
 
 VALUE ruby_make_mouse_event(int x, int y, int button, int buttons, int mods, int type) {
@@ -3216,8 +3692,9 @@ VALUE ruby_wrap_qobject(QObject *o) {
   {
     ObjMapLock lk(g_objmap_mutex);
     std::map<QObject *, ObjRef>::iterator it = g_objmap.find(o);
-    if (it != g_objmap.end()) return it->second.v;
+    if (it != g_objmap.end() && !wrapper_condemned(it->second.v)) return it->second.v;
   }
+  // No wrapper, or only a condemned one, which wrap_obj replaces.
   VALUE fallback = qobject_cast<QWidget *>(o) ? cWidget : cQtObject;
   return wrap_obj(best_ruby_class(o, fallback), o, false);
 }
@@ -3248,6 +3725,7 @@ VALUE ruby_event_call(QObject *obj, const char *method, int argc, VALUE *argv, b
     if (it == g_objmap.end()) return Qnil;
     self = it->second.v;
   }
+  if (wrapper_condemned(self)) return Qnil;   // see ruby_event_dispatch_n
   ID mid = rb_intern(method);
   if (!rb_respond_to(self, mid)) return Qnil;
   RetCall r;
@@ -3311,6 +3789,15 @@ static VALUE view_column_at(VALUE self, VALUE x) {
 static VALUE view_current_index(VALUE self) {
   return ruby_wrap_model_index(
     qcast<QAbstractItemView>(self)->currentIndex());
+}
+// completion.rb:399 highlights the popup's first row with model.index(0, 0),
+// one line before its setCurrentRow; the model is the popup's
+// QStringListModel, and QAbstractItemModel had no index at all.
+static VALUE model_index(int argc, VALUE *argv, VALUE self) {
+  VALUE r, c, parent; rb_scan_args(argc, argv, "21", &r, &c, &parent);
+  QModelIndex p = NIL_P(parent) ? QModelIndex() : *get_val<QModelIndex>(parent);
+  return ruby_wrap_model_index(
+    qcast<QAbstractItemModel>(self)->index(NUM2INT(r), NUM2INT(c), p));
 }
 static VALUE view_scroll_to(VALUE self, VALUE idx) {
   qcast<QAbstractItemView>(self)->scrollTo(*get_val<QModelIndex>(idx));
@@ -3613,6 +4100,12 @@ static VALUE table_resize_rows(VALUE self) {
 static VALUE completer_set_prefix(VALUE self, VALUE t) {
   qcast<QCompleter>(self)->setCompletionPrefix(rb_to_qs(t)); return self;
 }
+// completion.rb:400 selects the first completion after each keystroke that
+// leaves the popup up. Unbound, handle_keypress raised there. Returns Qt's
+// result: false when the row is out of range.
+static VALUE completer_set_current_row(VALUE self, VALUE r) {
+  return qcast<QCompleter>(self)->setCurrentRow(NUM2INT(r)) ? Qtrue : Qfalse;
+}
 
 // ---- cross-thread GUI marshalling ------------------------------------------
 // Qt widgets may only be touched from the GUI thread. COSMOS calls
@@ -3627,8 +4120,11 @@ static VALUE do_one_shot(VALUE p) {
 static void *one_shot_with_gvl(void *p) {
   int state = 0;
   rb_protect(do_one_shot, (VALUE)p, &state);
-  if (state) { rb_set_errinfo(Qnil); }   // never longjmp through Qt's frames
-  rb_ary_delete(g_procs, ((OneShot *)p)->proc);
+  // Never longjmp through Qt's frames. An exit-class exception ends the app;
+  // anything else is reported like a slot error -- it used to be cleared with
+  // no word at all.
+  ruby_contain_error(state, "single_shot/post_to_main_thread block");
+  ruby_release_proc(((OneShot *)p)->proc);
   return NULL;
 }
 void ruby_invoke_proc_once(VALUE proc) {
@@ -3641,18 +4137,21 @@ static VALUE qt_post_to_main(int argc, VALUE *argv, VALUE self) {
   VALUE blk;
   rb_scan_args(argc, argv, "00&", &blk);
   if (NIL_P(blk)) rb_raise(rb_eArgError, "post_to_main_thread requires a block");
-  rb_ary_push(g_procs, blk);
+  ruby_anchor_proc(blk);   // released once it has run (one_shot_with_gvl)
   // Do NOT construct a QObject here: this runs on a background Ruby thread and
   // "Cannot create children for a parent that is in a different thread" is a
   // crash, not a warning. Post a plain functor to qApp's thread instead.
-  VALUE proc = blk;
-  QMetaObject::invokeMethod(qApp, [proc]() { ruby_invoke_proc_once(proc); },
-                            Qt::QueuedConnection);
+  post_proc(blk, -1);
   return Qtrue;
 }
 static VALUE qt_on_main_thread_p(VALUE self) {
   QCoreApplication *a = QCoreApplication::instance();
-  return (a && QThread::currentThread() == a->thread()) ? Qtrue : Qfalse;
+  // Before the application exists, Ruby's main thread is the GUI thread to
+  // be, as qtbindings had it (Thread.current == Thread.main). False there made
+  // execute_in_main_thread post from the main thread itself, to a queue
+  // nothing ran, and wait on it forever.
+  if (!a) return rb_thread_current() == rb_thread_main() ? Qtrue : Qfalse;
+  return QThread::currentThread() == a->thread() ? Qtrue : Qfalse;
 }
 
 // addMenu(text), addMenu(submenu) and addMenu(icon, text) are all used.
@@ -3751,6 +4250,25 @@ static VALUE completer_set_widget(VALUE self, VALUE w) {
   qcast<QCompleter>(self)->setWidget(qobject_cast<QWidget *>(get_obj(w)));
   return self;
 }
+// Every keyPressEvent in the Ruby editors and CmdSender's history asks
+// popup.isVisible first (completion_text_edit.rb:92, cmd_sender_text_edit.rb:25);
+// unbound, COSMOS's key handling died on every key -- no Tab indent, no
+// completion, no Enter-to-execute. Completion#create_popup also needs widget
+// and complete(rect), and insertCompletion needs completionPrefix
+// (completion.rb:43-63).
+static VALUE completer_popup(VALUE self) {
+  QAbstractItemView *v = qcast<QCompleter>(self)->popup();
+  return v ? wrap_obj(best_ruby_class(v, cAbstractItemView), v, false) : Qnil;
+}
+static VALUE completer_widget(VALUE self) {
+  QWidget *w = qcast<QCompleter>(self)->widget();
+  return w ? wrap_obj(best_ruby_class(w, cWidget), w, false) : Qnil;
+}
+static VALUE completer_complete(int argc, VALUE *argv, VALUE self) {
+  VALUE r; rb_scan_args(argc, argv, "01", &r);
+  qcast<QCompleter>(self)->complete(NIL_P(r) ? QRect() : *get_val<QRect>(r));
+  return self;
+}
 static VALUE pixmap_from_image(VALUE klass, VALUE img) {
   return wrap_val<QPixmap>(cPixmap, QPixmap::fromImage(*get_val<QImage>(img)));
 }
@@ -3826,8 +4344,6 @@ static VALUE qt_connect(int argc, VALUE *argv, VALUE self) {
   }
   if (sidx < 0) rb_raise(rb_eArgError, "no such signal: %s", StringValueCStr(signal));
 
-  rb_ary_push(g_procs, blk);                       // keep the proc alive
-
   // Forward every parameter, whatever its type. Record the signal's metatype
   // ids now; qt_metacall only gets raw void* and needs them to convert.
   QMetaMethod sm = s->metaObject()->method(sidx);
@@ -3889,6 +4405,82 @@ static std::map<VALUE, VALUE> g_impl_modules;
 // `def self.critical` and calls super. rb_define_singleton_method puts the
 // method directly in the singleton class, where the reopen REPLACES it --
 // so super had nothing to find. Extending from a module fixes that.
+// ---- main-thread guard -----------------------------------------------------
+// qtbindings refused every Qt method, class method and constructor called
+// from a Ruby thread other than the main one (Qt.cpp:837 and 1000,
+// qtruby.cpp:1404), and COSMOS depends on the refusal: a TlmViewer BUTTON runs
+// its code on its own thread, and backgroundbutton_widget.rb:43 turns this
+// error into "wrap calls to the GUI in Qt.execute_in_main_thread". Here the
+// call went through, on a thread Qt does not support for widgets.
+//
+// Every binding function is registered through a trampoline of its arity,
+// which checks the thread and then calls the function the current frame's
+// method id and owner name. Ruby sees the same arity and owner as before.
+struct BoundKey {
+  VALUE owner; ID id;
+  bool operator==(const BoundKey &o) const { return owner == o.owner && id == o.id; }
+};
+struct BoundKeyHash {
+  size_t operator()(const BoundKey &k) const {
+    return std::hash<VALUE>()(k.owner) * 31u ^ std::hash<ID>()(k.id);
+  }
+};
+typedef VALUE (*AnyFn)(ANYARGS);
+static std::unordered_map<BoundKey, AnyFn, BoundKeyHash> g_bound;
+// qtbindings defined these outside its guarded dispatch (qtruby.cpp:2533-2535)
+// and they only read or end the wrapper, so they stay callable anywhere.
+static const char *const kUnguarded[] = { "dispose", "destroy!", "disposed?", "destroyed?", "owned?" };
+
+static void require_main_thread() {
+  if (rb_thread_current() != rb_thread_main())
+    rb_raise(rb_eRuntimeError, "Qt methods cannot be called from outside of the main thread");
+}
+static AnyFn guarded_target() {
+  require_main_thread();
+  ID id; VALUE owner;
+  if (rb_frame_method_id_and_class(&id, &owner)) {
+    std::unordered_map<BoundKey, AnyFn, BoundKeyHash>::const_iterator it = g_bound.find(BoundKey{owner, id});
+    if (it != g_bound.end()) return it->second;
+  }
+  rb_raise(rb_eRuntimeError, "qt6 binding: no function registered for %s", rb_id2name(rb_frame_this_func()));
+  return NULL;
+}
+static VALUE guard_m1(int argc, VALUE *argv, VALUE self) {
+  return ((VALUE (*)(int, VALUE *, VALUE))guarded_target())(argc, argv, self);
+}
+static VALUE guard_0(VALUE self) { return ((VALUE (*)(VALUE))guarded_target())(self); }
+static VALUE guard_1(VALUE self, VALUE a) {
+  return ((VALUE (*)(VALUE, VALUE))guarded_target())(self, a);
+}
+static VALUE guard_2(VALUE self, VALUE a, VALUE b) {
+  return ((VALUE (*)(VALUE, VALUE, VALUE))guarded_target())(self, a, b);
+}
+static VALUE guard_3(VALUE self, VALUE a, VALUE b, VALUE c) {
+  return ((VALUE (*)(VALUE, VALUE, VALUE, VALUE))guarded_target())(self, a, b, c);
+}
+static VALUE guard_4(VALUE self, VALUE a, VALUE b, VALUE c, VALUE d) {
+  return ((VALUE (*)(VALUE, VALUE, VALUE, VALUE, VALUE))guarded_target())(self, a, b, c, d);
+}
+static void define_guarded(VALUE owner, const char *name, AnyFn fn, int arity) {
+  for (const char *u : kUnguarded)
+    if (!strcmp(u, name)) { rb_define_method(owner, name, fn, arity); return; }
+  AnyFn tramp;
+  switch (arity) {
+    case -1: tramp = RUBY_METHOD_FUNC(guard_m1); break;
+    case 0:  tramp = RUBY_METHOD_FUNC(guard_0);  break;
+    case 1:  tramp = RUBY_METHOD_FUNC(guard_1);  break;
+    case 2:  tramp = RUBY_METHOD_FUNC(guard_2);  break;
+    case 3:  tramp = RUBY_METHOD_FUNC(guard_3);  break;
+    case 4:  tramp = RUBY_METHOD_FUNC(guard_4);  break;
+    default: rb_fatal("qt6 binding: no main-thread guard for arity %d (%s)", arity, name);
+  }
+  g_bound[BoundKey{owner, rb_intern(name)}] = fn;
+  rb_define_method(owner, name, tramp, arity);
+}
+// A Qt class's own (singleton) method, e.g. Qt::MessageBox.warning.
+#define QCDEF(klass, name, fn, arity) \
+  define_guarded(rb_singleton_class(klass), name, (AnyFn)(fn), arity)
+
 static std::map<VALUE, VALUE> g_class_impl_modules;
 static VALUE class_impl_module(VALUE klass) {
   std::map<VALUE, VALUE>::iterator it = g_class_impl_modules.find(klass);
@@ -3899,14 +4491,16 @@ static VALUE class_impl_module(VALUE klass) {
   return m;
 }
 #define QSDEF(klass, name, fn, arity) \
-  rb_define_method(class_impl_module(klass), name, fn, arity)
+  define_guarded(class_impl_module(klass), name, (AnyFn)(fn), arity)
 
+static std::set<VALUE> g_impl_module_set;   // the values of g_impl_modules
 static VALUE impl_module(VALUE klass) {
   std::map<VALUE, VALUE>::iterator it = g_impl_modules.find(klass);
   if (it != g_impl_modules.end()) return it->second;
   VALUE m = rb_define_module_under(klass, "Impl");
   rb_include_module(klass, m);
   g_impl_modules[klass] = m;
+  g_impl_module_set.insert(m);
   return m;
 }
 // Guard: using a class VALUE before Init assigns it yields 0 (== Qfalse), which
@@ -3914,8 +4508,75 @@ static VALUE impl_module(VALUE klass) {
 #define QDEF(klass, name, fn, arity) do { \
     if (!(klass) || (klass) == Qfalse) \
       rb_fatal("qt6 binding: %s defined before its class was created", name); \
-    rb_define_method(impl_module(klass), name, fn, arity); \
+    define_guarded(impl_module(klass), name, (AnyFn)(fn), arity); \
   } while (0)
+
+// ---- which forwarded virtuals Ruby overrides (see RubyOverrides) ----------
+static const char *const kForwardedVirtuals[] = {
+  "paintEvent", "resizeEvent", "showEvent", "closeEvent", "leaveEvent",
+  "focusInEvent", "focusOutEvent", "wheelEvent", "keyPressEvent",
+  "mousePressEvent", "mouseMoveEvent", "mouseReleaseEvent",
+  "dragEnterEvent", "dragMoveEvent", "dropEvent", "reject",
+  "initializeGL", "resizeGL", "paintGL",
+  "createEditor", "setEditorData", "setModelData", "paint",
+};
+static const int kForwardedCount = (int)(sizeof(kForwardedVirtuals) / sizeof(kForwardedVirtuals[0]));
+static std::atomic<unsigned long> g_override_epoch{1};   // caches start at 0
+
+static VALUE method_owner(VALUE args) {
+  VALUE *a = (VALUE *)args;
+  return rb_funcall(rb_obj_method(a[0], a[1]), rb_intern("owner"), 0);
+}
+// PRECONDITION: the GVL is held. False when obj has no live wrapper to ask
+// (none yet, or a condemned one) -- nothing worth caching.
+static bool override_mask(const QObject *obj, unsigned *mask) {
+  VALUE self;
+  {
+    ObjMapLock lk(g_objmap_mutex);
+    std::map<QObject *, ObjRef>::iterator it = g_objmap.find(const_cast<QObject *>(obj));
+    if (it == g_objmap.end()) return false;
+    self = it->second.v;
+  }
+  if (wrapper_condemned(self)) return false;
+  unsigned m = 0;
+  for (int i = 0; i < kForwardedCount; i++) {
+    ID mid = rb_intern(kForwardedVirtuals[i]);
+    if (!rb_respond_to(self, mid)) continue;          // as ruby_event_dispatch
+    VALUE args[2] = { self, ID2SYM(mid) };
+    int state = 0;
+    VALUE owner = rb_protect(method_owner, (VALUE)args, &state);
+    if (state) {                                      // cannot tell: dispatch
+      rb_set_errinfo(Qnil);
+      m |= 1u << i;
+      continue;
+    }
+    // An Impl module's method is the binding's pass-through to Qt's default
+    // (qt_base_event, there for super), not an override.
+    if (!g_impl_module_set.count(owner)) m |= 1u << i;
+  }
+  *mask = m;
+  return true;
+}
+bool ruby_overrides(const QObject *obj, RubyOverrides &c, const char *method) {
+  int i = 0;
+  while (i < kForwardedCount && strcmp(kForwardedVirtuals[i], method)) i++;
+  if (i == kForwardedCount) return true;              // not tracked
+  const unsigned long now = g_override_epoch.load(std::memory_order_acquire);
+  if (c.epoch.load(std::memory_order_acquire) != now) {
+    unsigned mask = 0;
+    bool known = false;
+    ruby_with_gvl([&] { known = override_mask(obj, &mask); });
+    if (!known) return false;          // ruby_event_dispatch would find no wrapper either
+    c.mask.store(mask, std::memory_order_relaxed);
+    c.epoch.store(now, std::memory_order_release);
+  }
+  return (c.mask.load(std::memory_order_relaxed) >> i) & 1u;
+}
+// lib/Qt.rb calls this after anything that can add or remove an override.
+static VALUE qt_overrides_changed(VALUE) {
+  g_override_epoch.fetch_add(1, std::memory_order_acq_rel);
+  return Qnil;
+}
 
 static VALUE variant_from_value(VALUE klass, VALUE v) {
   if (RB_TYPE_P(v, T_FIXNUM))     return wrap_val<QVariant>(cVariant, QVariant(NUM2INT(v)));
@@ -4213,22 +4874,26 @@ static VALUE tabw_set_tab_icon(VALUE self, VALUE i, VALUE icon) {
 static void item_init_module(VALUE klass, const char *name,
                              VALUE (*fn)(int, VALUE *, VALUE)) {
   VALUE m = rb_define_module_under(mQt, name);
-  rb_define_method(m, "initialize", RUBY_METHOD_FUNC(fn), -1);
+  define_guarded(m, "initialize", RUBY_METHOD_FUNC(fn), -1);
   rb_include_module(klass, m);
 }
 
 extern "C" void Init_qt6(void) {
+  // Marks the pinned wrappers on every GC; see ObjRef. The data pointer is
+  // unused but must not be NULL: Ruby skips dmark for a NULL T_DATA.
+  rb_gc_register_mark_object(TypedData_Wrap_Struct(rb_cObject, &pinned_root_type, &g_objmap));
+  // Marks the blocks C++ holds (ruby_anchor_proc); non-NULL for the same reason.
+  rb_gc_register_mark_object(TypedData_Wrap_Struct(rb_cObject, &anchored_root_type, g_anchored));
   mQt = rb_define_module("Qt");
   rb_define_singleton_method(mQt, "connect_raw",  RUBY_METHOD_FUNC(qt_connect), -1);
   rb_define_singleton_method(mQt, "connect",      RUBY_METHOD_FUNC(qt_connect), -1);
   rb_define_singleton_method(mQt, "qVersion",     RUBY_METHOD_FUNC(qt_version), 0);
   rb_define_singleton_method(mQt, "single_shot",  RUBY_METHOD_FUNC(qt_single_shot), -1);
   rb_define_singleton_method(mQt, "post_to_main_thread", RUBY_METHOD_FUNC(qt_post_to_main), -1);
+  rb_define_singleton_method(mQt, "__overrides_changed", RUBY_METHOD_FUNC(qt_overrides_changed), 0);
   rb_define_singleton_method(mQt, "on_main_thread?",     RUBY_METHOD_FUNC(qt_on_main_thread_p), 0);
   rb_define_singleton_method(mQt, "object_count", RUBY_METHOD_FUNC(obj_object_count), 0);
 
-  g_procs = rb_ary_new();
-  rb_gc_register_address(&g_procs);
   // ---- Qt::Base / Qt::Object ------------------------------------------
   // The hierarchy must match COSMOS's own line_graph C extension, which does
   //   cQtBase   = rb_define_class_under(mQt, "Base", rb_cObject);
@@ -4266,11 +4931,11 @@ extern "C" void Init_qt6(void) {
   QDEF(cApplication, "exec",          RUBY_METHOD_FUNC(app_exec), 0);
   QDEF(cApplication, "processEvents", RUBY_METHOD_FUNC(app_process_events), 0);
   QDEF(cApplication, "exec_for",      RUBY_METHOD_FUNC(app_exec_for), 1);
-  rb_define_singleton_method(cApplication, "setOverrideCursor",     RUBY_METHOD_FUNC(app_set_override_cursor), 1);
-  rb_define_singleton_method(cApplication, "restoreOverrideCursor", RUBY_METHOD_FUNC(app_restore_override_cursor), 0);
-  rb_define_singleton_method(cApplication, "activeWindow",      RUBY_METHOD_FUNC(app_active_window), 0);
-  rb_define_singleton_method(cApplication, "activeModalWidget", RUBY_METHOD_FUNC(app_active_modal), 0);
-  rb_define_singleton_method(cApplication, "topLevelWidgets",   RUBY_METHOD_FUNC(app_top_level_widgets), 0);
+  QCDEF(cApplication, "setOverrideCursor",     RUBY_METHOD_FUNC(app_set_override_cursor), 1);
+  QCDEF(cApplication, "restoreOverrideCursor", RUBY_METHOD_FUNC(app_restore_override_cursor), 0);
+  QCDEF(cApplication, "activeWindow",      RUBY_METHOD_FUNC(app_active_window), 0);
+  QCDEF(cApplication, "activeModalWidget", RUBY_METHOD_FUNC(app_active_modal), 0);
+  QCDEF(cApplication, "topLevelWidgets",   RUBY_METHOD_FUNC(app_top_level_widgets), 0);
   // COSMOS calls these on the instance too (qt_tool.rb:497 redirect_io).
   QDEF(cApplication, "activeWindow",      RUBY_METHOD_FUNC(app_active_window), 0);
   QDEF(cApplication, "activeModalWidget", RUBY_METHOD_FUNC(app_active_modal), 0);
@@ -4280,15 +4945,15 @@ extern "C" void Init_qt6(void) {
   QDEF(cApplication, "style",             RUBY_METHOD_FUNC(app_style), 0);
   QDEF(cApplication, "setOverrideCursor",     RUBY_METHOD_FUNC(app_set_override_cursor), 1);
   QDEF(cApplication, "restoreOverrideCursor", RUBY_METHOD_FUNC(app_restore_override_cursor), 0);
-  rb_define_singleton_method(cApplication, "quit",            RUBY_METHOD_FUNC(app_quit), 0);
-  rb_define_singleton_method(cApplication, "closeAllWindows", RUBY_METHOD_FUNC(app_close_all_windows), 0);
-  rb_define_singleton_method(cApplication, "processEvents",   RUBY_METHOD_FUNC(app_process_events_cls), 0);
-  rb_define_singleton_method(cApplication, "processEvents",  RUBY_METHOD_FUNC(app_process_events_cls), 0);
-  rb_define_singleton_method(cApplication, "instance",       RUBY_METHOD_FUNC(app_instance), 0);
-  rb_define_singleton_method(cApplication, "desktop",        RUBY_METHOD_FUNC(app_desktop), 0);
+  QCDEF(cApplication, "quit",            RUBY_METHOD_FUNC(app_quit), 0);
+  QCDEF(cApplication, "closeAllWindows", RUBY_METHOD_FUNC(app_close_all_windows), 0);
+  QCDEF(cApplication, "processEvents",   RUBY_METHOD_FUNC(app_process_events_cls), 0);
+  QCDEF(cApplication, "processEvents",  RUBY_METHOD_FUNC(app_process_events_cls), 0);
+  QCDEF(cApplication, "instance",       RUBY_METHOD_FUNC(app_instance), 0);
+  QCDEF(cApplication, "desktop",        RUBY_METHOD_FUNC(app_desktop), 0);
   QDEF(cApplication, "desktop",  RUBY_METHOD_FUNC(app_desktop), 0);   // also as an instance method (script_runner.rb)
-  rb_define_singleton_method(cApplication, "style",          RUBY_METHOD_FUNC(app_style), 0);
-  rb_define_singleton_method(cApplication, "setWindowIcon",  RUBY_METHOD_FUNC(app_set_window_icon), 1);
+  QCDEF(cApplication, "style",          RUBY_METHOD_FUNC(app_style), 0);
+  QCDEF(cApplication, "setWindowIcon",  RUBY_METHOD_FUNC(app_set_window_icon), 1);
   QDEF(cApplication, "setWindowIcon",   RUBY_METHOD_FUNC(widget_set_window_icon), 1);
   QDEF(cApplication, "addLibraryPath",  RUBY_METHOD_FUNC(app_add_library_path), 1);
   QDEF(cApplication, "closeAllWindows", RUBY_METHOD_FUNC(app_close_all_windows), 0);
@@ -4317,6 +4982,12 @@ extern "C" void Init_qt6(void) {
   QDEF(cWidget, "scroll",         RUBY_METHOD_FUNC(widget_scroll), 2);
   QDEF(cWidget, "actions",        RUBY_METHOD_FUNC(widget_actions), 0);
   QDEF(cWidget, "showNormal",     RUBY_METHOD_FUNC((call_void<QWidget, &QWidget::showNormal>)), 0);
+  // QtTool#complete_initialize (qt_tool.rb:238/240) for --minimized and
+  // --maximized; unbound, a tool started with either died there.
+  QDEF(cWidget, "showMinimized",  RUBY_METHOD_FUNC((call_void<QWidget, &QWidget::showMinimized>)), 0);
+  QDEF(cWidget, "showMaximized",  RUBY_METHOD_FUNC((call_void<QWidget, &QWidget::showMaximized>)), 0);
+  QDEF(cWidget, "isMinimized",    RUBY_METHOD_FUNC((get_bool<QWidget, &QWidget::isMinimized>)), 0);
+  QDEF(cWidget, "isMaximized",    RUBY_METHOD_FUNC((get_bool<QWidget, &QWidget::isMaximized>)), 0);
   QDEF(cWidget, "hasFocus",       RUBY_METHOD_FUNC((get_bool<QWidget, &QWidget::hasFocus>)), 0);
   QDEF(cWidget, "minimumHeight",  RUBY_METHOD_FUNC((get_int<QWidget, &QWidget::minimumHeight>)), 0);
   QDEF(cWidget, "maximumHeight",  RUBY_METHOD_FUNC((get_int<QWidget, &QWidget::maximumHeight>)), 0);
@@ -4468,7 +5139,12 @@ extern "C" void Init_qt6(void) {
   // QDialog::exec() -- without this, Ruby's Kernel#exec shadows it.
   QDEF(cDialog, "exec",   RUBY_METHOD_FUNC(dialog_exec), 0);
   QDEF(cDialog, "accept", RUBY_METHOD_FUNC((call_void<QDialog, &QDialog::accept>)), 0);
-  QDEF(cDialog, "reject", RUBY_METHOD_FUNC((call_void<QDialog, &QDialog::reject>)), 0);
+  QDEF(cDialog, "reject", RUBY_METHOD_FUNC(dialog_reject), 0);
+  // ProgressDialog#close_done (progress_dialog.rb:162) ends every ScriptRunner
+  // instrumentation pass with done(0); unbound, each Start showed "Error
+  // During Progress". Also about_dialog.rb:110/150, limits_monitor.rb:802,
+  // script_runner_frame.rb:1504.
+  QDEF(cDialog, "done",   RUBY_METHOD_FUNC((set_int<QDialog, &QDialog::done>)), 1);
 
   cMainWindow = rb_define_class_under(mQt, "MainWindow", cWidget);
   QDEF(cMainWindow, "addToolBar", RUBY_METHOD_FUNC(mw_add_toolbar), -1);
@@ -4478,8 +5154,10 @@ extern "C" void Init_qt6(void) {
   cLayout = rb_define_class_under(mQt, "Layout", cQtObject);
   QDEF(cLayout, "addWidget", RUBY_METHOD_FUNC(layout_add_widget), -1);
   QDEF(cLayout, "count",     RUBY_METHOD_FUNC(layout_count), 0);
+  QDEF(cLayout, "minimumSize", RUBY_METHOD_FUNC(layout_minimum_size), 0);
 
   QDEF(cLayout, "takeAt",             RUBY_METHOD_FUNC(layout_take_at), 1);
+  QDEF(cLayout, "addItem",            RUBY_METHOD_FUNC(layout_add_item), -1);
   QDEF(cLayout, "setSpacing",         RUBY_METHOD_FUNC(layout_set_spacing), 1);
   QDEF(cLayout, "setContentsMargins", RUBY_METHOD_FUNC(layout_set_margins), 4);
   QDEF(cLayout, "setAlignment",       RUBY_METHOD_FUNC(layout_set_alignment), -1);
@@ -4516,7 +5194,14 @@ extern "C" void Init_qt6(void) {
   cGridLayout = rb_define_class_under(mQt, "GridLayout", cLayout);
   register_ctor(cGridLayout, ctor_layout<QGridLayout>);
   QDEF(cGridLayout, "addWidget",         RUBY_METHOD_FUNC(grid_add_widget), -1);
+  QDEF(cGridLayout, "addLayout",         RUBY_METHOD_FUNC(grid_add_layout), -1);
   QDEF(cGridLayout, "setRowStretch",     RUBY_METHOD_FUNC(grid_set_row_stretch), 2);
+  // TlmViewer's MATRIXBYCOLUMNS sets both in its constructor
+  // (matrixbycolumns_widget.rb:27-28); unbound, no screen using it opened.
+  QDEF(cGridLayout, "setHorizontalSpacing", RUBY_METHOD_FUNC((set_int<QGridLayout, &QGridLayout::setHorizontalSpacing>)), 1);
+  QDEF(cGridLayout, "setVerticalSpacing",   RUBY_METHOD_FUNC((set_int<QGridLayout, &QGridLayout::setVerticalSpacing>)), 1);
+  QDEF(cGridLayout, "horizontalSpacing",    RUBY_METHOD_FUNC((get_int<QGridLayout, &QGridLayout::horizontalSpacing>)), 0);
+  QDEF(cGridLayout, "verticalSpacing",      RUBY_METHOD_FUNC((get_int<QGridLayout, &QGridLayout::verticalSpacing>)), 0);
   QDEF(cGridLayout, "setColumnStretch",  RUBY_METHOD_FUNC(grid_set_col_stretch), 2);
   // ---- enum constants --------------------------------------------------
   // Plain integer constants; COSMOS uses these as bare Qt::Foo values.
@@ -4552,7 +5237,13 @@ extern "C" void Init_qt6(void) {
   DEF_QT_CONST(ClosedHandCursor);   DEF_QT_CONST(SizeAllCursor);
   DEF_QT_CONST(SizeHorCursor);      DEF_QT_CONST(SizeVerCursor);
   // pens / brushes / text
-  DEF_QT_CONST(NoPen);   DEF_QT_CONST(DashLine);  DEF_QT_CONST(SolidPattern);
+  // A typed pen style, so Qt::Pen.new and Painter#setPen take it as a style
+  // (see pen_new). NoPen stays an Integer: COSMOS's Qt::Painter#setPen hands
+  // it to Cosmos.getColor, whose Qt::Color.new(Qt::NoPen) needs one
+  // (qt.rb:100-121, 708; led_widget.rb:103).
+  cPenStyle = typed_enum_class(mQt, "PenStyle", "Qt::");
+  rb_define_const(mQt, "DashLine", typed_enum(cPenStyle, (int)Qt::DashLine, "DashLine"));
+  DEF_QT_CONST(NoPen);   DEF_QT_CONST(SolidPattern);
   DEF_QT_CONST(NoBrush); DEF_QT_CONST(RichText);  DEF_QT_CONST(CaseInsensitive);
   DEF_QT_CONST(MatchExactly); DEF_QT_CONST(MoveAction);
   DEF_QT_CONST(TextSelectableByMouse);
@@ -4597,14 +5288,14 @@ extern "C" void Init_qt6(void) {
   QDEF(cAction, "shortcut",    RUBY_METHOD_FUNC(action_shortcut), 0);
   // ---- value types -----------------------------------------------------
   cKeySequence = rb_define_class_under(mQt, "KeySequence", rb_cObject);
-  rb_define_singleton_method(cKeySequence, "new", RUBY_METHOD_FUNC(keyseq_new), -1);
+  QCDEF(cKeySequence, "new", RUBY_METHOD_FUNC(keyseq_new), -1);
   QDEF(cKeySequence, "toString", RUBY_METHOD_FUNC(keyseq_to_s), 0);
   QDEF(cKeySequence, "to_s",     RUBY_METHOD_FUNC(keyseq_to_s), 0);
   QDEF(cKeySequence, "isEmpty",  RUBY_METHOD_FUNC(keyseq_is_empty), 0);
 
   cVariant = rb_define_class_under(mQt, "Variant", rb_cObject);
-  rb_define_singleton_method(cVariant, "new",       RUBY_METHOD_FUNC(variant_new), -1);
-  rb_define_singleton_method(cVariant, "fromValue", RUBY_METHOD_FUNC(variant_from_value), 1);
+  QCDEF(cVariant, "new",       RUBY_METHOD_FUNC(variant_new), -1);
+  QCDEF(cVariant, "fromValue", RUBY_METHOD_FUNC(variant_from_value), 1);
   QDEF(cVariant, "toStringList", RUBY_METHOD_FUNC(variant_to_string_list), 0);
   QDEF(cVariant, "value",        RUBY_METHOD_FUNC(variant_value), 0);
   QDEF(cVariant, "toString", RUBY_METHOD_FUNC(variant_to_s), 0);
@@ -4617,7 +5308,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cVariant, "toPoint",  RUBY_METHOD_FUNC(variant_to_point), 0);
 
   cFont = rb_define_class_under(mQt, "Font", rb_cObject);
-  rb_define_singleton_method(cFont, "new", RUBY_METHOD_FUNC(font_new), -1);
+  QCDEF(cFont, "new", RUBY_METHOD_FUNC(font_new), -1);
   QDEF(cFont, "family",    RUBY_METHOD_FUNC(font_family), 0);
   QDEF(cFont, "setFamily",    RUBY_METHOD_FUNC(font_set_family), 1);
   QDEF(cFont, "setPointSize", RUBY_METHOD_FUNC(font_set_point_size), 1);
@@ -4627,19 +5318,19 @@ extern "C" void Init_qt6(void) {
   QDEF(cFont, "bold",      RUBY_METHOD_FUNC(font_bold), 0);
 
   cColor = rb_define_class_under(mQt, "Color", rb_cObject);
-  rb_define_singleton_method(cColor, "new", RUBY_METHOD_FUNC(color_new), -1);
+  QCDEF(cColor, "new", RUBY_METHOD_FUNC(color_new), -1);
   QDEF(cColor, "red",   RUBY_METHOD_FUNC(color_red), 0);
   QDEF(cColor, "green", RUBY_METHOD_FUNC(color_green), 0);
   QDEF(cColor, "blue",  RUBY_METHOD_FUNC(color_blue), 0);
   QDEF(cColor, "name",  RUBY_METHOD_FUNC(color_name), 0);
 
   cSize = rb_define_class_under(mQt, "Size", rb_cObject);
-  rb_define_singleton_method(cSize, "new", RUBY_METHOD_FUNC(size_new), 2);
+  QCDEF(cSize, "new", RUBY_METHOD_FUNC(size_new), 2);
   QDEF(cSize, "width",  RUBY_METHOD_FUNC(size_width), 0);
   QDEF(cSize, "height", RUBY_METHOD_FUNC(size_height), 0);
 
   cPoint = rb_define_class_under(mQt, "Point", rb_cObject);
-  rb_define_singleton_method(cPoint, "new", RUBY_METHOD_FUNC(point_new), 2);
+  QCDEF(cPoint, "new", RUBY_METHOD_FUNC(point_new), 2);
   QDEF(cPoint, "x", RUBY_METHOD_FUNC(point_x), 0);
   QDEF(cPoint, "y", RUBY_METHOD_FUNC(point_y), 0);
   QDEF(cPoint, "setX", RUBY_METHOD_FUNC(point_set_x), 1);
@@ -4732,27 +5423,30 @@ extern "C" void Init_qt6(void) {
 
   // ---- Qt::FileDialog --------------------------------------------------
   cFileDialog = rb_define_class_under(mQt, "FileDialog", rb_cObject);
-  rb_define_singleton_method(cFileDialog, "getOpenFileName",      RUBY_METHOD_FUNC(filedlg_open), -1);
-  rb_define_singleton_method(cFileDialog, "getSaveFileName",      RUBY_METHOD_FUNC(filedlg_save), -1);
-  rb_define_singleton_method(cFileDialog, "getExistingDirectory", RUBY_METHOD_FUNC(filedlg_dir), -1);
-  rb_define_singleton_method(cFileDialog, "getOpenFileNames",      RUBY_METHOD_FUNC(filedlg_open_many), -1);
+  QCDEF(cFileDialog, "getOpenFileName",      RUBY_METHOD_FUNC(filedlg_open), -1);
+  QCDEF(cFileDialog, "getSaveFileName",      RUBY_METHOD_FUNC(filedlg_save), -1);
+  QCDEF(cFileDialog, "getExistingDirectory", RUBY_METHOD_FUNC(filedlg_dir), -1);
+  QCDEF(cFileDialog, "getOpenFileNames",      RUBY_METHOD_FUNC(filedlg_open_many), -1);
 
   // ---- Qt::CoreApplication ---------------------------------------------
   VALUE cCoreApp = rb_define_class_under(mQt, "CoreApplication", rb_cObject);
-  rb_define_singleton_method(cCoreApp, "applicationName",    RUBY_METHOD_FUNC(core_app_name), 0);
-  rb_define_singleton_method(cCoreApp, "setApplicationName", RUBY_METHOD_FUNC(core_set_app_name), 1);
-  rb_define_singleton_method(cCoreApp, "instance",           RUBY_METHOD_FUNC(app_instance), 0);
-  rb_define_singleton_method(cCoreApp, "processEvents",      RUBY_METHOD_FUNC(app_process_events_cls), 0);
-  rb_define_singleton_method(cCoreApp, "closeAllWindows",    RUBY_METHOD_FUNC(app_close_all_windows), 0);
+  QCDEF(cCoreApp, "applicationName",    RUBY_METHOD_FUNC(core_app_name), 0);
+  QCDEF(cCoreApp, "setApplicationName", RUBY_METHOD_FUNC(core_set_app_name), 1);
+  QCDEF(cCoreApp, "instance",           RUBY_METHOD_FUNC(app_instance), 0);
+  QCDEF(cCoreApp, "processEvents",      RUBY_METHOD_FUNC(app_process_events_cls), 0);
+  QCDEF(cCoreApp, "closeAllWindows",    RUBY_METHOD_FUNC(app_close_all_windows), 0);
   // ---- tables ----------------------------------------------------------
   cTableWidgetItem = rb_define_class_under(mQt, "TableWidgetItem", rb_cObject);
-  rb_define_singleton_method(cTableWidgetItem, "new", RUBY_METHOD_FUNC(twitem_new), -1);
+  QCDEF(cTableWidgetItem, "new", RUBY_METHOD_FUNC(twitem_new), -1);
   item_init_module(cTableWidgetItem, "TableWidgetItemInit", twitem_initialize);
   QDEF(cTableWidgetItem, "text",    RUBY_METHOD_FUNC(twitem_text), 0);
   QDEF(cTableWidgetItem, "textColor", RUBY_METHOD_FUNC(twi_text_color), 0);
   QDEF(cTableWidgetItem, "setText", RUBY_METHOD_FUNC(twitem_set_text), 1);
   QDEF(cTableWidgetItem, "setTextAlignment", RUBY_METHOD_FUNC(twitem_set_text_alignment), 1);
   QDEF(cTableWidgetItem, "setFlags",      RUBY_METHOD_FUNC(twitem_set_flags), 1);
+  QDEF(cTableWidgetItem, "flags",         RUBY_METHOD_FUNC(twitem_flags), 0);
+  QDEF(cTableWidgetItem, "row",           RUBY_METHOD_FUNC(twitem_row), 0);
+  QDEF(cTableWidgetItem, "column",        RUBY_METHOD_FUNC(twitem_column), 0);
   QDEF(cTableWidgetItem, "setCheckState", RUBY_METHOD_FUNC(twitem_set_check_state), 1);
   QDEF(cTableWidgetItem, "checkState",     RUBY_METHOD_FUNC(twitem_check_state), 0);
   QDEF(cTableWidgetItem, "setForeground",  RUBY_METHOD_FUNC(twitem_set_foreground), 1);
@@ -4774,6 +5468,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cTableWidget, "columnCount",    RUBY_METHOD_FUNC((get_int<QTableWidget, &QTableWidget::columnCount>)), 0);
   QDEF(cTableWidget, "setItem",        RUBY_METHOD_FUNC(tw_set_item), 3);
   QDEF(cTableWidget, "item",           RUBY_METHOD_FUNC(tw_item), 2);
+  QDEF(cTableWidget, "itemAt",         RUBY_METHOD_FUNC(tw_item_at), 1);
   QDEF(cTableWidget, "setHorizontalHeaderItem", RUBY_METHOD_FUNC(tw_set_hheader), 2);
   QDEF(cTableWidget, "resizeColumnsToContents", RUBY_METHOD_FUNC((call_void<QTableView, &QTableView::resizeColumnsToContents>)), 0);
   QDEF(cTableWidget, "setHorizontalHeaderLabels", RUBY_METHOD_FUNC(tw_set_h_header_labels), 1);
@@ -4784,7 +5479,7 @@ extern "C" void Init_qt6(void) {
 
   // ---- trees -----------------------------------------------------------
   cTreeWidgetItem = rb_define_class_under(mQt, "TreeWidgetItem", rb_cObject);
-  rb_define_singleton_method(cTreeWidgetItem, "new", RUBY_METHOD_FUNC(tritem_new), -1);
+  QCDEF(cTreeWidgetItem, "new", RUBY_METHOD_FUNC(tritem_new), -1);
   item_init_module(cTreeWidgetItem, "TreeWidgetItemInit", tritem_initialize);
   QDEF(cTreeWidgetItem, "setCheckState", RUBY_METHOD_FUNC(tritem_set_check_state), 2);
   QDEF(cTreeWidgetItem, "text",     RUBY_METHOD_FUNC(tritem_text), 1);
@@ -4809,7 +5504,7 @@ extern "C" void Init_qt6(void) {
   cListWidget = rb_define_class_under(mQt, "ListWidget", cAbstractItemView);
   // Declared but never defined, so findItems/currentItem had nothing to wrap.
   cListWidgetItem = rb_define_class_under(mQt, "ListWidgetItem", rb_cObject);
-  rb_define_singleton_method(cListWidgetItem, "new", RUBY_METHOD_FUNC(lwitem_new), -1);
+  QCDEF(cListWidgetItem, "new", RUBY_METHOD_FUNC(lwitem_new), -1);
   item_init_module(cListWidgetItem, "ListWidgetItemInit", lwitem_initialize);
   QDEF(cListWidgetItem, "setData", RUBY_METHOD_FUNC(lwitem_set_data), 2);
   QDEF(cListWidgetItem, "text",        RUBY_METHOD_FUNC(lwi_text), 0);
@@ -4840,6 +5535,13 @@ extern "C" void Init_qt6(void) {
   QDEF(cTabWidget, "setCurrentIndex", RUBY_METHOD_FUNC((set_int<QTabWidget, &QTabWidget::setCurrentIndex>)), 1);
   QDEF(cTabWidget, "tabRect",       RUBY_METHOD_FUNC(tab_rect), 1);
   QDEF(cTabWidget, "tabBar",        RUBY_METHOD_FUNC(tabwidget_tab_bar), 0);
+  VALUE cTabBar = rb_define_class_under(mQt, "TabBar", cWidget);
+  QDEF(cTabBar, "count",        RUBY_METHOD_FUNC((get_int<QTabBar, &QTabBar::count>)), 0);
+  QDEF(cTabBar, "tabRect",      RUBY_METHOD_FUNC(tabbar_tab_rect), 1);
+  QDEF(cTabBar, "setTabIcon",   RUBY_METHOD_FUNC(tabbar_set_tab_icon), 2);
+  QDEF(cTabBar, "tabIcon",      RUBY_METHOD_FUNC(tabbar_tab_icon), 1);
+  QDEF(cTabBar, "isTabEnabled", RUBY_METHOD_FUNC(tabbar_is_tab_enabled), 1);
+  register_qt_class("QTabBar", cTabBar);
   QDEF(cTabWidget, "setTabIcon",    RUBY_METHOD_FUNC(tab_set_tab_icon), 2);
   QDEF(cTabWidget, "currentWidget", RUBY_METHOD_FUNC(tab_current_widget), 0);
   QDEF(cTabWidget, "currentTab",    RUBY_METHOD_FUNC(tab_current_widget), 0);
@@ -4865,13 +5567,14 @@ extern "C" void Init_qt6(void) {
 
   cFormLayout = rb_define_class_under(mQt, "FormLayout", cLayout);
   register_ctor(cFormLayout, ctor_layout<QFormLayout>);
-  QDEF(cFormLayout, "addRow", RUBY_METHOD_FUNC(form_add_row), 2);
+  QDEF(cFormLayout, "addRow", RUBY_METHOD_FUNC(form_add_row), -1);
 
   // ---- menus and bars --------------------------------------------------
   cMenu = rb_define_class_under(mQt, "Menu", cWidget);
   register_ctor(cMenu, ctor_str<QMenu>);
   QDEF(cMenu, "addAction",    RUBY_METHOD_FUNC(menu_add_action), 1);
   QDEF(cMenu, "addSeparator", RUBY_METHOD_FUNC(menu_add_separator), 0);
+  QDEF(cMenu, "exec",         RUBY_METHOD_FUNC(menu_exec), -1);
   QDEF(cMenu, "title",        RUBY_METHOD_FUNC((get_str<QMenu, &QMenu::title>)), 0);
   QDEF(cMenu, "setTitle",     RUBY_METHOD_FUNC((set_str<QMenu, &QMenu::setTitle>)), 1);
 
@@ -4884,6 +5587,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cToolBar, "setFloatable", RUBY_METHOD_FUNC(toolbar_set_floatable), 1);
   QDEF(cToolBar, "addAction",    RUBY_METHOD_FUNC(menu_add_action), 1);
   QDEF(cToolBar, "addSeparator", RUBY_METHOD_FUNC(menu_add_separator), 0);
+  QDEF(cToolBar, "addWidget",    RUBY_METHOD_FUNC(toolbar_add_widget), 1);
 
   cStatusBar = rb_define_class_under(mQt, "StatusBar", cWidget);
   register_ctor(cStatusBar, ctor_plain<QStatusBar>);
@@ -4985,7 +5689,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cTimer, "isActive",      RUBY_METHOD_FUNC((get_bool<QTimer, &QTimer::isActive>)), 0);
   // ---- Qt::Palette / Qt::Cursor ----------------------------------------
   cPalette = rb_define_class_under(mQt, "Palette", rb_cObject);
-  rb_define_singleton_method(cPalette, "new", RUBY_METHOD_FUNC(palette_new), -1);
+  QCDEF(cPalette, "new", RUBY_METHOD_FUNC(palette_new), -1);
 #define DEF_PAL(n) rb_define_const(cPalette, #n, INT2NUM((int)QPalette::n))
   DEF_PAL(Active); DEF_PAL(Inactive); DEF_PAL(Disabled);
   DEF_PAL(Window); DEF_PAL(WindowText); DEF_PAL(Base); DEF_PAL(Text);
@@ -4994,9 +5698,15 @@ extern "C" void Init_qt6(void) {
   QDEF(cWidget, "setPalette", RUBY_METHOD_FUNC(widget_set_palette), 1);
 
   cCursor = rb_define_class_under(mQt, "Cursor", rb_cObject);
-  rb_define_singleton_method(cCursor, "new",    RUBY_METHOD_FUNC(cursor_new), 1);
-  rb_define_singleton_method(cCursor, "pos",    RUBY_METHOD_FUNC(cursor_pos), 0);
-  rb_define_singleton_method(cCursor, "setPos", RUBY_METHOD_FUNC(cursor_set_pos), 2);
+  QCDEF(cCursor, "new",    RUBY_METHOD_FUNC(cursor_new), 1);
+  QCDEF(cCursor, "pos",    RUBY_METHOD_FUNC(cursor_pos), 0);
+  QCDEF(cCursor, "setPos", RUBY_METHOD_FUNC(cursor_set_pos), 2);
+  QDEF(cCursor, "pos",    RUBY_METHOD_FUNC(cursor_pos_instance), 0);
+  QDEF(cWidget, "cursor", RUBY_METHOD_FUNC(widget_cursor), 0);
+  // Help > About prints parent.x / parent.y (about_dialog.rb:95/99).
+  QDEF(cWidget, "x",      RUBY_METHOD_FUNC((get_int<QWidget, &QWidget::x>)), 0);
+  QDEF(cWidget, "y",      RUBY_METHOD_FUNC((get_int<QWidget, &QWidget::y>)), 0);
+  QDEF(cWidget, "window", RUBY_METHOD_FUNC(widget_window), 0);
   QDEF(cWidget, "setCursor", RUBY_METHOD_FUNC(widget_set_cursor), 1);
 
   // ---- scroll bar policy -----------------------------------------------
@@ -5050,25 +5760,25 @@ extern "C" void Init_qt6(void) {
   QDEF(cColor, "hash", RUBY_METHOD_FUNC(color_hash), 0);
 
   cPen = rb_define_class_under(mQt, "Pen", rb_cObject);
-  rb_define_singleton_method(cPen, "new", RUBY_METHOD_FUNC(pen_new), -1);
+  QCDEF(cPen, "new", RUBY_METHOD_FUNC(pen_new), -1);
   QDEF(cPen, "setColor", RUBY_METHOD_FUNC(pen_set_color), 1);
   QDEF(cPen, "setWidth", RUBY_METHOD_FUNC(pen_set_width), 1);
   QDEF(cPen, "setStyle", RUBY_METHOD_FUNC(pen_set_style), 1);
   QDEF(cPen, "color",    RUBY_METHOD_FUNC(pen_color), 0);
 
   cLinearGradient = rb_define_class_under(mQt, "LinearGradient", rb_cObject);
-  rb_define_singleton_method(cLinearGradient, "new", RUBY_METHOD_FUNC(lingrad_new), -1);
+  QCDEF(cLinearGradient, "new", RUBY_METHOD_FUNC(lingrad_new), -1);
   QDEF(cLinearGradient, "setCoordinateMode", RUBY_METHOD_FUNC(lingrad_set_coord_mode), 1);
   QDEF(cLinearGradient, "setColorAt", RUBY_METHOD_FUNC(lingrad_set_color_at), 2);
 
   cBrush = rb_define_class_under(mQt, "Brush", rb_cObject);
-  rb_define_singleton_method(cBrush, "new", RUBY_METHOD_FUNC(brush_new), -1);
+  QCDEF(cBrush, "new", RUBY_METHOD_FUNC(brush_new), -1);
   QDEF(cBrush, "setColor", RUBY_METHOD_FUNC(brush_set_color), 1);
   QDEF(cBrush, "color",    RUBY_METHOD_FUNC(brush_color), 0);
 
   cFontMetrics = rb_define_class_under(mQt, "FontMetrics", rb_cObject);
   QDEF(cFontMetrics, "lineSpacing", RUBY_METHOD_FUNC(fm_line_spacing), 0);
-  rb_define_singleton_method(cFontMetrics, "new", RUBY_METHOD_FUNC(fontmetrics_new), 1);
+  QCDEF(cFontMetrics, "new", RUBY_METHOD_FUNC(fontmetrics_new), 1);
   QDEF(cFontMetrics, "boundingRect", RUBY_METHOD_FUNC(fm_bounding_rect), 1);
   QDEF(cFontMetrics, "width",   RUBY_METHOD_FUNC(fm_width), 1);
   QDEF(cFontMetrics, "horizontalAdvance", RUBY_METHOD_FUNC(fm_width), 1);
@@ -5109,8 +5819,9 @@ extern "C" void Init_qt6(void) {
 #undef DEF_RH
 
   cPixmap = rb_define_class_under(mQt, "Pixmap", rb_cObject);
-  rb_define_singleton_method(cPixmap, "new", RUBY_METHOD_FUNC(pixmap_new), -1);
+  QCDEF(cPixmap, "new", RUBY_METHOD_FUNC(pixmap_new), -1);
   QDEF(cPixmap, "width",  RUBY_METHOD_FUNC(pixmap_width), 0);
+  QDEF(cPixmap, "fill",   RUBY_METHOD_FUNC(pixmap_fill), -1);
   QDEF(cPixmap, "height", RUBY_METHOD_FUNC(pixmap_height), 0);
   QDEF(cPixmap, "isNull", RUBY_METHOD_FUNC(pixmap_is_null), 0);
   QDEF(cPixmap, "save",    RUBY_METHOD_FUNC(pixmap_save), 1);
@@ -5118,13 +5829,13 @@ extern "C" void Init_qt6(void) {
   QDEF(cWidget, "grab",   RUBY_METHOD_FUNC(widget_grab), 0);
 
   cIcon = rb_define_class_under(mQt, "Icon", rb_cObject);
-  rb_define_singleton_method(cIcon, "new", RUBY_METHOD_FUNC(icon_new), -1);
+  QCDEF(cIcon, "new", RUBY_METHOD_FUNC(icon_new), -1);
   QDEF(cIcon, "addPixmap", RUBY_METHOD_FUNC(icon_add_pixmap), -1);
   QDEF(cIcon, "isNull", RUBY_METHOD_FUNC(icon_is_null), 0);
   QDEF(cIcon, "pixmap", RUBY_METHOD_FUNC(icon_pixmap), -1);
 
   cImage = rb_define_class_under(mQt, "Image", rb_cObject);
-  rb_define_singleton_method(cImage, "new", RUBY_METHOD_FUNC(image_new), -1);
+  QCDEF(cImage, "new", RUBY_METHOD_FUNC(image_new), -1);
   QDEF(cImage, "width",  RUBY_METHOD_FUNC(image_width), 0);
   QDEF(cImage, "rect",   RUBY_METHOD_FUNC(image_rect), 0);
   QDEF(cImage, "height",     RUBY_METHOD_FUNC(image_height), 0);
@@ -5172,11 +5883,16 @@ extern "C" void Init_qt6(void) {
   QDEF(cCompleter, "model",      RUBY_METHOD_FUNC(completer_model), 0);
   QDEF(cCompleter, "setWidget",  RUBY_METHOD_FUNC(completer_set_widget), 1);
   QDEF(cCompleter, "setCaseSensitivity", RUBY_METHOD_FUNC(completer_set_case_sensitivity), 1);
+  QDEF(cCompleter, "popup",      RUBY_METHOD_FUNC(completer_popup), 0);
+  QDEF(cCompleter, "widget",     RUBY_METHOD_FUNC(completer_widget), 0);
+  QDEF(cCompleter, "complete",   RUBY_METHOD_FUNC(completer_complete), -1);
+  QDEF(cCompleter, "completionPrefix", RUBY_METHOD_FUNC((get_str<QCompleter, &QCompleter::completionPrefix>)), 0);
+  QDEF(cCompleter, "setCurrentRow", RUBY_METHOD_FUNC(completer_set_current_row), 1);
   QDEF(cLineEdit, "setCompleter", RUBY_METHOD_FUNC(lineedit_set_completer), 1);
 
   // ---- geometry ----------------------------------------------------------
   cRect = rb_define_class_under(mQt, "Rect", rb_cObject);
-  rb_define_singleton_method(cRect, "new", RUBY_METHOD_FUNC(rect_new), 4);
+  QCDEF(cRect, "new", RUBY_METHOD_FUNC(rect_new), 4);
   QDEF(cRect, "contains", RUBY_METHOD_FUNC(rect_contains), -1);
   QDEF(cRect, "x",        RUBY_METHOD_FUNC(rect_x), 0);
   QDEF(cRect, "y",        RUBY_METHOD_FUNC(rect_y), 0);
@@ -5193,20 +5909,20 @@ extern "C" void Init_qt6(void) {
   // Qt::Polygon was declared but never defined -- no class, no constructor.
   // Declared but never defined, like Polygon and ListWidgetItem were.
   cDate = rb_define_class_under(mQt, "Date", rb_cObject);
-  rb_define_singleton_method(cDate, "new", RUBY_METHOD_FUNC(date_new), -1);
+  QCDEF(cDate, "new", RUBY_METHOD_FUNC(date_new), -1);
   QDEF(cDate, "year",    RUBY_METHOD_FUNC(date_year), 0);
   QDEF(cDate, "month",   RUBY_METHOD_FUNC(date_month), 0);
   QDEF(cDate, "day",     RUBY_METHOD_FUNC(date_day), 0);
   QDEF(cDate, "isValid", RUBY_METHOD_FUNC(date_valid), 0);
 
   cPolygon = rb_define_class_under(mQt, "Polygon", rb_cObject);
-  rb_define_singleton_method(cPolygon, "new", RUBY_METHOD_FUNC(polygon_new), -1);
+  QCDEF(cPolygon, "new", RUBY_METHOD_FUNC(polygon_new), -1);
   QDEF(cPolygon, "setPoint", RUBY_METHOD_FUNC(polygon_set_point), 3);
   QDEF(cPolygon, "point",    RUBY_METHOD_FUNC(polygon_point), 1);
   QDEF(cPolygon, "size",     RUBY_METHOD_FUNC(polygon_size), 0);
 
   cPointF = rb_define_class_under(mQt, "PointF", rb_cObject);
-  rb_define_singleton_method(cPointF, "new", RUBY_METHOD_FUNC(pointf_new), 2);
+  QCDEF(cPointF, "new", RUBY_METHOD_FUNC(pointf_new), 2);
   QDEF(cPointF, "x", RUBY_METHOD_FUNC(pointf_x), 0);
   QDEF(cPointF, "y", RUBY_METHOD_FUNC(pointf_y), 0);
 
@@ -5220,6 +5936,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cModelIndex, "parent",  RUBY_METHOD_FUNC(mi_parent), 0);
 
   cAbstractItemModel = rb_define_class_under(mQt, "AbstractItemModel", cQtObject);
+  QDEF(cAbstractItemModel, "index", RUBY_METHOD_FUNC(model_index), -1);
   VALUE cStringListModel = rb_define_class_under(mQt, "StringListModel", cAbstractItemModel);
   rb_define_alloc_func(cStringListModel, qtobj_alloc);
   QDEF(cStringListModel, "initialize", RUBY_METHOD_FUNC(slmodel_init), -1);
@@ -5284,8 +6001,9 @@ extern "C" void Init_qt6(void) {
   QDEF(cTextDocument, "isModified",  RUBY_METHOD_FUNC(doc_is_modified), 0);
   QDEF(cTextDocument, "setModified", RUBY_METHOD_FUNC(doc_set_modified), -1);
   cTextCharFormat = rb_define_class_under(mQt, "TextCharFormat", rb_cObject);
-  rb_define_singleton_method(cTextCharFormat, "new", RUBY_METHOD_FUNC(tcf_new), 0);
+  QCDEF(cTextCharFormat, "new", RUBY_METHOD_FUNC(tcf_new), 0);
   QDEF(cTextCharFormat, "setForeground", RUBY_METHOD_FUNC(tcf_set_foreground), 1);
+  QDEF(cTextCharFormat, "setBackground", RUBY_METHOD_FUNC(tcf_set_background), 1);
   QDEF(cTextCharFormat, "setFont",       RUBY_METHOD_FUNC(tcf_set_font), 1);
   QDEF(cTextCharFormat, "font",          RUBY_METHOD_FUNC(tcf_font), 0);
   QDEF(cTextCharFormat, "setFontWeight", RUBY_METHOD_FUNC(tcf_set_font_weight), 1);
@@ -5306,6 +6024,7 @@ extern "C" void Init_qt6(void) {
   VALUE cDialogButtonBox = rb_define_class_under(mQt, "DialogButtonBox", cWidget);
   register_ctor(cDialogButtonBox, ctor_plain<QDialogButtonBox>);
   QDEF(cDialogButtonBox, "addButton", RUBY_METHOD_FUNC(dbb_add_button), 1);
+  QDEF(cDialogButtonBox, "setOrientation", RUBY_METHOD_FUNC(dbb_set_orientation), 1);
 #define DEF_DBB(n) rb_define_const(cDialogButtonBox, #n, INT2NUM((int)QDialogButtonBox::n))
   DEF_DBB(Ok); DEF_DBB(Cancel); DEF_DBB(Yes); DEF_DBB(No); DEF_DBB(Close);
 #undef DEF_DBB
@@ -5324,10 +6043,11 @@ extern "C" void Init_qt6(void) {
   rb_define_attr(cMimeDataCls, "urls",    1, 0);
   rb_define_attr(cMimeDataCls, "text",    1, 0);
   rb_define_class_under(mQt, "Drag", cQtObject);
-  rb_define_class_under(mQt, "SpacerItem", rb_cObject);
+  VALUE cSpacerItem = rb_define_class_under(mQt, "SpacerItem", cLayoutItem);
+  QCDEF(cSpacerItem, "new", RUBY_METHOD_FUNC(spacer_new), -1);
   rb_define_class_under(mQt, "Polygon", rb_cObject);
   VALUE cChar = rb_define_class_under(mQt, "Char", rb_cObject);
-  rb_define_singleton_method(cChar, "new", RUBY_METHOD_FUNC(qchar_new), 1);
+  QCDEF(cChar, "new", RUBY_METHOD_FUNC(qchar_new), 1);
   QDEF(cChar, "to_s",    RUBY_METHOD_FUNC(qchar_to_s), 0);
   QDEF(cChar, "to_str",  RUBY_METHOD_FUNC(qchar_to_s), 0);
   QDEF(cChar, "unicode", RUBY_METHOD_FUNC(qchar_unicode), 0);
@@ -5347,6 +6067,7 @@ extern "C" void Init_qt6(void) {
   rb_define_attr(cKeyEventCls, "key", 1, 0);
   rb_define_attr(cKeyEventCls, "text", 1, 0);
   rb_define_attr(cKeyEventCls, "modifiers", 1, 0);
+  QDEF(cKeyEventCls, "initialize", RUBY_METHOD_FUNC(keyevent_init), -1);
 
   cMouseEventCls = rb_define_class_under(mQt, "MouseEvent", cEventCls);
   rb_define_attr(cMouseEventCls, "x", 1, 0);
@@ -5389,14 +6110,14 @@ extern "C" void Init_qt6(void) {
   QDEF(cStyleK, "standardIcon", RUBY_METHOD_FUNC(style_standard_icon), 1);
   QDEF(cStyleK, "drawControl",  RUBY_METHOD_FUNC(style_draw_control), 3);
   cStyleOptionButtonKlass = rb_define_class_under(mQt, "StyleOptionButton", rb_cObject);
-  rb_define_singleton_method(cStyleOptionButtonKlass, "new", RUBY_METHOD_FUNC(sob_new), -1);
+  QCDEF(cStyleOptionButtonKlass, "new", RUBY_METHOD_FUNC(sob_new), -1);
   QDEF(cStyleOptionButtonKlass, "rect",    RUBY_METHOD_FUNC(sob_rect), 0);
   QDEF(cStyleOptionButtonKlass, "rect=",   RUBY_METHOD_FUNC(sob_set_rect), 1);
   QDEF(cStyleOptionButtonKlass, "text=",   RUBY_METHOD_FUNC(sob_set_text), 1);
   QDEF(cStyleOptionButtonKlass, "dispose", RUBY_METHOD_FUNC(value_dispose_noop), 0);
   VALUE cSOVI = rb_define_class_under(mQt, "StyleOptionViewItem", rb_cObject);
   cStyleOptionViewItemKlass = cSOVI;
-  rb_define_singleton_method(cSOVI, "new", RUBY_METHOD_FUNC(sovi_new), -1);
+  QCDEF(cSOVI, "new", RUBY_METHOD_FUNC(sovi_new), -1);
   QDEF(cSOVI, "rect",      RUBY_METHOD_FUNC(sovi_rect), 0);
   QDEF(cSOVI, "rect=",     RUBY_METHOD_FUNC(sovi_set_rect), 1);
   QDEF(cSOVI, "text",      RUBY_METHOD_FUNC(sovi_text), 0);
@@ -5413,7 +6134,9 @@ extern "C" void Init_qt6(void) {
 #define DEF_GRAD(n) rb_define_const(cGradient, #n, INT2NUM((int)QGradient::n))
   DEF_GRAD(LogicalMode); DEF_GRAD(StretchToDeviceMode); DEF_GRAD(ObjectBoundingMode);
 #undef DEF_GRAD
-  rb_define_class_under(mQt, "RadialGradient", rb_cObject);
+  cRadialGradient = rb_define_class_under(mQt, "RadialGradient", rb_cObject);
+  QCDEF(cRadialGradient, "new", RUBY_METHOD_FUNC(radgrad_new), -1);
+  QDEF(cRadialGradient, "setColorAt", RUBY_METHOD_FUNC(radgrad_set_color_at), 2);
   rb_define_class_under(mQt, "ListWidgetItem", rb_cObject);
   // QSound was removed in Qt6 (QSoundEffect replaces it); COSMOS only plays
   // optional notification sounds, so a no-op keeps those call sites alive.
@@ -5433,10 +6156,10 @@ extern "C" void Init_qt6(void) {
 
   cUrl = rb_define_class_under(mQt, "Url", rb_cObject);
   QDEF(cUrl, "toLocalFile", RUBY_METHOD_FUNC(url_to_local_file), 0);
-  rb_define_singleton_method(cUrl, "new", RUBY_METHOD_FUNC(url_new), 1);
+  QCDEF(cUrl, "new", RUBY_METHOD_FUNC(url_new), 1);
   QDEF(cUrl, "toString", RUBY_METHOD_FUNC(url_to_s), 0);
   VALUE cDesktopServices = rb_define_class_under(mQt, "DesktopServices", rb_cObject);
-  rb_define_singleton_method(cDesktopServices, "openUrl", RUBY_METHOD_FUNC(desktop_open_url), 1);
+  QCDEF(cDesktopServices, "openUrl", RUBY_METHOD_FUNC(desktop_open_url), 1);
 
   // ---- remaining enum constants ------------------------------------------
   rb_define_const(mQt, "Key_F",  INT2NUM((int)Qt::Key_F));
@@ -5480,7 +6203,7 @@ extern "C" void Init_qt6(void) {
 
   // Qt::TextCursor gets real behaviour (it was constants-only)
   cTextCursorKlass = cTextCursor;
-  rb_define_singleton_method(cTextCursor, "new", RUBY_METHOD_FUNC(tc_new), -1);
+  QCDEF(cTextCursor, "new", RUBY_METHOD_FUNC(tc_new), -1);
   QDEF(cTextCursor, "movePosition", RUBY_METHOD_FUNC(tc_move_position), -1);
   QDEF(cTextCursor, "insertText",   RUBY_METHOD_FUNC(tc_insert_text), 1);
   QDEF(cTextCursor, "setPosition",  RUBY_METHOD_FUNC(tc_set_position), -1);
@@ -5492,6 +6215,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cTextCursor, "selectionStart",     RUBY_METHOD_FUNC(tc_selection_start), 0);
   QDEF(cTextCursor, "selectionEnd",       RUBY_METHOD_FUNC(tc_selection_end), 0);
   QDEF(cTextCursor, "selectedText",       RUBY_METHOD_FUNC(tc_selection_text), 0);
+  QDEF(cTextCursor, "__selection_plain_text", RUBY_METHOD_FUNC(tc_selection_plain_text), 0);
   QDEF(cTextCursor, "atBlockStart",       RUBY_METHOD_FUNC(tc_at_block_start), 0);
   QDEF(cTextCursor, "atBlockEnd",         RUBY_METHOD_FUNC(tc_at_block_end), 0);
   QDEF(cTextCursor, "deletePreviousChar", RUBY_METHOD_FUNC(tc_delete_prev_char), 0);
@@ -5591,8 +6315,9 @@ extern "C" void Init_qt6(void) {
   QDEF(cCompleter,   "setCompletionPrefix", RUBY_METHOD_FUNC(completer_set_prefix), 1);
   QDEF(cPainter,     "drawPolygon",      RUBY_METHOD_FUNC(painter_draw_polygon), 1);
 
-  // QKeySequence standard keys (Qt::KeySequence::New etc.)
-#define DEF_SK(n) rb_define_const(cKeySequence, #n, INT2NUM((int)QKeySequence::n))
+  // QKeySequence standard keys (Qt::KeySequence::New etc.); see keyseq_new.
+  cStandardKey = typed_enum_class(cKeySequence, "StandardKey", "Qt::KeySequence::");
+#define DEF_SK(n) rb_define_const(cKeySequence, #n, standard_key((int)QKeySequence::n, #n))
   DEF_SK(New); DEF_SK(Open); DEF_SK(Save); DEF_SK(SaveAs); DEF_SK(Close);
   DEF_SK(Quit); DEF_SK(Cut); DEF_SK(Copy); DEF_SK(Paste); DEF_SK(Undo);
   DEF_SK(Redo); DEF_SK(Find); DEF_SK(FindNext); DEF_SK(SelectAll); DEF_SK(Delete);
@@ -5667,9 +6392,9 @@ extern "C" void Init_qt6(void) {
   rb_define_const(cCalendarWidget, "NoHorizontalHeader",
                   INT2NUM((int)QCalendarWidget::NoHorizontalHeader));
 
-  rb_define_singleton_method(cPixmap, "fromImage",  RUBY_METHOD_FUNC(pixmap_from_image), 1);
-  rb_define_singleton_method(cPixmap, "grabWidget", RUBY_METHOD_FUNC(pixmap_grab_widget), -1);
-  rb_define_singleton_method(cApplication, "startDragDistance",
+  QCDEF(cPixmap, "fromImage",  RUBY_METHOD_FUNC(pixmap_from_image), 1);
+  QCDEF(cPixmap, "grabWidget", RUBY_METHOD_FUNC(pixmap_grab_widget), -1);
+  QCDEF(cApplication, "startDragDistance",
                              RUBY_METHOD_FUNC(app_start_drag_distance), 0);
 
   // ---- Qt class name -> Ruby class (for findChildren typing) -------------
@@ -5677,6 +6402,21 @@ extern "C" void Init_qt6(void) {
   register_qt_class("QFrame", cFrame);
   register_qt_class("QLabel", cLabel);
   register_qt_class("QAbstractButton", cAbstractButton);
+  // Completer#popup's QListView, and any other bare item view Qt hands back.
+  register_qt_class("QAbstractItemView", cAbstractItemView);
+  // The static MessageBox.critical/warning/... boxes are built in C++; found
+  // through topLevelWidgets they came back as a bare Qt::Dialog.
+  register_qt_class("QMessageBox", cMessageBox);
+  // A QMessageBox's own button box, found with findChildren (script
+  // vertical_message_box and combo_box, script_module_gui.rb:207/268).
+  register_qt_class("QDialogButtonBox", cDialogButtonBox);
+  register_qt_class("QLayout", cLayout);
+  register_qt_class("QBoxLayout", cBoxLayout);
+  register_qt_class("QVBoxLayout", cVBoxLayout);
+  register_qt_class("QHBoxLayout", cHBoxLayout);
+  register_qt_class("QGridLayout", cGridLayout);
+  register_qt_class("QFormLayout", cFormLayout);
+  register_qt_class("QStackedLayout", cStackedLayout);
   register_qt_class("QPushButton", cPushButton);
   register_qt_class("QCheckBox", cCheckBox);
   register_qt_class("QRadioButton", cRadioButton);

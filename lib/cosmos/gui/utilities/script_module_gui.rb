@@ -264,8 +264,13 @@ module Cosmos
           font_family = font.family unless font_family
           box.setStyleSheet("QMessageBox { background-color: #{background_color}; }\
                              QMessageBox QLabel { color: #{text_color}; font: #{font_size}pt '#{font_family}'}")
-          # Change the layout of the buttons to vertical if necessary
-          box.layout.itemAt(2).widget.setOrientation(Qt::Vertical) if vertical
+          # Change the layout of the buttons to vertical if necessary. Qt 4
+          # kept the button box at layout index 2; in Qt 6 that is a label,
+          # so find the button box by type.
+          if vertical
+            button_box = box.findChildren.find { |child| child.is_a?(Qt::DialogButtonBox) }
+            button_box.setOrientation(Qt::Vertical) if button_box
+          end
           box.exec()
           result = box.clickedButton.text
           if result == "Cancel"

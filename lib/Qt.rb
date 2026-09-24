@@ -12,7 +12,7 @@ rescue LoadError => e
     COSMOS GUI tools need Qt 6. Install it and rebuild:
       macOS:  brew install qt
       Linux:  install the Qt6 base/widgets/opengl development packages
-    then:     rake build_extensions
+    then:     rake build
 
     (original error: #{e.message})
   MSG
@@ -133,6 +133,60 @@ module Qt
   class Base
     extend RubySignals
 
+    # The C++ side caches, per object, which forwarded virtuals (paintEvent,
+    # closeEvent, ...) Ruby overrides, so an event nothing overrides skips the
+    # GVL (RubyOverrides, rubywidget.h). Anything that can add or remove an
+    # override clears every cached answer; each runs after the change is made.
+    class << self
+      def method_added(name)
+        super
+        Qt.__overrides_changed
+      end
+
+      def method_removed(name)
+        super
+        Qt.__overrides_changed
+      end
+
+      def method_undefined(name)
+        super
+        Qt.__overrides_changed
+      end
+
+      def include(*mods)
+        result = super
+        Qt.__overrides_changed
+        result
+      end
+
+      def prepend(*mods)
+        result = super
+        Qt.__overrides_changed
+        result
+      end
+    end
+
+    def singleton_method_added(name)
+      super
+      Qt.__overrides_changed
+    end
+
+    def singleton_method_removed(name)
+      super
+      Qt.__overrides_changed
+    end
+
+    def singleton_method_undefined(name)
+      super
+      Qt.__overrides_changed
+    end
+
+    def extend(*mods)
+      result = super
+      Qt.__overrides_changed
+      result
+    end
+
     def __ruby_signal_handlers(name)
       @__ruby_signal_handlers ||= Hash.new { |h, k| h[k] = [] }
       @__ruby_signal_handlers[Qt.__sig(name)]
@@ -143,18 +197,23 @@ module Qt
     end
   end
 
-  # qtbindings' helper for running GUI work from a background thread. COSMOS
-  # calls it as execute_in_main_thread(blocking = true, delay = 0, boost = false).
-  # Touching Qt widgets off the GUI thread is undefined behaviour, so anything
-  # not already on the main thread is posted to the main event loop.
-  def self.execute_in_main_thread(blocking = true, delay = 0, _priority_boost = false, &block)
+  # qtbindings' helper for running GUI work from a background thread, with its
+  # signature (qtbindings 4.8.6.5, lib/Qt4.rb:101):
+  #   execute_in_main_thread(blocking = true, sleep_period = 0.001, delay_execution = false)
+  # sleep_period was qtbindings' poll interval while blocking; the condition
+  # variable below waits instead, so it is accepted and ignored. Reading it as
+  # a delay deferred script_module_gui.rb:74's (true, 0.05) on the GUI thread,
+  # so every prompt called there returned nil. Touching Qt widgets off the GUI
+  # thread is undefined behaviour, so anything not already on the main thread
+  # is posted to the main event loop.
+  def self.execute_in_main_thread(blocking = true, _sleep_period = 0.001, delay_execution = false, &block)
     if on_main_thread?
-      # A non-zero delay is COSMOS's "run this after the current call frame
+      # delay_execution is COSMOS's "run this after the current call frame
       # unwinds" idiom, always paired with blocking=false. packet_viewer.rb:366
       # sets a shutdown flag and re-invokes itself through here; running the
       # block inline re-enters before the flag can take effect and recurses
       # until SystemStackError. Defer through the event loop instead.
-      return Qt.single_shot((delay * 1000).round) { block.call } if delay.to_f > 0
+      return Qt.single_shot(0) { block.call } if delay_execution
       return block.call
     end
 
@@ -171,6 +230,13 @@ module Qt
         if ENV['COSMOS_QT6_DEBUG']
           File.open(ENV['COSMOS_QT6_DEBUG'], 'a') { |f| f.puts "EIMT ERROR #{e.class}: #{e.message}"; f.puts e.backtrace.reject { |b| b.include?('Qt.rb') }.first(4) }
         end
+        # exit, Interrupt (Ctrl-C landing in this block) and SignalException
+        # must end the app, not only the waiting thread -- or nobody, for a
+        # non-blocking post. Re-raised here on the GUI thread, the binding
+        # ends every event loop and re-raises it from exec. A non-blocking
+        # post has no caller to hand any other error to, so re-raise that too
+        # and the binding reports it.
+        raise if e.is_a?(SystemExit) || e.is_a?(SignalException) || !blocking
       ensure
         mutex.synchronize { done = true; cond.signal }
       end
@@ -300,8 +366,9 @@ module Qt
 
   # QTextCursor#selection returns a QTextDocumentFragment. COSMOS only ever
   # calls toPlainText on it (qt.rb:530) and reads .format/.cursor off a
-  # details object, so a thin wrapper over selectedText is enough rather than
-  # binding a whole fragment class.
+  # details object, so a thin wrapper is enough rather than binding a whole
+  # fragment class. Its text is the fragment's toPlainText (newlines), not
+  # selectedText (U+2029 between blocks).
   class SelectionFragment
     attr_accessor :format, :cursor
     def initialize(text); @text = text; end
@@ -311,7 +378,7 @@ module Qt
 
   class TextCursor
     def selection
-      SelectionFragment.new(selectedText)
+      SelectionFragment.new(__selection_plain_text)
     end
   end
 
@@ -344,6 +411,18 @@ module Qt
       Qt.connect_raw(sender, name) { |*a| handler.call(*a) }
     rescue ArgumentError => e
       raise unless e.message.include?('no such signal')
+      # Only a signal the sender's class (or an ancestor) declared with
+      # `signals` lives in the Ruby registry. Filing any other name there
+      # connected a misspelt signal silently, never to fire; Qt warns and
+      # returns false, which qtbindings passed through.
+      key = Qt.__sig(name)
+      declared = sender.class.ancestors.any? do |k|
+        k.respond_to?(:qt_signals) && k.qt_signals.any? { |s| Qt.__sig(s) == key }
+      end
+      unless declared
+        warn "QObject::connect: No such signal #{sender.class.name}::#{name}"
+        return false
+      end
       sender.__ruby_signal_handlers(name) << handler   # Ruby-declared signal
       true
     end

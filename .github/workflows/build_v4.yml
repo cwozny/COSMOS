@@ -41,6 +41,8 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
       CI: 1
+      # A missing Qt6 or moc fails the build instead of stubbing it out.
+      COSMOS_QT6_REQUIRED: 1
     steps:
       - uses: actions/checkout@v2
       - uses: ruby/setup-ruby@v1
