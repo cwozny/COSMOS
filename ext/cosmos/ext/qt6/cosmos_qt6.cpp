@@ -122,6 +122,9 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <cxxabi.h>
+#include <cstdlib>
+#include <typeinfo>
 #include <set>
 #include <string>
 #include <vector>
@@ -232,9 +235,13 @@ static void qtwrap_free(void *p) {
 }
 static size_t qtwrap_size(const void *) { return sizeof(QtWrap); }
 
+// Every rb_data_type_t here leaves the end of its function struct to zero
+// initialization: Ruby 2.6 has reserved[2] there and 2.7 dcompact and
+// reserved[1], so 2.6's spelled-out { NULL, NULL } did not compile on 2.7,
+// which the gemspec's '~> 2.4' allows.
 static const rb_data_type_t qtwrap_type = {
   "Qt::Object",
-  { NULL, qtwrap_free, qtwrap_size, { NULL, NULL } },
+  { NULL, qtwrap_free, qtwrap_size },
   NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY
 };
 
@@ -369,7 +376,7 @@ static void pinned_mark(void *) {
 }
 static const rb_data_type_t pinned_root_type = {
   "Qt::PinnedWrappers",
-  { pinned_mark, NULL, NULL, { NULL, NULL } },
+  { pinned_mark, NULL, NULL },
   NULL, NULL, 0
 };
 
@@ -398,7 +405,7 @@ static void anchored_mark(void *) {
 }
 static const rb_data_type_t anchored_root_type = {
   "Qt::AnchoredBlocks",
-  { anchored_mark, NULL, NULL, { NULL, NULL } },
+  { anchored_mark, NULL, NULL },
   NULL, NULL, 0
 };
 // COSMOS telemetry is binary (ascii-8bit) and packet items routinely carry
@@ -860,11 +867,27 @@ static VALUE button_click(VALUE self) {
 template <typename T> static void val_free(void *p) { delete static_cast<T *>(p); }
 template <typename T> static size_t val_size(const void *) { return sizeof(T); }
 
+// The Ruby class a wrapped C++ type is exposed as ("QSize" -> "Qt::Size"),
+// for TypeError messages: every value type was "Qt::Value" and every item
+// type "Qt::Item", so they read "wrong argument type Qt::Value (expected
+// Qt::Value)".
+template <typename T> static const char *ruby_type_name() {
+  static const std::string name = [] {
+    int status = 0;
+    char *demangled = abi::__cxa_demangle(typeid(T).name(), NULL, NULL, &status);
+    std::string n = (status == 0 && demangled) ? demangled : typeid(T).name();
+    free(demangled);
+    if (n.size() > 1 && n[0] == 'Q') n = "Qt::" + n.substr(1);
+    return n;
+  }();
+  return name.c_str();
+}
+
 template <typename T> static const rb_data_type_t &val_type() {
   // One static per instantiation, so TypedData type-checking stays sound.
   static const rb_data_type_t t = {
-    "Qt::Value",
-    { NULL, val_free<T>, val_size<T>, { NULL, NULL } },
+    ruby_type_name<T>(),
+    { NULL, val_free<T>, val_size<T> },
     NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY
   };
   return t;
@@ -1138,7 +1161,7 @@ static VALUE core_set_app_name(VALUE self, VALUE v) {
 // ---------------------------------------------------------------------------
 template <typename T> static const rb_data_type_t &ptr_type() {
   static const rb_data_type_t t = {
-    "Qt::Item", { NULL, NULL, NULL, { NULL, NULL } }, NULL, NULL, 0
+    ruby_type_name<T>(), { NULL, NULL, NULL }, NULL, NULL, 0
   };
   return t;   // dfree == NULL: the owning widget frees it, not Ruby
 }
@@ -3359,7 +3382,7 @@ static void painter_free(void *v) {
 static size_t painter_size(const void *) { return sizeof(PainterWrap); }
 static const rb_data_type_t painter_type = {
   "Qt::Painter",
-  { NULL, painter_free, painter_size, { NULL, NULL } },
+  { NULL, painter_free, painter_size },
   NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY
 };
 

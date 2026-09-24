@@ -2906,6 +2906,25 @@ chk('a modal exec after exec_for still runs until its dialog closes') do
   ms >= 100 || raise("exec returned after #{ms} ms")
 end
 
+puts "\n90. The wrong value or item type raised 'wrong argument type Qt::Value"
+puts "    (expected Qt::Value)'"
+puts "   (every value type shared one Ruby data type name, and every item"
+puts "    type another, so the TypeError could not say which was which)"
+def f90_type_error
+  yield
+  raise 'no TypeError'
+rescue TypeError => e
+  e.message
+end
+chk('a value of the wrong type names both types') do
+  (m = f90_type_error { Qt::Widget.new.resize(Qt::Point.new(1, 2)) }) ==
+    'wrong argument type Qt::Point (expected Qt::Size)' || raise(m)
+end
+chk('an item of the wrong type names both types') do
+  (m = f90_type_error { Qt::TreeWidget.new.addTopLevelItem(Qt::ListWidgetItem.new('x')) }) ==
+    'wrong argument type Qt::ListWidgetItem (expected Qt::TreeWidgetItem)' || raise(m)
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'
