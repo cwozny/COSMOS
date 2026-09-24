@@ -438,9 +438,17 @@ static VALUE app_exec(VALUE self) {
 // Runs the Qt event loop for `ms` with the GVL RELEASED, so Ruby's other
 // threads keep being scheduled. Any Ruby callback fired from inside the loop
 // re-acquires the GVL first (see RubyCallback::invoke).
+// Runs events for ms milliseconds. A local loop: ending QApplication::exec
+// with QCoreApplication::quit closes every top-level window in Qt 6, which
+// took the suites' windows down between checks. A pending exit still ends
+// it (QCoreApplication::exit ends every loop on the thread).
 static VALUE app_exec_for(VALUE self, VALUE ms) {
-  QTimer::singleShot(NUM2INT(ms), qApp, &QCoreApplication::quit);
-  ruby_without_gvl([] { QApplication::exec(); });
+  const int msec = NUM2INT(ms);
+  ruby_without_gvl([msec] {
+    QEventLoop loop;
+    QTimer::singleShot(msec, &loop, &QEventLoop::quit);
+    loop.exec();
+  });
   ruby_raise_pending_exit();
   return Qnil;
 }
@@ -1775,19 +1783,25 @@ static VALUE image_new(int argc, VALUE *argv, VALUE klass) {
 static VALUE image_width(VALUE self)  { return INT2NUM(get_val<QImage>(self)->width()); }
 static VALUE image_height(VALUE self) { return INT2NUM(get_val<QImage>(self)->height()); }
 
+// (organization, application) as COSMOS makes them, and qtbindings'
+// (file, format), which lets the suites use a file of their own.
 static VALUE settings_init(int argc, VALUE *argv, VALUE self) {
   if (get_wrap(self)->ptr) return self;
   VALUE org, app2; rb_scan_args(argc, argv, "02", &org, &app2);
-  QSettings *st = (NIL_P(org) || NIL_P(app2))
-      ? new QSettings() : new QSettings(rb_to_qs(org), rb_to_qs(app2));
+  QSettings *st;
+  if (NIL_P(org) || NIL_P(app2))  st = new QSettings();
+  else if (RB_INTEGER_TYPE_P(app2)) st = new QSettings(rb_to_qs(org), (QSettings::Format)NUM2INT(app2));
+  else                            st = new QSettings(rb_to_qs(org), rb_to_qs(app2));
   attach(self, st, true);
   return self;
 }
+// Takes whatever Qt::Variant.new takes. It was registered twice, and both
+// versions turned anything but an Integer, Size, Point or Variant into a
+// String with rb_to_qs: a Float or a boolean raised TypeError.
 static VALUE settings_set_value(VALUE self, VALUE k, VALUE v) {
-  QSettings *st = qcast<QSettings>(self);
-  if (rb_obj_is_kind_of(v, cVariant)) st->setValue(rb_to_qs(k), *get_val<QVariant>(v));
-  else if (RB_TYPE_P(v, T_FIXNUM))    st->setValue(rb_to_qs(k), NUM2INT(v));
-  else                                 st->setValue(rb_to_qs(k), rb_to_qs(v));
+  QVariant var;
+  if (!variant_arg(v, &var)) var = *get_val<QVariant>(variant_new(1, &v, cVariant));
+  qcast<QSettings>(self)->setValue(rb_to_qs(k), var);
   return self;
 }
 static VALUE settings_value(VALUE self, VALUE k) {
@@ -3293,15 +3307,6 @@ static VALUE variant_to_point(VALUE self) {
 static VALUE settings_contains(VALUE self, VALUE k) {
   return qcast<QSettings>(self)->contains(rb_to_qs(k)) ? Qtrue : Qfalse;
 }
-static VALUE settings_set_value_variant(VALUE self, VALUE k, VALUE v) {
-  QSettings *st = qcast<QSettings>(self);
-  if (rb_obj_is_kind_of(v, cSize))       st->setValue(rb_to_qs(k), *get_val<QSize>(v));
-  else if (rb_obj_is_kind_of(v, cPoint)) st->setValue(rb_to_qs(k), *get_val<QPoint>(v));
-  else if (rb_obj_is_kind_of(v, cVariant)) st->setValue(rb_to_qs(k), *get_val<QVariant>(v));
-  else if (RB_TYPE_P(v, T_FIXNUM))       st->setValue(rb_to_qs(k), NUM2INT(v));
-  else                                    st->setValue(rb_to_qs(k), rb_to_qs(v));
-  return self;
-}
 
 // ---- resize/move accepting value types -------------------------------------
 static VALUE widget_resize_v(int argc, VALUE *argv, VALUE self) {
@@ -4149,9 +4154,6 @@ static VALUE tc_at_start(VALUE self)        { return get_val<QTextCursor>(self)-
 static VALUE tc_block_text(VALUE self) {
   return rb_str_new2(get_val<QTextCursor>(self)->block().text().toUtf8().constData());
 }
-static VALUE tc_selected_text(VALUE self)  {
-  return rb_str_new2(get_val<QTextCursor>(self)->selectedText().toUtf8().constData());
-}
 static VALUE tc_select(VALUE self, VALUE sel) {
   get_val<QTextCursor>(self)->select((QTextCursor::SelectionType)NUM2INT(sel)); return self;
 }
@@ -4766,7 +4768,7 @@ static VALUE model_set_data(int argc, VALUE *argv, VALUE self) {
   VALUE idx, value, role;
   rb_scan_args(argc, argv, "21", &idx, &value, &role);
   QVariant v;
-  if (!variant_arg(value, &v)) v = *get_val<QVariant>(variant_from_value(cVariant, value));
+  if (!variant_arg(value, &v)) v = *get_val<QVariant>(variant_new(1, &value, cVariant));
   return qcast<QAbstractItemModel>(self)->setData(
       *get_val<QModelIndex>(idx), v, NIL_P(role) ? (int)Qt::EditRole : NUM2INT(role)) ? Qtrue : Qfalse;
 }
@@ -5127,10 +5129,6 @@ static VALUE fm_line_spacing(VALUE self) {
 static VALUE layout_parent_widget(VALUE self) {
   return wrap_obj(cWidget, qcast<QLayout>(self)->parentWidget(), false);
 }
-static VALUE tabw_set_tab_icon(VALUE self, VALUE i, VALUE icon) {
-  qcast<QTabWidget>(self)->setTabIcon(NUM2INT(i), *get_val<QIcon>(icon));
-  return self;
-}
 
 // The C initialize goes in an included module, not on the class: COSMOS
 // reopens some of these classes with their own initialize and calls super.
@@ -5217,7 +5215,6 @@ extern "C" void Init_qt6(void) {
   QCDEF(cApplication, "quit",            RUBY_METHOD_FUNC(app_quit), 0);
   QCDEF(cApplication, "closeAllWindows", RUBY_METHOD_FUNC(app_close_all_windows), 0);
   QCDEF(cApplication, "processEvents",   RUBY_METHOD_FUNC(app_process_events_cls), 0);
-  QCDEF(cApplication, "processEvents",  RUBY_METHOD_FUNC(app_process_events_cls), 0);
   QCDEF(cApplication, "instance",       RUBY_METHOD_FUNC(app_instance), 0);
   QCDEF(cApplication, "desktop",        RUBY_METHOD_FUNC(app_desktop), 0);
   QDEF(cApplication, "desktop",  RUBY_METHOD_FUNC(app_desktop), 0);   // also as an instance method (script_runner.rb)
@@ -5809,7 +5806,6 @@ extern "C" void Init_qt6(void) {
 
   // ---- containers ------------------------------------------------------
   cTabWidget = rb_define_class_under(mQt, "TabWidget", cWidget);
-  QDEF(cTabWidget, "setTabIcon", RUBY_METHOD_FUNC(tabw_set_tab_icon), 2);
   register_ctor(cTabWidget, ctor_plain<QTabWidget>);
   QDEF(cTabWidget, "addTab",          RUBY_METHOD_FUNC(tab_add_tab), 2);
   QDEF(cTabWidget, "tabText",         RUBY_METHOD_FUNC(tab_text), 1);
@@ -5933,8 +5929,6 @@ extern "C" void Init_qt6(void) {
   // ---- text / timer ----------------------------------------------------
   cTextEdit = rb_define_class_under(mQt, "TextEdit", cAbstractScrollArea);
   register_ctor(cTextEdit, ctor_str<RubyForward<QTextEdit> >);
-  QDEF(cTextEdit, "setPlainText", RUBY_METHOD_FUNC((set_str<QTextEdit, &QTextEdit::setPlainText>)), 1);
-  QDEF(cTextEdit, "toPlainText",  RUBY_METHOD_FUNC((get_str<QTextEdit, &QTextEdit::toPlainText>)), 0);
   QDEF(cTextEdit, "currentCharFormat",    RUBY_METHOD_FUNC(edit_current_char_format), 0);
   QDEF(cTextEdit, "moveCursor",  RUBY_METHOD_FUNC(edit_move_cursor), -1);
   QDEF(cTextEdit, "cursorRect",  RUBY_METHOD_FUNC(edit_cursor_rect), 0);
@@ -6131,7 +6125,8 @@ extern "C" void Init_qt6(void) {
   QDEF(cSettings, "setValue", RUBY_METHOD_FUNC(settings_set_value), 2);
   QDEF(cSettings, "value",    RUBY_METHOD_FUNC(settings_value), 1);
   QDEF(cSettings, "contains", RUBY_METHOD_FUNC(settings_contains), 1);
-  QDEF(cSettings, "setValue", RUBY_METHOD_FUNC(settings_set_value_variant), 2);
+  rb_define_const(cSettings, "NativeFormat", INT2NUM((int)QSettings::NativeFormat));
+  rb_define_const(cSettings, "IniFormat",    INT2NUM((int)QSettings::IniFormat));
 
   cDesktopWidget = rb_define_class_under(mQt, "DesktopWidget", rb_cObject);
   QDEF(cDesktopWidget, "screen",         RUBY_METHOD_FUNC(desktop_self), 0);
@@ -6500,7 +6495,6 @@ extern "C" void Init_qt6(void) {
   QDEF(cTextCursor, "setPosition",  RUBY_METHOD_FUNC(tc_set_position), -1);
   QDEF(cTextCursor, "position",     RUBY_METHOD_FUNC(tc_position), 0);
   QDEF(cTextCursor, "blockNumber",  RUBY_METHOD_FUNC(tc_block_number), 0);
-  QDEF(cTextCursor, "selectedText",       RUBY_METHOD_FUNC(tc_selected_text), 0);
   QDEF(cTextCursor, "positionInBlock",    RUBY_METHOD_FUNC(tc_position_in_block), 0);
   QDEF(cTextCursor, "anchor",             RUBY_METHOD_FUNC(tc_anchor), 0);
   QDEF(cTextCursor, "selectionStart",     RUBY_METHOD_FUNC(tc_selection_start), 0);

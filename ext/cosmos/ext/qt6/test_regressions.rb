@@ -2865,6 +2865,47 @@ chk('a fixup that rewrites its argument is applied, and editing finishes') do
   (text == '100' && finished == 1) || raise("text #{text.inspect}, editingFinished x#{finished}")
 end
 
+puts "\n88. Settings#setValue raised TypeError for a Float or a boolean"
+puts "   (it was registered twice, the later one winning, and both turned"
+puts "    anything but an Integer, Size, Point or Variant into a String with"
+puts "    rb_to_qs; COSMOS itself always passes a Variant (qt_tool.rb:255))"
+chk('Settings#setValue takes a Float, a boolean and an Array, like Variant.new') do
+  file = File.join(Dir.tmpdir, "qt6_regressions_#{Process.pid}.ini")
+  begin
+    settings = Qt::Settings.new(file, Qt::Settings::IniFormat)
+    settings.setValue('scale', 2.5)
+    settings.setValue('on', true)
+    settings.setValue('names', %w[a b])
+    settings.setValue('count', 3)
+    got = %w[scale on names count].map { |k| settings.value(k).value }
+    got == [2.5, true, %w[a b], 3] || raise("read back #{got.inspect}")
+  ensure
+    FileUtils.rm_f(file)
+  end
+end
+
+puts "\n89. Qt::Application#exec_for closed every window"
+puts "   (it ended its loop with QCoreApplication::quit, which in Qt 6 closes"
+puts "    every top-level window first. COSMOS never calls it; these suites"
+puts "    do, between checks that expect their windows to stay as they were.)"
+chk('exec_for leaves top-level windows open') do
+  w = Qt::Widget.new
+  w.show
+  APP.exec_for(20)
+  visible = w.isVisible
+  w.hide
+  visible || raise('the window was closed')
+end
+chk('a modal exec after exec_for still runs until its dialog closes') do
+  APP.exec_for(20)
+  d = Qt::Dialog.new
+  Qt.single_shot(150) { d.accept }
+  t0 = Time.now
+  d.exec
+  ms = ((Time.now - t0) * 1000).round
+  ms >= 100 || raise("exec returned after #{ms} ms")
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'
