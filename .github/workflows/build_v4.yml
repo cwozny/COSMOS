@@ -49,9 +49,11 @@ jobs:
       COSMOS_QT6_REQUIRED: 1
       # On Windows, gems with C code (racc, io-console) build as C17: MSYS2's
       # GCC 16 defaults to C23, which rejects the Ruby 2.6 C API's VALUE (*)().
+      # ffi strips any -std= from CFLAGS, so -fpermissive also turns that
+      # error (and GCC 14's other new errors for old C) back into a warning.
       # mkmf reads CONFIGURE_ARGS in every extconf.rb, and $(cflags) keeps the
       # usual optimization and warning flags.
-      CONFIGURE_ARGS: "${{ matrix.os == 'windows-latest' && '--with-cflags=''$(cflags) -std=gnu17''' || '' }}"
+      CONFIGURE_ARGS: "${{ matrix.os == 'windows-latest' && '--with-cflags=''$(cflags) -std=gnu17 -fpermissive''' || '' }}"
     steps:
       - uses: actions/checkout@v2
       - name: Install the toolchain and Qt 6 (Windows)
