@@ -628,7 +628,9 @@ static QObject *ctor_slider(int argc, VALUE *argv) {
 // paints the palette's white text onto those white backgrounds, which is why
 // the Legal Agreement pane looks empty. Default to the light scheme COSMOS
 // was written against. COSMOS_QT_COLOR_SCHEME=dark|system opts out.
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
 static int g_color_scheme_requested = 0;   // see qt_color_scheme
+#endif
 static void apply_color_scheme() {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
   const char *want = getenv("COSMOS_QT_COLOR_SCHEME");
