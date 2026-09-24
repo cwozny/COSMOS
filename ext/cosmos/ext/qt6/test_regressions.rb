@@ -23,6 +23,12 @@ def chk(name)
   puts format('  %-52s %s', name, ok ? 'ok' : 'FAIL')
 end
 
+WINDOWS = RUBY_PLATFORM =~ /mingw|mswin/
+# A check this platform cannot run: reported, and not a failure.
+def skip_chk(name, why)
+  puts format('  %-52s skipped: %s', name, why)
+end
+
 APP = Qt::Application.new([])
 
 puts "\n1. Qt::MessageBox had no instance side"
@@ -1338,7 +1344,9 @@ def signal_idle_loop(kind, sig)
 end
 { 'TERM' => 'SignalException', 'INT' => 'Interrupt' }.each do |sig, error|
   %w[app dialog].each do |kind|
-    chk("SIG#{sig} ends an idle #{kind}.exec with #{error}") do
+    name = "SIG#{sig} ends an idle #{kind}.exec with #{error}"
+    next skip_chk(name, 'Windows has no POSIX signals between processes') if WINDOWS
+    chk(name) do
       exited, out = signal_idle_loop(kind, sig)
       (exited && out.include?("exec raised #{error}")) ||
         raise(exited ? "output #{out.lines.last.to_s.strip.inspect}" : 'still running 3 s after the signal')
@@ -1424,6 +1432,7 @@ end
   ['exit_in_async_post', nil] => 'exec raised SystemExit status=5',
   ['interrupt_in_blocking_post', nil] => 'exec raised Interrupt'
 }.each do |(kind, sig), expected|
+  next skip_chk("#{kind.tr('_', ' ')} ends app.exec", 'Windows has no POSIX signals between processes') if WINDOWS && sig
   chk("#{kind.tr('_', ' ')} ends app.exec") do
     out = exit_from_loop(kind, sig)
     out.include?(expected) || raise("got #{out.lines.map(&:strip).grep(/exec |STILL/).join(' | ').inspect}")
@@ -1437,6 +1446,10 @@ puts "    fallback failed, extconf.rb wrote the stub Makefile, and the build"
 puts "    'succeeded' with no GUI. Runs the real extconf.rb in a temporary copy"
 puts "    with the Linux branch forced and a stand-in pkg-config/moc laid out"
 puts "    like Qt 6's.)"
+if WINDOWS
+  skip_chk('extconf.rb finds moc in libexecdir and writes a real Makefile',
+           'the Linux branch is driven by POSIX shell stand-ins')
+else
 chk('extconf.rb finds moc in libexecdir and writes a real Makefile') do
   Dir.mktmpdir('qt6_extconf') do |dir|
     src = File.join(dir, 'src')
@@ -1466,6 +1479,7 @@ chk('extconf.rb finds moc in libexecdir and writes a real Makefile') do
       raise(out.lines.grep(/skipping|moc/).first.to_s.strip.then { |l| l.empty? ? 'no Makefile' : l })
   end
 end
+end   # WINDOWS
 
 puts "\n47. Qt::Completer#popup, #widget, #complete and #completionPrefix were unbound"
 puts "   (every keyPressEvent in the Ruby editors and CmdSender's history asks"
@@ -1894,9 +1908,14 @@ def extconf_without_qt(required)
     bin = File.join(dir, 'bin')
     Dir.mkdir(bin)
     FileUtils.cp(File.join(__dir__, 'extconf.rb'), dir)
-    File.write(File.join(bin, 'pkg-config'), "#!/bin/sh\nexit 1\n")   # no Qt6 modules
-    FileUtils.chmod(0755, File.join(bin, 'pkg-config'))
-    env = { 'PATH' => "#{bin}:#{ENV['PATH']}", 'COSMOS_QT6_REQUIRED' => required ? '1' : nil }
+    if WINDOWS   # a stand-in that finds no Qt6 modules
+      File.write(File.join(bin, 'pkg-config.bat'), "@exit /b 1\r\n")
+    else
+      File.write(File.join(bin, 'pkg-config'), "#!/bin/sh\nexit 1\n")
+      FileUtils.chmod(0755, File.join(bin, 'pkg-config'))
+    end
+    env = { 'PATH' => [bin, ENV['PATH']].join(File::PATH_SEPARATOR),
+            'COSMOS_QT6_REQUIRED' => required ? '1' : nil }
     force_linux = "Object.send(:remove_const, :RUBY_PLATFORM); RUBY_PLATFORM = 'x86_64-linux'.freeze; load 'extconf.rb'"
     IO.popen(env, [RbConfig.ruby, '-e', force_linux, chdir: dir, err: [:child, :out]], &:read)
     stub = File.exist?(File.join(dir, 'Makefile')) && File.read(File.join(dir, 'Makefile')).include?('qt6 extension skipped')
@@ -2018,7 +2037,8 @@ def scan_fixture
         end
       end
     RUBY
-    `QT6_SCAN_ROOT=#{root.inspect} #{RbConfig.ruby.inspect} -rset #{File.join(__dir__, 'scan_unbound.rb').inspect} 2>&1`
+    IO.popen({ 'QT6_SCAN_ROOT' => root }, [RbConfig.ruby, '-rset', File.join(__dir__, 'scan_unbound.rb')],
+             err: [:child, :out], &:read)
   end
 end
 fixture_scan = scan_fixture
@@ -2427,7 +2447,8 @@ puts "   (lib/Qt.rb told the user to run 'rake build_extensions'; the task is"
 puts "    'rake build'.)"
 chk('the LoadError message names a rake task the Rakefile defines') do
   named = File.read(File.join(ROOT, 'lib', 'Qt.rb'))[/then:\s+rake (\S+)/, 1]
-  tasks = Dir.chdir(ROOT) { `#{RbConfig.ruby.inspect} -S rake -P 2>/dev/null` }.lines.grep(/^rake /).map { |l| l.split[1] }
+  tasks = IO.popen([RbConfig.ruby, '-S', 'rake', '-P'], chdir: ROOT, err: File::NULL, &:read)
+            .lines.grep(/^rake /).map { |l| l.split[1] }
   (named && tasks.include?(named)) || raise("the message names #{named.inspect}")
 end
 

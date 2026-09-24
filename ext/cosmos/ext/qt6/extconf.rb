@@ -26,6 +26,15 @@ def write_stub_makefile(reason)
   exit 0
 end
 
+# pkg-config's output, or '' when it or the module is missing. No shell:
+# cmd.exe cannot redirect to /dev/null, and with `2>/dev/null` every query on
+# Windows came back empty, so Qt6 was never found there.
+def pkg_config(*args)
+  IO.popen(['pkg-config', *args], err: File::NULL, &:read).to_s.chomp
+rescue SystemCallError
+  ''
+end
+
 # Returns [include_flags, link_flags, moc_path] or nil.
 def locate_qt6
   if RUBY_PLATFORM =~ /darwin/
@@ -42,19 +51,22 @@ def locate_qt6
            " -framework QtOpenGL -framework QtOpenGLWidgets"
     [inc, link, moc]
   else
-    mods = 'Qt6Core Qt6Gui Qt6Widgets Qt6OpenGL Qt6OpenGLWidgets'
-    inc  = `pkg-config --cflags #{mods} 2>/dev/null`.chomp
-    link = `pkg-config --libs   #{mods} 2>/dev/null`.chomp
+    # Linux, and Windows with Qt 6 from MSYS2 (pacman mingw-w64-x86_64-qt6-base).
+    mods = %w[Qt6Core Qt6Gui Qt6Widgets Qt6OpenGL Qt6OpenGLWidgets]
+    inc  = pkg_config('--cflags', *mods)
+    link = pkg_config('--libs', *mods)
     return nil if inc.empty? || link.empty?
     # Qt 6's .pc files have no host_bins (Qt 5's did): moc is in libexecdir,
     # e.g. /usr/lib/qt6/libexec/moc on Ubuntu 24.04, and not on PATH. Looking
     # only at host_bins fell back to a bare `moc`, which failed, so the build
     # wrote the stub Makefile and "succeeded" with no GUI.
+    # On Windows it is moc.exe (MSYS2: mingw64/share/qt6/bin).
+    moc_name = "moc#{RbConfig::CONFIG['EXEEXT']}"
     moc = %w[libexecdir host_libexecs host_bins bindir].map do |var|
-      dir = `pkg-config --variable=#{var} Qt6Core 2>/dev/null`.chomp
-      File.join(dir, 'moc') unless dir.empty?
+      dir = pkg_config("--variable=#{var}", 'Qt6Core')
+      File.join(dir, moc_name) unless dir.empty?
     end.compact.find { |path| File.executable?(path) }
-    [" #{inc}", " #{link}", moc || 'moc']
+    [" #{inc}", " #{link}", moc || moc_name]
   end
 end
 
@@ -63,7 +75,10 @@ write_stub_makefile('Qt6 not found (brew --prefix qt / pkg-config Qt6Core)') unl
 inc, link, moc = found
 
 $INCFLAGS << inc
-$CXXFLAGS << ' -std=c++17 -Wno-register -Wno-unused-parameter'
+# gnu++17 on MinGW: strict c++17 defines __STRICT_ANSI__, which hides C
+# library functions Ruby's win32.h relies on.
+$CXXFLAGS << (RUBY_PLATFORM =~ /mingw/ ? ' -std=gnu++17' : ' -std=c++17')
+$CXXFLAGS << ' -Wno-register -Wno-unused-parameter'
 $LDFLAGS  << link
 
 # moc must run before create_makefile writes the file list. Regenerating on

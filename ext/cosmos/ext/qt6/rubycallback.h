@@ -8,7 +8,7 @@
 
 // moc cannot parse ruby.h, so hide it and give moc a stand-in for VALUE.
 #ifndef Q_MOC_RUN
-#  include <ruby.h>
+#  include "ruby_compat.h"
 #else
    typedef unsigned long VALUE;
 #endif

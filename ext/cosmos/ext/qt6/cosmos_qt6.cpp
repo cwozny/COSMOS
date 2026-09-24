@@ -128,7 +128,7 @@
 #include <atomic>
 #include <cstring>
 
-#include <ruby.h>
+#include "ruby_compat.h"   // ruby.h, safe next to Qt on Windows
 #include <ruby/thread.h>
 #include "rubycallback.h"
 #include "rubywidget.h"

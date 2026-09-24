@@ -38,9 +38,6 @@ jobs:
   # section 19. The -latest labels follow whatever versions GitHub moves them to.
   qt6:
     runs-on: ${{ matrix.os }}
-    # Windows has no Qt6 build path yet (S13 in the v4.5.2 review), so its job
-    # shows how far the build gets without failing the run.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,10 +49,21 @@ jobs:
       COSMOS_QT6_REQUIRED: 1
     steps:
       - uses: actions/checkout@v2
+      - name: Install the toolchain and Qt 6 (Windows)
+        if: runner.os == 'Windows'
+        # One MSYS2 for everything: Qt 6, the compiler that builds against it
+        # and the DLLs Ruby loads at run time. MINGW64 is the MSVCRT toolchain
+        # RubyInstaller 2.6 is built with, and RubyInstaller adds C:\msys64's
+        # mingw64\bin to its DLL search path at startup. This runs before
+        # setup-ruby, whose bundle install builds native gems with it.
+        run: C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed make mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "2.6"
           bundler-cache: true
+          # setup-ruby's own Windows toolchain is a second MSYS2 (GCC 14) in
+          # Ruby's directory, which RubyInstaller would find first.
+          windows-toolchain: ${{ runner.os == 'Windows' && 'none' || 'default' }}
       - name: Install Qt 6 (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -64,10 +72,6 @@ jobs:
       - name: Install Qt 6 (macOS)
         if: runner.os == 'macOS'
         run: brew install qt
-      - name: Install Qt 6 (Windows)
-        if: runner.os == 'Windows'
-        # MSYS2's MINGW64 packages: the toolchain RubyInstaller 2.6 builds with.
-        run: C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed mingw-w64-x86_64-qt6-base mingw-w64-x86_64-pkgconf
       - name: Build extensions
         run: bundle exec rake build
       - name: Unbound-method ratchet

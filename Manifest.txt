@@ -691,6 +691,7 @@ ext/cosmos/ext/polynomial_conversion/polynomial_conversion.c
 ext/cosmos/ext/qt6/.gitignore
 ext/cosmos/ext/qt6/cosmos_qt6.cpp
 ext/cosmos/ext/qt6/extconf.rb
+ext/cosmos/ext/qt6/ruby_compat.h
 ext/cosmos/ext/qt6/rubycallback.cpp
 ext/cosmos/ext/qt6/rubycallback.h
 ext/cosmos/ext/qt6/rubywidget.cpp

@@ -33,9 +33,14 @@ module Cosmos
       sleep(0.1)
     end
 
+    # display, clear and clear_all are also script API methods, private on
+    # every object, and JsonDRbObject forwards a private call through
+    # method_missing. rspec-mocks keeps a stubbed private method private, so
+    # stubbing display itself never took: the call went on to a real
+    # TlmViewer. The stubs are on the method_missing call instead.
     describe "display" do
       it "displays a telemetry viewer screen" do
-        allow_any_instance_of(JsonDRbObject).to receive(:display)
+        allow_any_instance_of(JsonDRbObject).to receive(:method_missing).with(:display, any_args)
         display("HI")
       end
 
@@ -48,14 +53,14 @@ module Cosmos
       end
 
       it "complains if the screen doesn't exist" do
-        allow_any_instance_of(JsonDRbObject).to receive(:display).and_raise(Errno::ENOENT)
+        allow_any_instance_of(JsonDRbObject).to receive(:method_missing).with(:display, any_args).and_raise(Errno::ENOENT)
         expect { display("HI") }.to raise_error(RuntimeError, /HI.txt does not exist/)
       end
     end
 
     describe "clear" do
       it "closes a telemetry viewer screen" do
-        allow_any_instance_of(JsonDRbObject).to receive(:clear)
+        allow_any_instance_of(JsonDRbObject).to receive(:method_missing).with(:clear, any_args)
         clear("HI")
       end
 
@@ -68,14 +73,14 @@ module Cosmos
       end
 
       it "complains if the screen doesn't exist" do
-        allow_any_instance_of(JsonDRbObject).to receive(:clear).and_raise(Errno::ENOENT)
+        allow_any_instance_of(JsonDRbObject).to receive(:method_missing).with(:clear, any_args).and_raise(Errno::ENOENT)
         expect { clear("HI") }.to raise_error(RuntimeError, /HI.txt does not exist/)
       end
     end
 
     describe "clear_all" do
       it "closes all telemetry viewer screens" do
-        allow_any_instance_of(JsonDRbObject).to receive(:clear_all)
+        allow_any_instance_of(JsonDRbObject).to receive(:method_missing).with(:clear_all, any_args)
         clear_all
       end
 
