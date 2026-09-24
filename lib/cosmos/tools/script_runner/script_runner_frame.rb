@@ -1193,7 +1193,9 @@ module Cosmos
           my_parent.statusBar.showMessage("")
           self.setPalette(Qt::Palette.new(Cosmos::DEFAULT_PALETTE))
         else
-          config_file = chooser.filename
+          # No chooser when not asking (ScriptRunner --disconnect): keep the
+          # config file given.
+          config_file = chooser.filename if chooser
           my_parent.statusBar.showMessage("Targets disconnected: #{targets.join(" ")}")
           self.setPalette(Qt::Palette.new(Cosmos::RED_PALETTE))
           Splash.execute(self) do |splash|

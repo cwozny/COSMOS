@@ -1452,6 +1452,25 @@ chk('FloatChooser clamps 7.5 to its maximum, 1.0') do
 end
 chooser_host.hide
 
+say "\n42. ScriptRunner --disconnect raised NoMethodError on nil"
+say "   (disconnect mode starts with toggle_disconnect(file, false)"
+say "    (script_runner.rb:83), which builds no file chooser but then reads"
+say "    chooser.filename once any target is checked (script_runner_frame.rb:"
+say "    1196). v4.5.2 has the same code.)"
+recorded = nil   # the section 1 frame's set_disconnected_targets stand-in
+on_dialog('Disconnect Settings') { |d| button(d, 'Ok').click }
+dc_error = begin
+  frame.toggle_disconnect(Cosmos::CmdTlmServer::DEFAULT_CONFIG_FILE, false)
+  nil
+rescue Exception => e
+  e
+end
+wait_for { recorded }
+chk('disconnecting without asking for a config file completes') { dc_error.nil? || raise(dc_error) }
+chk('it disconnects with the config file it was given') do
+  (recorded && recorded[2] == Cosmos::CmdTlmServer::DEFAULT_CONFIG_FILE) || raise("recorded #{recorded.inspect}")
+end
+
 say
 if $failures.empty?
   say 'ALL COSMOS TOOL CHECKS PASSED'
