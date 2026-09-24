@@ -697,11 +697,13 @@ ext/cosmos/ext/qt6/rubywidget.cpp
 ext/cosmos/ext/qt6/rubywidget.h
 ext/cosmos/ext/qt6/scan_unbound.rb
 ext/cosmos/ext/qt6/test_cosmos_integration.rb
+ext/cosmos/ext/qt6/test_cosmos_tools.rb
 ext/cosmos/ext/qt6/test_gvl_race.rb
 ext/cosmos/ext/qt6/test_nested_gvl.rb
 ext/cosmos/ext/qt6/test_paint_gvl.rb
 ext/cosmos/ext/qt6/test_qt6.rb
 ext/cosmos/ext/qt6/test_regressions.rb
+ext/cosmos/ext/qt6/tool_smoke.rb
 ext/cosmos/ext/qt6/ui_exerciser.rb
 ext/cosmos/ext/string/extconf.rb
 ext/cosmos/ext/string/string.c
