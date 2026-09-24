@@ -109,6 +109,14 @@ void RubyItemDelegate::paint(QPainter *p, const QStyleOptionViewItem &opt,
 }
 
 // ---- RubyGLWidget ----------------------------------------------------------
+QSize RubyGLWidget::sizeHint() const {
+  QSize s;
+  return ruby_size_hint(this, m_overrides, "sizeHint", &s) ? s : QOpenGLWidget::sizeHint();
+}
+QSize RubyGLWidget::minimumSizeHint() const {
+  QSize s;
+  return ruby_size_hint(this, m_overrides, "minimumSizeHint", &s) ? s : QOpenGLWidget::minimumSizeHint();
+}
 void RubyGLWidget::initializeGL() {
   if (!ruby_overrides(this, m_overrides, "initializeGL")) { QOpenGLWidget::initializeGL(); return; }
   bool handled = false;
@@ -249,6 +257,14 @@ static bool dispatch_dnd(QObject *self, RubyOverrides &ov, const char *method, i
   }
 
 // ---- RubyWidget ------------------------------------------------------------
+QSize RubyWidget::sizeHint() const {
+  QSize s;
+  return ruby_size_hint(this, m_overrides, "sizeHint", &s) ? s : QWidget::sizeHint();
+}
+QSize RubyWidget::minimumSizeHint() const {
+  QSize s;
+  return ruby_size_hint(this, m_overrides, "minimumSizeHint", &s) ? s : QWidget::minimumSizeHint();
+}
 FWD_PLAIN(RubyWidget, QWidget, resizeEvent,   RUBY_EV_RESIZE, QResizeEvent)
 FWD_PLAIN(RubyWidget, QWidget, leaveEvent,    RUBY_EV_LEAVE,  QEvent)
 FWD_PLAIN(RubyWidget, QWidget, focusInEvent,  RUBY_EV_FOCUS,  QFocusEvent)

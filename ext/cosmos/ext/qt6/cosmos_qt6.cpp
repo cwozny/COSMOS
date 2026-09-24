@@ -1838,21 +1838,40 @@ static VALUE cIntValidator, cDoubleValidator, cCompleter, cPainter, cRect, cPoin
 static VALUE cTextBlockKlass = Qnil;   // hoisted: used by the text-editing accessors above
 static VALUE cPolygon, cTextDocument, cTextCharFormat, cTextOption, cUrl, cDate;
 
+// The validators' Qt::Object arguments are the parent and the rest the
+// range: (parent), (bottom, top[, parent]), and for DoubleValidator
+// (bottom, top, decimals[, parent]). IntegerChooser and FloatChooser pass
+// their line edit (integer_chooser.rb:53), and their fixup overrides reach it
+// as parent(); taking the line edit as the bottom of the range left it nil.
+// A parented validator belongs to it.
+static QObject *validator_args(int argc, VALUE *argv, VALUE *nums, int max, int *n) {
+  QObject *parent = NULL;
+  *n = 0;
+  for (int i = 0; i < argc; i++) {
+    if (rb_obj_is_kind_of(argv[i], cQtBase)) parent = get_obj(argv[i]);
+    else if (!NIL_P(argv[i]) && *n < max) nums[(*n)++] = argv[i];
+  }
+  return parent;
+}
 static VALUE intval_init(int argc, VALUE *argv, VALUE self) {
   if (get_wrap(self)->ptr) return self;
-  VALUE lo, hi; rb_scan_args(argc, argv, "02", &lo, &hi);
-  QIntValidator *v = (NIL_P(lo) || NIL_P(hi))
-      ? new QIntValidator() : new QIntValidator(NUM2INT(lo), NUM2INT(hi));
-  attach(self, v, true);
+  VALUE nums[2]; int n;
+  QObject *parent = validator_args(argc, argv, nums, 2, &n);
+  QIntValidator *v = n == 2
+      ? new RubyValidator<QIntValidator>(NUM2INT(nums[0]), NUM2INT(nums[1]), parent)
+      : new RubyValidator<QIntValidator>(parent);
+  attach(self, v, !parent);
   return self;
 }
 static VALUE dblval_init(int argc, VALUE *argv, VALUE self) {
   if (get_wrap(self)->ptr) return self;
-  VALUE lo, hi, dec; rb_scan_args(argc, argv, "03", &lo, &hi, &dec);
-  QDoubleValidator *v = (NIL_P(lo) || NIL_P(hi))
-      ? new QDoubleValidator()
-      : new QDoubleValidator(NUM2DBL(lo), NUM2DBL(hi), NIL_P(dec) ? 2 : NUM2INT(dec));
-  attach(self, v, true);
+  VALUE nums[3]; int n;
+  QObject *parent = validator_args(argc, argv, nums, 3, &n);
+  QDoubleValidator *v = n >= 2
+      ? new RubyValidator<QDoubleValidator>(NUM2DBL(nums[0]), NUM2DBL(nums[1]),
+                                            n == 3 ? NUM2INT(nums[2]) : 2, parent)
+      : new RubyValidator<QDoubleValidator>(parent);
+  attach(self, v, !parent);
   return self;
 }
 static VALUE dblval_set_notation(VALUE self, VALUE n) {
@@ -1875,6 +1894,12 @@ static VALUE intval_set_bottom(VALUE self, VALUE v) {
 static VALUE intval_set_top(VALUE self, VALUE v) {
   qcast<QIntValidator>(self)->setTop(NUM2INT(v)); return self;
 }
+// The choosers' fixup overrides clamp to bottom() and top()
+// (integer_chooser.rb:19/22, float_chooser.rb:19/22).
+static VALUE intval_bottom(VALUE self) { return INT2NUM(qcast<QIntValidator>(self)->bottom()); }
+static VALUE intval_top(VALUE self)    { return INT2NUM(qcast<QIntValidator>(self)->top()); }
+static VALUE dblval_bottom(VALUE self) { return rb_float_new(qcast<QDoubleValidator>(self)->bottom()); }
+static VALUE dblval_top(VALUE self)    { return rb_float_new(qcast<QDoubleValidator>(self)->top()); }
 static VALUE intval_set_range(VALUE self, VALUE lo, VALUE hi) {
   qcast<QIntValidator>(self)->setRange(NUM2INT(lo), NUM2INT(hi)); return self;
 }
@@ -4619,6 +4644,7 @@ static const char *const kForwardedVirtuals[] = {
   "dragEnterEvent", "dragMoveEvent", "dropEvent", "reject",
   "initializeGL", "resizeGL", "paintGL",
   "createEditor", "setEditorData", "setModelData", "paint",
+  "sizeHint", "minimumSizeHint", "fixup",
 };
 static const int kForwardedCount = (int)(sizeof(kForwardedVirtuals) / sizeof(kForwardedVirtuals[0]));
 static std::atomic<unsigned long> g_override_epoch{1};   // caches start at 0
@@ -4676,6 +4702,43 @@ bool ruby_overrides(const QObject *obj, RubyOverrides &c, const char *method) {
   }
   return (c.mask.load(std::memory_order_relaxed) >> i) & 1u;
 }
+// The size hint being asked of Ruby. super from the override comes back
+// through Widget#sizeHint and the virtual; that call gets Qt's own.
+static thread_local const QObject *t_hint_obj = nullptr;
+static thread_local const char *t_hint_method = nullptr;
+bool ruby_size_hint(const QObject *obj, RubyOverrides &c, const char *method, QSize *out) {
+  if (t_hint_obj == obj && t_hint_method && !strcmp(t_hint_method, method)) return false;
+  if (!ruby_overrides(obj, c, method)) return false;
+  bool ok = false;
+  ruby_with_gvl([&] {
+    const QObject *saved_obj = t_hint_obj;
+    const char *saved_method = t_hint_method;
+    t_hint_obj = obj;
+    t_hint_method = method;
+    bool handled = false;
+    VALUE r = ruby_event_call(const_cast<QObject *>(obj), method, 0, NULL, &handled);
+    t_hint_obj = saved_obj;
+    t_hint_method = saved_method;
+    if (handled && rb_obj_is_kind_of(r, cSize)) {
+      *out = *get_val<QSize>(r);
+      ok = true;
+    }
+  });
+  return ok;
+}
+// The override gets the entry as a String and may rewrite it in place, which
+// is Qt's contract for fixup; COSMOS's instead set the line edit's text.
+bool ruby_fixup(const QObject *obj, RubyOverrides &c, QString &input) {
+  if (!ruby_overrides(obj, c, "fixup")) return false;
+  bool handled = false;
+  ruby_with_gvl([&] {
+    VALUE str = rb_utf8_str_new_cstr(input.toUtf8().constData());
+    handled = ruby_event_dispatch(const_cast<QObject *>(obj), "fixup", str);
+    if (handled && RB_TYPE_P(str, T_STRING)) input = rb_to_qs(str);
+  });
+  return handled;
+}
+
 // lib/Qt.rb calls this after anything that can add or remove an override.
 static VALUE qt_overrides_changed(VALUE) {
   g_override_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -6093,6 +6156,10 @@ extern "C" void Init_qt6(void) {
   QDEF(cIntValidator,    "setBottom",   RUBY_METHOD_FUNC(intval_set_bottom), 1);
   QDEF(cIntValidator,    "setTop",      RUBY_METHOD_FUNC(intval_set_top), 1);
   QDEF(cIntValidator,    "setRange",    RUBY_METHOD_FUNC(intval_set_range), 2);
+  QDEF(cIntValidator,    "bottom",      RUBY_METHOD_FUNC(intval_bottom), 0);
+  QDEF(cIntValidator,    "top",         RUBY_METHOD_FUNC(intval_top), 0);
+  QDEF(cDoubleValidator, "bottom",      RUBY_METHOD_FUNC(dblval_bottom), 0);
+  QDEF(cDoubleValidator, "top",         RUBY_METHOD_FUNC(dblval_top), 0);
   QDEF(cLineEdit, "setValidator", RUBY_METHOD_FUNC(lineedit_set_validator), 1);
 
   cCompleter = rb_define_class_under(mQt, "Completer", cQtObject);

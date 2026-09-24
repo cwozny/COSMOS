@@ -2758,6 +2758,113 @@ chk('a taken item disposes once; a second dispose and later calls are safe') do
   end
 end
 
+puts "\n86. Ruby sizeHint and minimumSizeHint overrides were never consulted"
+puts "   (neither virtual was forwarded, so layouts sized a Ruby widget by"
+puts "    Qt's default: TlmGrapher's overview graph (sizeHint 0x50,"
+puts "    overview_graph.rb:81) came out 0 px tall, and OpenGL Builder's"
+puts "    viewer (gl_viewer.rb:87-93) got Qt's default size)"
+class HintedWidget < Qt::Widget
+  def sizeHint; Qt::Size.new(0, 50); end
+  def minimumSizeHint; Qt::Size.new(0, 30); end
+end
+class HintedFromSuper < Qt::Widget
+  def sizeHint; s = super; Qt::Size.new(s.width, 77); end
+end
+# The widget's height in a column whose other entry takes the spare room,
+# as the plots do above TlmGrapher's overview graph.
+def f86_height(widget, max_height)
+  widget.setMaximumHeight(max_height)
+  host = Qt::Widget.new
+  layout = Qt::VBoxLayout.new
+  layout.addWidget(Qt::Widget.new, 1)
+  layout.addWidget(widget)
+  host.setLayout(layout)
+  host.resize(400, 300)
+  host.show
+  APP.processEvents
+  widget.height
+ensure
+  host.hide if host
+end
+def f86_min_height(widget)
+  host = Qt::Widget.new
+  layout = Qt::VBoxLayout.new
+  layout.addWidget(widget)
+  host.setLayout(layout)
+  host.minimumSizeHint.height
+end
+chk('a layout sizes a widget by its Ruby sizeHint') do
+  (h = f86_height(HintedWidget.new, 50)) == 50 || raise("height #{h}")
+end
+chk('a layout reads the Ruby minimumSizeHint') do
+  (d = f86_min_height(HintedWidget.new) - f86_min_height(Qt::Widget.new)) == 30 || raise("minimum differs by #{d}")
+end
+chk('super from a sizeHint override reaches Qt\'s, not the override') do
+  (h = f86_height(HintedFromSuper.new, 77)) == 77 || raise("height #{h}")
+end
+
+puts "\n87. Validator constructors dropped the line edit, and fixup never ran"
+puts "   (IntegerChooser and FloatChooser build IntegerChooserIntValidator.new"
+puts "    (@value) and override fixup to clamp an out-of-range entry through"
+puts "    parent().setText (integer_chooser.rb:15-31, float_chooser.rb:15-29)."
+puts "    parent was nil, and fixup was not forwarded, so the entry stayed out"
+puts "    of range)"
+class ClampingValidator < Qt::IntValidator
+  def fixup(input)
+    parent.setText(top.to_s) if input.to_i > top
+  end
+end
+class RewritingValidator < Qt::IntValidator
+  def fixup(input)
+    input.replace(top.to_s)   # Qt's contract: fix the string in place
+  end
+end
+# Types +text+ into a line edit guarded by +validator_class+ (0..100) and
+# moves the focus away, which is when QLineEdit calls fixup.
+def f87_entry(validator_class, text)
+  host = Qt::Widget.new
+  layout = Qt::VBoxLayout.new
+  entry = Qt::LineEdit.new('5')
+  other = Qt::LineEdit.new('x')
+  layout.addWidget(entry)
+  layout.addWidget(other)
+  host.setLayout(layout)
+  validator = validator_class.new(entry)
+  validator.setBottom(0)
+  validator.setTop(100)
+  entry.setValidator(validator)
+  finished = 0
+  entry.connect(SIGNAL('editingFinished()')) { finished += 1 }
+  host.show
+  APP.processEvents
+  entry.setFocus
+  APP.processEvents
+  entry.setText(text)
+  other.setFocus
+  APP.processEvents
+  [entry.text, finished]
+ensure
+  host.hide if host
+end
+chk('IntValidator.new(line_edit) is parented to the line edit') do
+  entry = Qt::LineEdit.new
+  (v = Qt::IntValidator.new(entry)).parent == entry || raise("parent #{v.parent.inspect}")
+end
+chk('DoubleValidator.new(line_edit) and (bottom, top, decimals, line_edit)') do
+  entry = Qt::LineEdit.new
+  v1 = Qt::DoubleValidator.new(entry)
+  v2 = Qt::DoubleValidator.new(0.0, 1.0, 3, entry)
+  (v1.parent == entry && v2.parent == entry) || raise("parents #{[v1.parent, v2.parent].inspect}")
+end
+chk('a Ruby fixup clamps an out-of-range entry when editing finishes') do
+  text, = f87_entry(ClampingValidator, '500')
+  text == '100' || raise("text #{text.inspect}")
+end
+chk('a fixup that rewrites its argument is applied, and editing finishes') do
+  text, finished = f87_entry(RewritingValidator, '500')
+  (text == '100' && finished == 1) || raise("text #{text.inspect}, editingFinished x#{finished}")
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'

@@ -1392,6 +1392,66 @@ chk('Remove Selected takes the item off the ignore list and the dialog') do
 end
 limits_monitor.hide
 
+say "\n40. TlmGrapher's overview graph hung mostly below its tab"
+say "   (its sizeHint override (overview_graph.rb:81) was never consulted,"
+say "    so the tab's layout gave it 0 px at the bottom; LineGraph's"
+say "    resizeEvent then grew it to its 50 px minimum (line_graph_drawing.rb:"
+say "    475-497) from there, past the tab's edge -- see test_regressions.rb"
+say "    section 86)"
+require 'cosmos/gui/line_graph/overview_graph'
+# The tab's layout, as overview_tabbed_plots.rb:157-173 builds it.
+overview_tab = Qt::Widget.new
+overview_layout = Qt::VBoxLayout.new
+overview_plots = Qt::AdaptiveGridLayout.new
+overview_plots.addWidget(Qt::Widget.new)   # a plot
+overview_layout.addLayout(overview_plots, 1)
+overview_layout.addStretch
+overview_graph = Cosmos::OverviewGraph.new(overview_tab)
+overview_layout.addWidget(overview_graph)
+overview_tab.setLayout(overview_layout)
+overview_tab.resize(800, 600)
+overview_tab.show
+APP.processEvents
+chk('the overview graph gets its 50 px inside the tab') do
+  bottom = overview_graph.y + overview_graph.height
+  (overview_graph.height == 50 && bottom <= overview_tab.height) ||
+    raise("#{overview_graph.height} px tall, bottom at #{bottom} of #{overview_tab.height}")
+end
+overview_tab.hide
+
+say "\n41. Integer and float choosers kept an out-of-range entry"
+say "   (their validators' fixup clamps it (integer_chooser.rb:15-31,"
+say "    float_chooser.rb:15-29), but fixup was never called, and the"
+say "    validator's parent was nil -- test_regressions.rb section 87)"
+require 'cosmos/gui/choosers/integer_chooser'
+require 'cosmos/gui/choosers/float_chooser'
+# Types +text+ into the chooser's field and moves the focus to the other.
+def chooser_entry(chooser, other, text)
+  field = chooser.instance_variable_get(:@value)
+  field.setFocus
+  APP.processEvents
+  field.setText(text)
+  other.setFocus
+  APP.processEvents
+  field.text
+end
+chooser_host = Qt::Widget.new
+chooser_layout = Qt::VBoxLayout.new
+int_chooser = Cosmos::IntegerChooser.new(chooser_host, 'Count', 5, 0, 100)
+float_chooser = Cosmos::FloatChooser.new(chooser_host, 'Scale', 0.5, 0.0, 1.0)
+other_field = Qt::LineEdit.new
+[int_chooser, float_chooser, other_field].each { |w| chooser_layout.addWidget(w) }
+chooser_host.setLayout(chooser_layout)
+chooser_host.show
+APP.processEvents
+chk('IntegerChooser clamps 500 to its maximum, 100') do
+  (text = chooser_entry(int_chooser, other_field, '500')) == '100' || raise("field #{text.inspect}")
+end
+chk('FloatChooser clamps 7.5 to its maximum, 1.0') do
+  (text = chooser_entry(float_chooser, other_field, '7.5')) == '1.0' || raise("field #{text.inspect}")
+end
+chooser_host.hide
+
 say
 if $failures.empty?
   say 'ALL COSMOS TOOL CHECKS PASSED'
