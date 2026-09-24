@@ -412,7 +412,7 @@ chk('the app defaults to the light colour scheme') do
   l.resize(420, 40)
   l.show
   Qt::Application.processEvents
-  png = '/tmp/_regr_label.png'
+  png = File.join(Dir.tmpdir, "_regr_label_#{Process.pid}.png")   # no /tmp on Windows
   l.grab.save(png)
   data = File.binread(png)
   # A blank (all-white) label compresses to a much smaller PNG than one with
