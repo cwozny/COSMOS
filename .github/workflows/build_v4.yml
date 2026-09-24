@@ -17,7 +17,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         ruby-version: ["2.5", "2.6"]
@@ -32,12 +32,19 @@ jobs:
         env:
           COSMOS_DEVEL: ${GITHUB_WORKSPACE}\.
 
-  # The Qt6 binding's own suites. They need Qt 6 and a display, so they run
-  # separately from the matrix above: ubuntu-18.04 has no Qt6 packages, and
-  # without this job nothing ever ran test_regressions.rb -- including the
-  # scan_unbound ratchet in its section 19.
+  # The Qt6 binding's own suites, on each OS COSMOS runs on. They need Qt 6,
+  # which the matrix above does not install, and without this job nothing ever
+  # ran test_regressions.rb -- including the scan_unbound ratchet in its
+  # section 19. The -latest labels follow whatever versions GitHub moves them to.
   qt6:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    # Windows has no Qt6 build path yet (S13 in the v4.5.2 review), so its job
+    # shows how far the build gets without failing the run.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     env:
       QT_QPA_PLATFORM: offscreen
       CI: 1
@@ -49,10 +56,18 @@ jobs:
         with:
           ruby-version: "2.6"
           bundler-cache: true
-      - name: Install Qt 6
+      - name: Install Qt 6 (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y qt6-base-dev libgl1-mesa-dev
+      - name: Install Qt 6 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install qt
+      - name: Install Qt 6 (Windows)
+        if: runner.os == 'Windows'
+        # MSYS2's MINGW64 packages: the toolchain RubyInstaller 2.6 builds with.
+        run: C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed mingw-w64-x86_64-qt6-base mingw-w64-x86_64-pkgconf
       - name: Build extensions
         run: bundle exec rake build
       - name: Unbound-method ratchet
