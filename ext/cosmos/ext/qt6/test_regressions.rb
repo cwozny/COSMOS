@@ -2620,6 +2620,144 @@ chk('super still runs the dispatching widget\'s own default') do
   rejected || raise('QDialog::closeEvent did not run')
 end
 
+puts "\n80. Qt::ListWidgetItem.new(text, list) left the list empty"
+puts "   (ExceptionListDialog adds each exception that way"
+puts "    (exception_list_dialog.rb:39), so its list showed nothing)"
+chk('ListWidgetItem.new(text, list) adds the item to the list') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new('first', list)
+  Qt::ListWidgetItem.new('second', list)
+  (list.count == 2 && list.item(1).text == 'second') || raise("count #{list.count}")
+end
+chk('ListWidgetItem.new(icon, text, list) too') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new(Qt::Icon.new, 'x', list)
+  list.count == 1 || raise("count #{list.count}")
+end
+
+puts "\n81. Menu#addSeparator returned the menu, not the separator"
+puts "   (PacketViewer labels its View menu's separator with"
+puts "    addSeparator.setText('Formatting') (packet_viewer.rb:191), which"
+puts "    retitled the whole menu 'Formatting')"
+chk('addSeparator returns the separator action') do
+  menu = Qt::Menu.new('&View')
+  sep = menu.addSeparator
+  sep.setText('Formatting')
+  (sep.is_a?(Qt::Action) && menu.actions.include?(sep) && menu.title == '&View') ||
+    raise("returned #{sep.class}, menu title #{menu.title.inspect}")
+end
+chk('ToolBar#addSeparator returns the separator action') do
+  Qt::ToolBar.new.addSeparator.is_a?(Qt::Action)
+end
+
+puts "\n82. TreeWidgetItem font/setFont/childCount/child/checkState/parent were"
+puts "    unbound, and DialogButtonBox.new(buttons) built no buttons"
+puts "   (qt.rb reopens TreeWidgetItem with column defaults that call super"
+puts "    (qt.rb:394-424) and every COSMOS tree's itemClicked handler reads"
+puts "    checkState and parent (qt.rb:336-349), so a checkbox click raised;"
+puts "    TestRunner's Test Selections dialog also reads font while it is"
+puts "    built (test_runner.rb:764) and asks for Ok|Cancel buttons (856))"
+def f82_tree
+  tree = Qt::TreeWidget.new
+  tree.setColumnCount(1)
+  suite = Qt::TreeWidgetItem.new(['Suite'])
+  tree.addTopLevelItem(suite)
+  test = Qt::TreeWidgetItem.new(['Test'])
+  suite.addChild(test)
+  [tree, suite, test]
+end
+chk('TreeWidgetItem#font(column) and setFont(column, font)') do
+  _, suite, = f82_tree
+  font = suite.font(0)
+  font.setBold(true)
+  suite.setFont(0, font)
+  suite.font(0).bold || raise('setFont did not take')
+end
+chk('TreeWidgetItem#childCount, #child(i) and #parent') do
+  _, suite, test = f82_tree
+  (suite.childCount == 1 && suite.child(0).text(0) == 'Test' &&
+   test.parent.text(0) == 'Suite' && suite.parent.nil?) ||
+    raise("childCount #{suite.childCount}, parent #{suite.parent.inspect}")
+end
+chk('TreeWidgetItem#checkState(column) reads setCheckState') do
+  _, suite, = f82_tree
+  suite.setCheckState(0, Qt::Checked)
+  suite.checkState(0) == Qt::Checked || raise("checkState #{suite.checkState(0).inspect}")
+end
+chk('DialogButtonBox.new(Ok | Cancel) builds both buttons') do
+  box = Qt::DialogButtonBox.new(Qt::DialogButtonBox::Ok | Qt::DialogButtonBox::Cancel)
+  texts = box.findChildren.select { |c| c.is_a?(Qt::PushButton) }.map(&:text)
+  texts.size == 2 || raise("buttons #{texts.inspect}")
+end
+
+puts "\n83. Two wrappers of the same Qt item compared unequal"
+puts "   (an item wrapper is made anew for every lookup, and == was object"
+puts "    identity. TestRunner's Test Selections unchecks every suite that"
+puts "    is not the clicked item's top level (test_runner.rb:753), so it"
+puts "    unchecked the suite just clicked as well)"
+chk('items compare equal when they wrap the same Qt item') do
+  tree, suite, test = f82_tree
+  (tree.topLevelItem(0) == suite && test.parent == suite && suite.child(0).eql?(test) &&
+   suite.child(0).hash == test.hash) || raise('same item compared unequal')
+end
+chk('items compare unequal when they wrap different Qt items') do
+  _, suite, test = f82_tree
+  suite != test || raise('different items compared equal')
+end
+chk('table and list items compare the same way') do
+  table = Qt::TableWidget.new
+  table.setRowCount(1)
+  table.setColumnCount(1)
+  cell = Qt::TableWidgetItem.new('x')
+  table.setItem(0, 0, cell)
+  list = Qt::ListWidget.new
+  entry = Qt::ListWidgetItem.new('y', list)
+  (table.item(0, 0) == cell && list.item(0) == entry) || raise('same item compared unequal')
+end
+
+puts "\n84. ListWidgetItem#data and ListWidget#row were unbound"
+puts "   (LimitsMonitor's Ignored Telemetry Items dialog reads each selected"
+puts "    item's data on Delete (limits_monitor.rb:786), then removes the"
+puts "    selection with qt.rb's remove_selected_items, which calls row(item)"
+puts "    (qt.rb:614): nothing was ever removed)"
+chk('ListWidgetItem#data(role) returns what setData stored') do
+  item = Qt::ListWidgetItem.new('x')
+  item.setData(Qt::UserRole, Qt::Variant.new(%w[INST HEALTH_STATUS TEMP1]))
+  (v = item.data(Qt::UserRole).value) == %w[INST HEALTH_STATUS TEMP1] || raise("data #{v.inspect}")
+end
+chk('ListWidget#row(item) is the item\'s row') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new('a', list)
+  b = Qt::ListWidgetItem.new('b', list)
+  list.row(b) == 1 || raise("row #{list.row(b).inspect}")
+end
+
+puts "\n85. ListWidgetItem#dispose freed nothing"
+puts "   (COSMOS removes list entries with takeItem(i).dispose (qt.rb:598,"
+puts "    614, 690; tlm_extractor.rb:57); dispose was lib/Qt.rb's no-op for"
+puts "    value types, so every removed entry leaked)"
+chk('dispose deletes the item: an item still in its list leaves it') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new('a', list)
+  list.item(0).dispose            # ~QListWidgetItem takes it out of the list
+  list.count == 0 || raise("count #{list.count} after dispose")
+end
+chk('a taken item disposes once; a second dispose and later calls are safe') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new('a', list)
+  item = list.takeItem(0)
+  item.dispose
+  item.dispose
+  item.disposed? || raise('not disposed')
+  begin
+    item.text
+    raise 'text on a disposed item did not raise'
+  rescue RuntimeError => e
+    raise if e.message.include?('did not raise')
+    true
+  end
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'

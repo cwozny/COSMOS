@@ -1273,6 +1273,125 @@ chk('picking a state commits it without an error') do
 end
 collect.hide
 
+say "\n36. ExceptionListDialog listed none of its exceptions"
+say "   (it adds each with Qt::ListWidgetItem.new(string, @list)"
+say "    (exception_list_dialog.rb:39), which ignored the list -- see"
+say "    test_regressions.rb section 80)"
+require 'cosmos/gui/dialogs/exception_list_dialog'
+exceptions_listed = nil
+on_dialog('COSMOS Exception List') do |d|
+  list = d.findChildren.find { |c| c.is_a?(Qt::ListWidget) }
+  exceptions_listed = list && (0...list.count).map { |i| list.item(i).text }
+  d.accept
+end
+Cosmos::ExceptionListDialog.new('Errors', [RuntimeError.new('first'), ArgumentError.new('second')])
+chk('the dialog lists both exceptions') do
+  exceptions_listed == ['1. RuntimeError : first', '2. ArgumentError : second'] ||
+    raise("listed #{exceptions_listed.inspect}")
+end
+
+say "\n37. PacketViewer's View menu was retitled 'Formatting'"
+say "   (view_menu.addSeparator.setText('Formatting'), packet_viewer.rb:191:"
+say "    addSeparator returned the menu -- test_regressions.rb section 81)"
+chk("PacketViewer's menu bar still has its View menu") do
+  titles = packet_viewer.menuBar.actions.map(&:text)
+  (titles.include?('&View') && !titles.include?('Formatting')) || raise("menus #{titles.inspect}")
+end
+
+say "\n38. TestRunner's Test Selections dialog did not open"
+say "   (it reads each node's font while it builds the tree"
+say "    (test_runner.rb:764), and COSMOS's tree helpers read checkState,"
+say "    parent, childCount and child (qt.rb:336-349, 388-391), all unbound"
+say "    on items. Its Ok|Cancel button box had no buttons (test_runner.rb:"
+say "    856), and item lookups never compared equal, so a click unchecked"
+say "    its own suite (753). See test_regressions.rb sections 82 and 83.)"
+require 'cosmos/tools/test_runner/test_runner'
+_, tr_options = Cosmos::TestRunner.create_default_options
+tr_options.title = 'Test Runner'
+tr_options.auto_size = false
+tr_options.remember_geometry = false
+tr_options.redirect_io = false   # see sr_options
+tr_options.server_config_file = Cosmos::CmdTlmServer::DEFAULT_CONFIG_FILE
+tr_options.config_file = true    # the demo's, which loads example_test.rb
+test_runner = Cosmos::TestRunner.new(tr_options)
+test_runner.instance_variable_get(:@timer).stop
+# Splash.execute loads the config on its own thread (splash.rb:106).
+wait_for(30) { Cosmos::TestRunner.class_variable_get(:@@test_suites).any? }
+wait_for(10) do
+  Qt::Application.topLevelWidgets.none? { |w| w.is_a?(Cosmos::Splash::SplashDialogBox) && w.isVisible }
+end
+selections = {}
+on_dialog('Test Selections') do |d|
+  tree = d.findChildren.find { |c| c.is_a?(Qt::TreeWidget) }
+  suites = []
+  tree.topLevelItems { |node| suites << node }
+  selections[:suites] = suites.map(&:text)
+  selections[:buttons] = d.findChildren.select { |c| c.is_a?(Qt::PushButton) }.map { |b| b.text.delete('&') }
+  suite = suites.find { |node| node.childCount > 0 }
+  if suite
+    suite.setCheckStateAll(Qt::Checked)
+    tests = []
+    suite.children { |node| tests << node }
+    selections[:checked] = tests.all? { |node| node.checkState == Qt::Checked }
+    selections[:top_is_suite] = tests.all? { |node| node.topLevel == suite }
+  end
+  d.reject
+end
+begin
+  test_runner.show_select
+rescue => e
+  selections[:error] = "#{e.class}: #{e.message}"
+end
+chk('the Test Selections dialog opens and lists the demo suites') do
+  selections[:error] && raise(selections[:error])
+  selections[:suites].to_a.include?('ExampleTestSuite') || raise("suites #{selections[:suites].inspect}")
+end
+chk('its button box has OK and Cancel') do
+  (selections[:buttons].to_a & %w[OK Cancel]).size == 2 || raise("buttons #{selections[:buttons].inspect}")
+end
+chk("checking a suite checks its tests, whose top level is that suite") do
+  (selections[:checked] && selections[:top_is_suite]) ||
+    raise("checked #{selections[:checked].inspect}, top level #{selections[:top_is_suite].inspect}")
+end
+test_runner.hide
+
+say "\n39. LimitsMonitor's Ignored Telemetry Items dialog removed nothing"
+say "   (Remove Selected reads each selected item's data (limits_monitor.rb:"
+say "    786), then removes the selection with qt.rb's remove_selected_items,"
+say "    which calls ListWidget#row (qt.rb:614). Both were unbound -- see"
+say "    test_regressions.rb section 84.)"
+require 'cosmos/tools/limits_monitor/limits_monitor'
+class Qt6SuiteLimitsMonitor < Cosmos::LimitsMonitor
+  # The server threads initialize starts (limits_monitor.rb:560-561).
+  def limits_thread; end
+  def value_thread; end
+end
+_, lm_options = Cosmos::LimitsMonitor.create_default_options
+lm_options.title = 'Limits Monitor'
+lm_options.auto_size = false
+lm_options.remember_geometry = false
+lm_options.redirect_io = false   # see sr_options
+limits_monitor = Qt6SuiteLimitsMonitor.new(lm_options)
+lm_items = limits_monitor.instance_variable_get(:@limits_items)
+lm_items.ignored << %w[INST HEALTH_STATUS TEMP1]
+lm_items.ignored << %w[INST HEALTH_STATUS TEMP2]
+lm_removal = nil
+on_dialog('Ignored Telemetry Items') do |d|
+  list = d.findChildren.find { |c| c.is_a?(Qt::ListWidget) }
+  list.item(0).setSelected(true)   # ITEM: INST HEALTH_STATUS TEMP1
+  err = reported { button(d, 'Remove Selected').click }
+  lm_removal = [err, list.count]
+  d.done(0)
+end
+limits_monitor.edit_ignored_items
+chk('Remove Selected takes the item off the ignore list and the dialog') do
+  err, left = lm_removal
+  err.to_s.empty? || raise(err.lines.first.to_s.strip)
+  (lm_items.ignored == [%w[INST HEALTH_STATUS TEMP2]] && left == 1) ||
+    raise("ignored #{lm_items.ignored.inspect}, #{left.inspect} left in the list")
+end
+limits_monitor.hide
+
 say
 if $failures.empty?
   say 'ALL COSMOS TOOL CHECKS PASSED'

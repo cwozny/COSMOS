@@ -1138,7 +1138,21 @@ template <typename T> static VALUE wrap_ptr(VALUE klass, T *p) {
   return p ? TypedData_Wrap_Struct(klass, &ptr_type<T>(), p) : Qnil;
 }
 template <typename T> static T *get_ptr(VALUE self) {
-  T *p; TypedData_Get_Struct(self, T, &ptr_type<T>(), p); return p;
+  T *p; TypedData_Get_Struct(self, T, &ptr_type<T>(), p);
+  if (!p) rb_raise(rb_eRuntimeError, "Qt item has been disposed");
+  return p;
+}
+// A new wrapper is made for every lookup (topLevelItem, child, parent, ...),
+// so == compares the Qt items, not the wrappers. TestRunner's Test
+// Selections unchecks every suite but the clicked item's top level
+// (test_runner.rb:753); with object identity that was every suite.
+template <typename T> static VALUE item_eq(VALUE self, VALUE other) {
+  if (!rb_typeddata_is_kind_of(other, &ptr_type<T>())) return Qfalse;
+  void *p = DATA_PTR(self);
+  return p && p == DATA_PTR(other) ? Qtrue : Qfalse;
+}
+template <typename T> static VALUE item_hash(VALUE self) {
+  return ULL2NUM((unsigned long long)(uintptr_t)DATA_PTR(self));
 }
 
 static VALUE cTableWidget, cTableWidgetItem, cTreeWidget, cTreeWidgetItem;
@@ -1221,11 +1235,16 @@ static VALUE lwitem_new(int argc, VALUE *argv, VALUE klass) {
 }
 static VALUE lwitem_initialize(int argc, VALUE *argv, VALUE self) {
   QListWidgetItem *it = get_ptr<QListWidgetItem>(self);
+  QListWidget *list = NULL;
   for (int i = 0; i < argc; i++) {
     if (NIL_P(argv[i])) continue;
     if (RB_TYPE_P(argv[i], T_STRING))           it->setText(rb_to_qs(argv[i]));
     else if (rb_obj_is_kind_of(argv[i], cIcon)) it->setIcon(*get_val<QIcon>(argv[i]));
+    else if (rb_obj_is_kind_of(argv[i], cListWidget)) list = qcast<QListWidget>(argv[i]);
   }
+  // The (text, list) overload: ExceptionListDialog adds each exception this
+  // way (exception_list_dialog.rb:39), and its list stayed empty.
+  if (list) list->addItem(it);
   return self;
 }
 static VALUE tritem_text(VALUE self, VALUE col) {
@@ -1340,11 +1359,15 @@ static VALUE menu_add_action(VALUE self, VALUE a) {
   release_ownership(a);
   return self;
 }
+// Returns the separator action, as Qt does: PacketViewer labels its View
+// menu's separator with addSeparator.setText('Formatting')
+// (packet_viewer.rb:191), which retitled the whole menu when this returned it.
 static VALUE menu_add_separator(VALUE self) {
   QObject *o = get_obj(self);
-  if (QMenu *m = qobject_cast<QMenu *>(o))            m->addSeparator();
-  else if (QToolBar *t = qobject_cast<QToolBar *>(o)) t->addSeparator();
-  return self;
+  QAction *sep = NULL;
+  if (QMenu *m = qobject_cast<QMenu *>(o))            sep = m->addSeparator();
+  else if (QToolBar *t = qobject_cast<QToolBar *>(o)) sep = t->addSeparator();
+  return sep ? wrap_obj(cAction, sep, false) : Qnil;   // the menu owns it
 }
 // menu.exec(global_point) opens every COSMOS context menu (14 sites in 11
 // files, e.g. cmd_params.rb:194, script_runner.rb:889). Unbound, it resolved
@@ -4686,6 +4709,17 @@ static VALUE model_set_data(int argc, VALUE *argv, VALUE self) {
 }
 
 
+// QDialogButtonBox(buttons[, parent]): TestRunner's Test Selections asks for
+// Ok | Cancel (test_runner.rb:856); ctor_plain ignored them, so it had none.
+static QObject *ctor_dialog_button_box(int argc, VALUE *argv) {
+  QWidget *p = parent_arg(argc, argv);
+  if (p) g_ctor_took_parent = true;
+  for (int i = 0; i < argc; i++)
+    if (RB_INTEGER_TYPE_P(argv[i]))
+      return new QDialogButtonBox(QDialogButtonBox::StandardButtons(NUM2INT(argv[i])), p);
+  return new QDialogButtonBox(p);
+}
+
 // Qt::Shortcut was declared but never given a constructor, so every
 // Qt::Shortcut.new fell through to ctor_plain<QObject> and built a bare
 // QObject: the key sequence was never installed and connect() silently took
@@ -4800,6 +4834,50 @@ static VALUE point_set_y(VALUE self, VALUE v) {
 static VALUE lwitem_set_data(VALUE self, VALUE role, VALUE val) {
   get_ptr<QListWidgetItem>(self)->setData(NUM2INT(role), *get_val<QVariant>(val));
   return self;
+}
+// qt.rb reopens TreeWidgetItem with column defaults that call super
+// (qt.rb:394-424), and every COSMOS tree's itemClicked handler walks
+// checkState and parent (qt.rb:336-349); TestRunner's Test Selections reads
+// font while it builds its tree (test_runner.rb:764). All were unbound.
+static VALUE tritem_font(VALUE self, VALUE col) {
+  return wrap_val<QFont>(cFont, get_ptr<QTreeWidgetItem>(self)->font(NUM2INT(col)));
+}
+static VALUE tritem_set_font(VALUE self, VALUE col, VALUE f) {
+  get_ptr<QTreeWidgetItem>(self)->setFont(NUM2INT(col), *get_val<QFont>(f));
+  return self;
+}
+static VALUE tritem_child_count(VALUE self) {
+  return INT2NUM(get_ptr<QTreeWidgetItem>(self)->childCount());
+}
+static VALUE tritem_child(VALUE self, VALUE i) {
+  return wrap_ptr<QTreeWidgetItem>(cTreeWidgetItem, get_ptr<QTreeWidgetItem>(self)->child(NUM2INT(i)));
+}
+static VALUE tritem_parent(VALUE self) {
+  return wrap_ptr<QTreeWidgetItem>(cTreeWidgetItem, get_ptr<QTreeWidgetItem>(self)->parent());
+}
+static VALUE tritem_check_state(VALUE self, VALUE col) {
+  return INT2NUM((int)get_ptr<QTreeWidgetItem>(self)->checkState(NUM2INT(col)));
+}
+// LimitsMonitor's Ignored Telemetry Items reads each selected item's data on
+// Delete (limits_monitor.rb:786) and removes the selection with qt.rb's
+// remove_selected_items, which needs row(item) (qt.rb:614).
+static VALUE lwitem_data(VALUE self, VALUE role) {
+  return wrap_val<QVariant>(cVariant, get_ptr<QListWidgetItem>(self)->data(NUM2INT(role)));
+}
+static VALUE listw_row(VALUE self, VALUE item) {
+  return INT2NUM(qcast<QListWidget>(self)->row(get_ptr<QListWidgetItem>(item)));
+}
+// COSMOS removes list entries with takeItem(i).dispose (qt.rb:598/614/690,
+// tlm_extractor.rb:57), and lib/Qt.rb's value-type no-op leaked each one.
+// Deletes the item; one still in a list leaves it (~QListWidgetItem).
+static VALUE lwitem_dispose(VALUE self) {
+  QListWidgetItem *p = (QListWidgetItem *)DATA_PTR(self);
+  DATA_PTR(self) = NULL;
+  delete p;
+  return Qnil;
+}
+static VALUE lwitem_disposed_p(VALUE self) {
+  return DATA_PTR(self) ? Qfalse : Qtrue;
 }
 static VALUE tritem_set_check_state(VALUE self, VALUE col, VALUE st) {
   get_ptr<QTreeWidgetItem>(self)
@@ -4998,6 +5076,12 @@ static void item_init_module(VALUE klass, const char *name,
   VALUE m = rb_define_module_under(mQt, name);
   define_guarded(m, "initialize", RUBY_METHOD_FUNC(fn), -1);
   rb_include_module(klass, m);
+}
+// == / eql? / hash by Qt item; see item_eq.
+template <typename T> static void define_item_equality(VALUE klass) {
+  QDEF(klass, "==",   RUBY_METHOD_FUNC(item_eq<T>), 1);
+  QDEF(klass, "eql?", RUBY_METHOD_FUNC(item_eq<T>), 1);
+  QDEF(klass, "hash", RUBY_METHOD_FUNC(item_hash<T>), 0);
 }
 
 extern "C" void Init_qt6(void) {
@@ -5579,6 +5663,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cTableWidgetItem, "setSizeHint",    RUBY_METHOD_FUNC(twitem_set_size_hint), 1);
   QDEF(cTableWidgetItem, "setData",        RUBY_METHOD_FUNC(twitem_set_data), 2);
   QDEF(cTableWidgetItem, "data",           RUBY_METHOD_FUNC(twitem_data), 1);
+  define_item_equality<QTableWidgetItem>(cTableWidgetItem);
 
   cTableWidget = rb_define_class_under(mQt, "TableWidget", cAbstractItemView);
   // cmd_tlm_server_gui.rb:90 reopens Qt::TableWidget purely to override
@@ -5610,6 +5695,13 @@ extern "C" void Init_qt6(void) {
   QDEF(cTreeWidgetItem, "addChild",      RUBY_METHOD_FUNC(tritem_add_child), 1);
   QDEF(cTreeWidgetItem, "setForeground", RUBY_METHOD_FUNC(tritem_set_foreground), 2);
   QDEF(cTreeWidgetItem, "setBackground", RUBY_METHOD_FUNC(tritem_set_background), 2);
+  QDEF(cTreeWidgetItem, "font",          RUBY_METHOD_FUNC(tritem_font), 1);
+  QDEF(cTreeWidgetItem, "setFont",       RUBY_METHOD_FUNC(tritem_set_font), 2);
+  QDEF(cTreeWidgetItem, "childCount",    RUBY_METHOD_FUNC(tritem_child_count), 0);
+  QDEF(cTreeWidgetItem, "child",         RUBY_METHOD_FUNC(tritem_child), 1);
+  QDEF(cTreeWidgetItem, "parent",        RUBY_METHOD_FUNC(tritem_parent), 0);
+  QDEF(cTreeWidgetItem, "checkState",    RUBY_METHOD_FUNC(tritem_check_state), 1);
+  define_item_equality<QTreeWidgetItem>(cTreeWidgetItem);
 
   cTreeWidget = rb_define_class_under(mQt, "TreeWidget", cAbstractItemView);
   register_ctor(cTreeWidget, ctor_plain<RubyForward<QTreeWidget> >);
@@ -5633,9 +5725,14 @@ extern "C" void Init_qt6(void) {
   QDEF(cListWidgetItem, "setText",     RUBY_METHOD_FUNC(lwi_set_text), 1);
   QDEF(cListWidgetItem, "setSelected", RUBY_METHOD_FUNC(lwi_set_selected), 1);
   QDEF(cListWidgetItem, "isSelected",  RUBY_METHOD_FUNC(lwi_is_selected), 0);
+  QDEF(cListWidgetItem, "data",        RUBY_METHOD_FUNC(lwitem_data), 1);
+  QDEF(cListWidgetItem, "dispose",     RUBY_METHOD_FUNC(lwitem_dispose), 0);
+  QDEF(cListWidgetItem, "disposed?",   RUBY_METHOD_FUNC(lwitem_disposed_p), 0);
+  define_item_equality<QListWidgetItem>(cListWidgetItem);
   register_ctor(cListWidget, ctor_plain<RubyForward<QListWidget> >);
   QDEF(cListWidget, "setUniformItemSizes", RUBY_METHOD_FUNC(listw_set_uniform_item_sizes), 1);
   QDEF(cListWidget, "takeItem",            RUBY_METHOD_FUNC(listw_take_item), 1);
+  QDEF(cListWidget, "row",                 RUBY_METHOD_FUNC(listw_row), 1);
   QDEF(cListWidget, "visualItemRect",      RUBY_METHOD_FUNC(listw_visual_item_rect), 1);
   QDEF(cListWidget, "item",          RUBY_METHOD_FUNC(lw_item), 1);
   QDEF(cListWidget, "findItems",     RUBY_METHOD_FUNC(lw_find_items), -1);
@@ -6149,7 +6246,7 @@ extern "C" void Init_qt6(void) {
 
   // ---- misc widgets / helpers --------------------------------------------
   VALUE cDialogButtonBox = rb_define_class_under(mQt, "DialogButtonBox", cWidget);
-  register_ctor(cDialogButtonBox, ctor_plain<QDialogButtonBox>);
+  register_ctor(cDialogButtonBox, ctor_dialog_button_box);
   QDEF(cDialogButtonBox, "addButton", RUBY_METHOD_FUNC(dbb_add_button), 1);
   QDEF(cDialogButtonBox, "setOrientation", RUBY_METHOD_FUNC(dbb_set_orientation), 1);
 #define DEF_DBB(n) rb_define_const(cDialogButtonBox, #n, INT2NUM((int)QDialogButtonBox::n))
