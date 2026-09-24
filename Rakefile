@@ -24,6 +24,15 @@ def which(cmd)
   return nil
 end
 
+# For rake build when ext/cosmos/ext/qt6 built nothing: extconf.rb wrote its
+# do-nothing Makefile, and records why in it. A qt6 bundle from an earlier
+# build would still load as if current, so it goes. Returns the message.
+def qt6_not_built(makefile, stale_bundle)
+  FileUtils.rm_f stale_bundle
+  reason = (File.read(makefile)[/qt6 extension skipped \((.*)\)/, 1] rescue nil) || 'see extconf.rb above'
+  "qt6: not built (#{reason}) - COSMOS GUI tools will not run"
+end
+
 # Pure Ruby CRC class to avoid circular dependency with c_cosmos
 class RakeCrc32
   attr_reader :crc32_poly
@@ -174,6 +183,7 @@ task :build => [:devkit] do
       system('ruby extconf.rb')
       make_ok = system('make')
       built = "#{extension_name}.#{shared_extension}"
+      dest = File.join('..', '..', '..', '..', 'lib', 'cosmos', 'ext', built)
       build_error = nil
       if File.exist?(built)
         # Replace-and-resign rather than copy over the existing file. On macOS
@@ -181,7 +191,6 @@ task :build => [:devkit] do
         # a stale code-signing hash for it, after which ruby is SIGKILLed at
         # load with no message at all -- `codesign -v` still reports the file
         # as valid, so it looks like the extension simply does not work.
-        dest = File.join('..', '..', '..', '..', 'lib', 'cosmos', 'ext', built)
         FileUtils.rm_f dest
         FileUtils.copy(built, dest)
         system("codesign -f -s - #{dest.inspect}") if RUBY_PLATFORM =~ /darwin/
@@ -191,7 +200,7 @@ task :build => [:devkit] do
         # no Qt6 can still build the rest of COSMOS. Every other extension
         # producing nothing is a real build failure and must not be silent --
         # nor qt6 when COSMOS_QT6_REQUIRED is set (the CI qt6 job).
-        puts "  qt6: Qt6 not found - skipping (COSMOS GUI tools will not run)"
+        puts "  #{qt6_not_built('Makefile', dest)}"
       else
         build_error = "#{extension_name}: build FAILED - " +
           (make_ok ? "make succeeded but produced no #{built}" : "make returned non-zero")

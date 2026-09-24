@@ -2964,6 +2964,44 @@ chk('a second load of lib/Qt.rb leaves post_to_main_thread working') do
   out.include?('ran') || raise(out.lines.grep(/Error/).first.to_s.strip)
 end
 
+puts "\n93. rake build kept a stale qt6 bundle and blamed a missing Qt6"
+puts "   (when the qt6 extension built nothing, lib/cosmos/ext kept the"
+puts "    bundle of an earlier build, which still loaded as if current, and"
+puts "    the message always said 'Qt6 not found' -- also when extconf.rb had"
+puts "    written its stub because moc failed. The Rakefile's qt6_not_built"
+puts "    now removes the stale bundle and reports extconf.rb's own reason.)"
+QT6_NOT_BUILT = <<~'RUBY'
+  require 'rake'
+  Rake.application.init('rake', [])
+  Dir.chdir(ARGV[0])
+  Rake.application.load_rakefile
+  puts qt6_not_built(ARGV[1], ARGV[2])
+  puts(File.exist?(ARGV[2]) ? 'stale bundle kept' : 'stale bundle removed')
+RUBY
+chk("rake build's qt6 skip removes a stale bundle and gives extconf.rb's reason") do
+  Dir.mktmpdir('qt6_not_built') do |dir|
+    # extconf.rb in a copy, with no Qt6 to find: it writes the stub Makefile
+    bin = File.join(dir, 'bin')
+    Dir.mkdir(bin)
+    FileUtils.cp(File.join(__dir__, 'extconf.rb'), dir)
+    if WINDOWS
+      File.write(File.join(bin, 'pkg-config.bat'), "@exit /b 1\r\n")
+    else
+      File.write(File.join(bin, 'pkg-config'), "#!/bin/sh\nexit 1\n")
+      FileUtils.chmod(0755, File.join(bin, 'pkg-config'))
+    end
+    force_linux = "Object.send(:remove_const, :RUBY_PLATFORM); RUBY_PLATFORM = 'x86_64-linux'.freeze; load 'extconf.rb'"
+    IO.popen({ 'PATH' => [bin, ENV['PATH']].join(File::PATH_SEPARATOR), 'COSMOS_QT6_REQUIRED' => nil },
+             [RbConfig.ruby, '-e', force_linux, chdir: dir, err: [:child, :out]], &:read)
+    stale = File.join(dir, 'qt6.bundle')
+    File.write(stale, 'an earlier build')
+    out = IO.popen([RbConfig.ruby, '-e', QT6_NOT_BUILT, ROOT, File.join(dir, 'Makefile'), stale,
+                    err: [:child, :out]], &:read)
+    (out.include?('qt6: not built (Qt6 not found (brew --prefix qt / pkg-config Qt6Core))') &&
+     out.include?('stale bundle removed')) || raise(out.lines.last(2).join.strip)
+  end
+end
+
 puts
 if $failures.empty?
   puts 'ALL REGRESSION CHECKS PASSED'
