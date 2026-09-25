@@ -2,6 +2,8 @@
 *.def
 *.so
 *.bundle
+# Debug symbols macOS Rubies write next to each extension (dsymutil)
+*.dSYM/
 Makefile
 Gemfile.lock
 .yardoc

@@ -680,8 +680,6 @@ ext/cosmos/ext/crc/crc.c
 ext/cosmos/ext/crc/extconf.rb
 ext/cosmos/ext/line_graph/extconf.rb
 ext/cosmos/ext/line_graph/line_graph.c
-ext/cosmos/ext/low_fragmentation_array/extconf.rb
-ext/cosmos/ext/low_fragmentation_array/low_fragmentation_array.c
 ext/cosmos/ext/packet/extconf.rb
 ext/cosmos/ext/packet/packet.c
 ext/cosmos/ext/platform/extconf.rb
@@ -1421,7 +1419,6 @@ lib/cosmos/win32/excel.rb
 lib/cosmos/win32/win32.rb
 lib/cosmos/win32/win32_main.rb
 make_gems.sh
-roodi.yml
 run_gui_tests.bat
 spec/ccsds/ccsds_packet_spec.rb
 spec/ccsds/ccsds_parser_spec.rb

@@ -22,11 +22,8 @@ end
 # NOTE: You MUST require simplecov before anything else!
 if !ENV['COSMOS_NO_SIMPLECOV']
   require 'simplecov'
-  require 'codecov'
-  SimpleCov.formatter = SimpleCov::Formatter::MultiFormatter.new([
-    SimpleCov::Formatter::HTMLFormatter,
-    SimpleCov::Formatter::Codecov,
-  ])
+  # The codecov gem's last release (0.6.0, 2021) does not allow Ruby 4.
+  SimpleCov.formatter = SimpleCov::Formatter::HTMLFormatter
   SimpleCov.start do
     merge_timeout 12 * 60 * 60 # merge the last 12 hours of results
     add_filter '/spec/'
@@ -149,7 +146,9 @@ def running_threads
       thread_name = JRuby.reference(t).native_thread.get_name
       threads << t.inspect unless thread_name == "Finalizer" or thread_name.include?("JRubyWorker")
     else
-      threads << t.inspect
+      # Since Ruby 3.3, Timeout runs one thread for the whole process, which
+      # stays once anything has used it
+      threads << t.inspect unless t.name == 'Timeout stdlib thread'
     end
   end
   return threads
