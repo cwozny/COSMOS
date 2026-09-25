@@ -908,7 +908,18 @@ template <typename T> static const rb_data_type_t &val_type() {
   };
   return t;
 }
+// The value and item classes (Qt::Color, Qt::Rect, Qt::ListWidgetItem, ...)
+// get their instances only from wrap_val and wrap_ptr, and keep Object's
+// allocator. Since Ruby 3.2 the first T_DATA instance of such a class makes
+// Ruby undefine that allocator and rb_warn "undefining the allocator of T_DATA
+// class" (gc.c rb_data_object_check), which COSMOS tools then report as
+// unexpected STDERR output. Undefine it first, the same way, without the warning.
+static void undef_object_allocator(VALUE klass) {
+  static const rb_alloc_func_t object_allocator = rb_get_alloc_func(rb_cObject);
+  if (klass != rb_cObject && rb_get_alloc_func(klass) == object_allocator) rb_undef_alloc_func(klass);
+}
 template <typename T> static VALUE wrap_val(VALUE klass, const T &v) {
+  undef_object_allocator(klass);
   return TypedData_Wrap_Struct(klass, &val_type<T>(), new T(v));
 }
 template <typename T> static T *get_val(VALUE self) {
@@ -1182,7 +1193,9 @@ template <typename T> static const rb_data_type_t &ptr_type() {
   return t;   // dfree == NULL: the owning widget frees it, not Ruby
 }
 template <typename T> static VALUE wrap_ptr(VALUE klass, T *p) {
-  return p ? TypedData_Wrap_Struct(klass, &ptr_type<T>(), p) : Qnil;
+  if (!p) return Qnil;
+  undef_object_allocator(klass);
+  return TypedData_Wrap_Struct(klass, &ptr_type<T>(), p);
 }
 template <typename T> static T *get_ptr(VALUE self) {
   T *p; TypedData_Get_Struct(self, T, &ptr_type<T>(), p);
