@@ -55,6 +55,16 @@ at_exit do
     $cleanups.each(&:call)
     STDOUT.flush
     exit!(1)
+  elsif $!.is_a?(SystemExit) && !$!.success?
+    # The suite itself ends with exit!, which skips this. A tool that exits
+    # does not: ExceptionDialog exits after an "Error During Startup", and
+    # the suite used to end with no word of why. The dialogs say.
+    STDOUT.puts "EXIT #{$!.status} (in #{$current_check.inspect})"
+    ($!.backtrace || []).first(12).each { |line| STDOUT.puts "  #{line}" }
+    Array($message_boxes).zip(Array($message_texts)).each { |title, text| STDOUT.puts "  dialog #{title.inspect}: #{text.to_s[0, 500]}" }
+    $cleanups.each(&:call)
+    STDOUT.flush
+    exit!($!.status)
   end
 end
 
@@ -1230,6 +1240,245 @@ f23.check_all_crcs
 f23_text = f23.instance_variable_get(:@text_crc).toPlainText
 chk('the Legal dialog verifies every core CRC') do
   !f23_text.include?('Core CRC checks failed') || raise(f23_text.lines.first(2).join.strip)
+end
+
+say "\n35. CmdSender's parameter table reported an error for cells it painted"
+say "    and for every state picked"
+say "   (CmdParamTableItemDelegate draws the state and description columns"
+say "    itself and calls super for the rest, which raised NoMethodError, as"
+say "    did the description column's Qt::Style.CE_ItemViewItem. Its"
+say "    setModelData writes the picked state with model.setData, which was"
+say "    unbound. See test_regressions.rb sections 77 and 78.)"
+require 'stringio'
+# What the binding reports goes to $stderr, which ScriptRunnerFrame has
+# redirected; capture it directly.
+def reported
+  saved = $stderr
+  $stderr = StringIO.new
+  yield
+  APP.processEvents
+  $stderr.string
+ensure
+  $stderr = saved
+end
+collect = cmd_params.update_cmd_params(Cosmos::System.commands.packet('INST', 'COLLECT'))
+collect.resize(900, 300)
+collect.show
+APP.processEvents
+collect_painted = reported { collect.grab }
+chk("painting INST COLLECT's parameters reports no error") do
+  collect_painted.empty? || raise(collect_painted.lines.first.to_s.strip)
+end
+collect_row = param_row(collect, 'TYPE')
+collect.editItem(collect.item(collect_row, 1))
+APP.processEvents
+collect_combo = collect.viewport.findChildren.find { |c| c.is_a?(Qt::ComboBox) }
+collect_delegate = collect.findChildren.find { |c| c.is_a?(Cosmos::CmdParamTableItemDelegate) }
+chk('picking a state commits it without an error') do
+  collect_combo || raise('no state editor opened')
+  collect_combo.setCurrentIndex(collect_combo.findText('SPECIAL'))
+  committed = reported { collect_delegate.commitData(collect_combo) }
+  committed.empty? || raise(committed.lines.first.to_s.strip)
+  (state = collect.item(collect_row, 1).text) == 'SPECIAL' || raise("state cell #{state.inspect}")
+end
+collect.hide
+
+say "\n36. ExceptionListDialog listed none of its exceptions"
+say "   (it adds each with Qt::ListWidgetItem.new(string, @list)"
+say "    (exception_list_dialog.rb:39), which ignored the list -- see"
+say "    test_regressions.rb section 80)"
+require 'cosmos/gui/dialogs/exception_list_dialog'
+exceptions_listed = nil
+on_dialog('COSMOS Exception List') do |d|
+  list = d.findChildren.find { |c| c.is_a?(Qt::ListWidget) }
+  exceptions_listed = list && (0...list.count).map { |i| list.item(i).text }
+  d.accept
+end
+Cosmos::ExceptionListDialog.new('Errors', [RuntimeError.new('first'), ArgumentError.new('second')])
+chk('the dialog lists both exceptions') do
+  exceptions_listed == ['1. RuntimeError : first', '2. ArgumentError : second'] ||
+    raise("listed #{exceptions_listed.inspect}")
+end
+
+say "\n37. PacketViewer's View menu was retitled 'Formatting'"
+say "   (view_menu.addSeparator.setText('Formatting'), packet_viewer.rb:191:"
+say "    addSeparator returned the menu -- test_regressions.rb section 81)"
+chk("PacketViewer's menu bar still has its View menu") do
+  titles = packet_viewer.menuBar.actions.map(&:text)
+  (titles.include?('&View') && !titles.include?('Formatting')) || raise("menus #{titles.inspect}")
+end
+
+say "\n38. TestRunner's Test Selections dialog did not open"
+say "   (it reads each node's font while it builds the tree"
+say "    (test_runner.rb:764), and COSMOS's tree helpers read checkState,"
+say "    parent, childCount and child (qt.rb:336-349, 388-391), all unbound"
+say "    on items. Its Ok|Cancel button box had no buttons (test_runner.rb:"
+say "    856), and item lookups never compared equal, so a click unchecked"
+say "    its own suite (753). See test_regressions.rb sections 82 and 83.)"
+require 'cosmos/tools/test_runner/test_runner'
+_, tr_options = Cosmos::TestRunner.create_default_options
+tr_options.title = 'Test Runner'
+tr_options.auto_size = false
+tr_options.remember_geometry = false
+tr_options.redirect_io = false   # see sr_options
+tr_options.server_config_file = Cosmos::CmdTlmServer::DEFAULT_CONFIG_FILE
+tr_options.config_file = true    # the demo's, which loads example_test.rb
+test_runner = Cosmos::TestRunner.new(tr_options)
+test_runner.instance_variable_get(:@timer).stop
+# Splash.execute loads the config on its own thread (splash.rb:106).
+wait_for(30) { Cosmos::TestRunner.class_variable_get(:@@test_suites).any? }
+wait_for(10) do
+  Qt::Application.topLevelWidgets.none? { |w| w.is_a?(Cosmos::Splash::SplashDialogBox) && w.isVisible }
+end
+selections = {}
+on_dialog('Test Selections') do |d|
+  tree = d.findChildren.find { |c| c.is_a?(Qt::TreeWidget) }
+  suites = []
+  tree.topLevelItems { |node| suites << node }
+  selections[:suites] = suites.map(&:text)
+  selections[:buttons] = d.findChildren.select { |c| c.is_a?(Qt::PushButton) }.map { |b| b.text.delete('&') }
+  suite = suites.find { |node| node.childCount > 0 }
+  if suite
+    suite.setCheckStateAll(Qt::Checked)
+    tests = []
+    suite.children { |node| tests << node }
+    selections[:checked] = tests.all? { |node| node.checkState == Qt::Checked }
+    selections[:top_is_suite] = tests.all? { |node| node.topLevel == suite }
+  end
+  d.reject
+end
+begin
+  test_runner.show_select
+rescue => e
+  selections[:error] = "#{e.class}: #{e.message}"
+end
+chk('the Test Selections dialog opens and lists the demo suites') do
+  selections[:error] && raise(selections[:error])
+  selections[:suites].to_a.include?('ExampleTestSuite') || raise("suites #{selections[:suites].inspect}")
+end
+chk('its button box has OK and Cancel') do
+  (selections[:buttons].to_a & %w[OK Cancel]).size == 2 || raise("buttons #{selections[:buttons].inspect}")
+end
+chk("checking a suite checks its tests, whose top level is that suite") do
+  (selections[:checked] && selections[:top_is_suite]) ||
+    raise("checked #{selections[:checked].inspect}, top level #{selections[:top_is_suite].inspect}")
+end
+test_runner.hide
+
+say "\n39. LimitsMonitor's Ignored Telemetry Items dialog removed nothing"
+say "   (Remove Selected reads each selected item's data (limits_monitor.rb:"
+say "    786), then removes the selection with qt.rb's remove_selected_items,"
+say "    which calls ListWidget#row (qt.rb:614). Both were unbound -- see"
+say "    test_regressions.rb section 84.)"
+require 'cosmos/tools/limits_monitor/limits_monitor'
+class Qt6SuiteLimitsMonitor < Cosmos::LimitsMonitor
+  # The server threads initialize starts (limits_monitor.rb:560-561).
+  def limits_thread; end
+  def value_thread; end
+end
+_, lm_options = Cosmos::LimitsMonitor.create_default_options
+lm_options.title = 'Limits Monitor'
+lm_options.auto_size = false
+lm_options.remember_geometry = false
+lm_options.redirect_io = false   # see sr_options
+limits_monitor = Qt6SuiteLimitsMonitor.new(lm_options)
+lm_items = limits_monitor.instance_variable_get(:@limits_items)
+lm_items.ignored << %w[INST HEALTH_STATUS TEMP1]
+lm_items.ignored << %w[INST HEALTH_STATUS TEMP2]
+lm_removal = nil
+on_dialog('Ignored Telemetry Items') do |d|
+  list = d.findChildren.find { |c| c.is_a?(Qt::ListWidget) }
+  list.item(0).setSelected(true)   # ITEM: INST HEALTH_STATUS TEMP1
+  err = reported { button(d, 'Remove Selected').click }
+  lm_removal = [err, list.count]
+  d.done(0)
+end
+limits_monitor.edit_ignored_items
+chk('Remove Selected takes the item off the ignore list and the dialog') do
+  err, left = lm_removal
+  err.to_s.empty? || raise(err.lines.first.to_s.strip)
+  (lm_items.ignored == [%w[INST HEALTH_STATUS TEMP2]] && left == 1) ||
+    raise("ignored #{lm_items.ignored.inspect}, #{left.inspect} left in the list")
+end
+limits_monitor.hide
+
+say "\n40. TlmGrapher's overview graph hung mostly below its tab"
+say "   (its sizeHint override (overview_graph.rb:81) was never consulted,"
+say "    so the tab's layout gave it 0 px at the bottom; LineGraph's"
+say "    resizeEvent then grew it to its 50 px minimum (line_graph_drawing.rb:"
+say "    475-497) from there, past the tab's edge -- see test_regressions.rb"
+say "    section 86)"
+require 'cosmos/gui/line_graph/overview_graph'
+# The tab's layout, as overview_tabbed_plots.rb:157-173 builds it.
+overview_tab = Qt::Widget.new
+overview_layout = Qt::VBoxLayout.new
+overview_plots = Qt::AdaptiveGridLayout.new
+overview_plots.addWidget(Qt::Widget.new)   # a plot
+overview_layout.addLayout(overview_plots, 1)
+overview_layout.addStretch
+overview_graph = Cosmos::OverviewGraph.new(overview_tab)
+overview_layout.addWidget(overview_graph)
+overview_tab.setLayout(overview_layout)
+overview_tab.resize(800, 600)
+overview_tab.show
+APP.processEvents
+chk('the overview graph gets its 50 px inside the tab') do
+  bottom = overview_graph.y + overview_graph.height
+  (overview_graph.height == 50 && bottom <= overview_tab.height) ||
+    raise("#{overview_graph.height} px tall, bottom at #{bottom} of #{overview_tab.height}")
+end
+overview_tab.hide
+
+say "\n41. Integer and float choosers kept an out-of-range entry"
+say "   (their validators' fixup clamps it (integer_chooser.rb:15-31,"
+say "    float_chooser.rb:15-29), but fixup was never called, and the"
+say "    validator's parent was nil -- test_regressions.rb section 87)"
+require 'cosmos/gui/choosers/integer_chooser'
+require 'cosmos/gui/choosers/float_chooser'
+# Types +text+ into the chooser's field and moves the focus to the other.
+def chooser_entry(chooser, other, text)
+  field = chooser.instance_variable_get(:@value)
+  field.setFocus
+  APP.processEvents
+  field.setText(text)
+  other.setFocus
+  APP.processEvents
+  field.text
+end
+chooser_host = Qt::Widget.new
+chooser_layout = Qt::VBoxLayout.new
+int_chooser = Cosmos::IntegerChooser.new(chooser_host, 'Count', 5, 0, 100)
+float_chooser = Cosmos::FloatChooser.new(chooser_host, 'Scale', 0.5, 0.0, 1.0)
+other_field = Qt::LineEdit.new
+[int_chooser, float_chooser, other_field].each { |w| chooser_layout.addWidget(w) }
+chooser_host.setLayout(chooser_layout)
+chooser_host.show
+APP.processEvents
+chk('IntegerChooser clamps 500 to its maximum, 100') do
+  (text = chooser_entry(int_chooser, other_field, '500')) == '100' || raise("field #{text.inspect}")
+end
+chk('FloatChooser clamps 7.5 to its maximum, 1.0') do
+  (text = chooser_entry(float_chooser, other_field, '7.5')) == '1.0' || raise("field #{text.inspect}")
+end
+chooser_host.hide
+
+say "\n42. ScriptRunner --disconnect raised NoMethodError on nil"
+say "   (disconnect mode starts with toggle_disconnect(file, false)"
+say "    (script_runner.rb:83), which builds no file chooser but then reads"
+say "    chooser.filename once any target is checked (script_runner_frame.rb:"
+say "    1196). v4.5.2 has the same code.)"
+recorded = nil   # the section 1 frame's set_disconnected_targets stand-in
+on_dialog('Disconnect Settings') { |d| button(d, 'Ok').click }
+dc_error = begin
+  frame.toggle_disconnect(Cosmos::CmdTlmServer::DEFAULT_CONFIG_FILE, false)
+  nil
+rescue Exception => e
+  e
+end
+wait_for { recorded }
+chk('disconnecting without asking for a config file completes') { dc_error.nil? || raise(dc_error) }
+chk('it disconnects with the config file it was given') do
+  (recorded && recorded[2] == Cosmos::CmdTlmServer::DEFAULT_CONFIG_FILE) || raise("recorded #{recorded.inspect}")
 end
 
 say

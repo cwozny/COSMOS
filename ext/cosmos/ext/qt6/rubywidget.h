@@ -44,6 +44,9 @@ void ruby_with_gvl(const std::function<void()> &fn);
 // NoMethodError. Calling it runs Qt's default; it self-clears so a handler
 // cannot invoke the base twice.
 QEvent *ruby_call_base_event();
+// The real event of that dispatch (nullptr outside one), without running its
+// base: qt_base_event hands it to another widget's handler.
+QEvent *ruby_current_event();
 
 // RAII: installs the base-class thunk for the duration of one dispatch, so a
 // Ruby override's `super` can run Qt's default. Restores the previous thunk,
@@ -74,6 +77,13 @@ struct RubyOverrides {
 // Qt's default and never takes the GVL. True otherwise, and for a name not
 // tracked here, when ruby_event_dispatch decides as before.
 bool ruby_overrides(const QObject *obj, RubyOverrides &cache, const char *method);
+// A Ruby sizeHint or minimumSizeHint override's size. False: none, or it did
+// not return a Qt::Size, and the caller uses Qt's own. Layouts ask these
+// constantly, so it too asks ruby_overrides first.
+bool ruby_size_hint(const QObject *obj, RubyOverrides &cache, const char *method, QSize *out);
+// Runs a Ruby fixup override on input, which it may rewrite in place. False:
+// none, and the caller runs Qt's own.
+bool ruby_fixup(const QObject *obj, RubyOverrides &cache, QString &input);
 
 // Invokes a Ruby-side override of a Qt virtual, if the wrapper defines one.
 // Returns true when Ruby handled the event, false to fall through to Qt's
@@ -116,6 +126,9 @@ class RubyGLWidget : public QOpenGLWidget {
   Q_OBJECT
 public:
   explicit RubyGLWidget(QWidget *parent = nullptr) : QOpenGLWidget(parent) {}
+  // gl_viewer.rb:87-93
+  QSize sizeHint() const override;
+  QSize minimumSizeHint() const override;
 protected:
   void initializeGL() override;
   void resizeGL(int w, int h) override;
@@ -157,6 +170,9 @@ class RubyWidget : public QWidget {
   Q_OBJECT
 public:
   explicit RubyWidget(QWidget *parent = nullptr) : QWidget(parent) {}
+  // overview_graph.rb:81; the tab's layout gave the overview graph 0 px.
+  QSize sizeHint() const override;
+  QSize minimumSizeHint() const override;
 
 protected:
   void paintEvent(QPaintEvent *e) override;
@@ -236,6 +252,15 @@ class RubyForward : public Base {
 public:
   template <typename... Args>
   explicit RubyForward(Args &&... args) : Base(std::forward<Args>(args)...) {}
+
+  QSize sizeHint() const override {
+    QSize s;
+    return ruby_size_hint(this, m_overrides, "sizeHint", &s) ? s : Base::sizeHint();
+  }
+  QSize minimumSizeHint() const override {
+    QSize s;
+    return ruby_size_hint(this, m_overrides, "minimumSizeHint", &s) ? s : Base::minimumSizeHint();
+  }
 
 protected:
   // Dispatch with a real event object and apply the handler's accept/ignore
@@ -381,6 +406,24 @@ private:
     else                                            Base::mouseReleaseEvent(e);
   }
 
+  mutable RubyOverrides m_overrides;
+};
+
+// QValidator::fixup, which QLineEdit calls for an entry the validator does
+// not accept once editing finishes. IntegerChooser's and FloatChooser's
+// validators clamp an out-of-range entry there (integer_chooser.rb:15-31,
+// float_chooser.rb:15-29); nothing forwarded it, so the entry stayed.
+template <typename Base>
+class RubyValidator : public Base {
+public:
+  template <typename... Args>
+  explicit RubyValidator(Args &&... args) : Base(std::forward<Args>(args)...) {}
+
+  void fixup(QString &input) const override {
+    if (!ruby_fixup(this, m_overrides, input)) Base::fixup(input);
+  }
+
+private:
   mutable RubyOverrides m_overrides;
 };
 

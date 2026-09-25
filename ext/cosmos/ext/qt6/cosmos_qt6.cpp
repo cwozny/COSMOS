@@ -122,6 +122,9 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <cxxabi.h>
+#include <cstdlib>
+#include <typeinfo>
 #include <set>
 #include <string>
 #include <vector>
@@ -232,9 +235,13 @@ static void qtwrap_free(void *p) {
 }
 static size_t qtwrap_size(const void *) { return sizeof(QtWrap); }
 
+// Every rb_data_type_t here leaves the end of its function struct to zero
+// initialization: Ruby 2.6 has reserved[2] there and 2.7 dcompact and
+// reserved[1], so 2.6's spelled-out { NULL, NULL } did not compile on 2.7,
+// which the gemspec's '~> 2.4' allows.
 static const rb_data_type_t qtwrap_type = {
   "Qt::Object",
-  { NULL, qtwrap_free, qtwrap_size, { NULL, NULL } },
+  { NULL, qtwrap_free, qtwrap_size },
   NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY
 };
 
@@ -369,7 +376,7 @@ static void pinned_mark(void *) {
 }
 static const rb_data_type_t pinned_root_type = {
   "Qt::PinnedWrappers",
-  { pinned_mark, NULL, NULL, { NULL, NULL } },
+  { pinned_mark, NULL, NULL },
   NULL, NULL, 0
 };
 
@@ -398,7 +405,7 @@ static void anchored_mark(void *) {
 }
 static const rb_data_type_t anchored_root_type = {
   "Qt::AnchoredBlocks",
-  { anchored_mark, NULL, NULL, { NULL, NULL } },
+  { anchored_mark, NULL, NULL },
   NULL, NULL, 0
 };
 // COSMOS telemetry is binary (ascii-8bit) and packet items routinely carry
@@ -438,9 +445,17 @@ static VALUE app_exec(VALUE self) {
 // Runs the Qt event loop for `ms` with the GVL RELEASED, so Ruby's other
 // threads keep being scheduled. Any Ruby callback fired from inside the loop
 // re-acquires the GVL first (see RubyCallback::invoke).
+// Runs events for ms milliseconds. A local loop: ending QApplication::exec
+// with QCoreApplication::quit closes every top-level window in Qt 6, which
+// took the suites' windows down between checks. A pending exit still ends
+// it (QCoreApplication::exit ends every loop on the thread).
 static VALUE app_exec_for(VALUE self, VALUE ms) {
-  QTimer::singleShot(NUM2INT(ms), qApp, &QCoreApplication::quit);
-  ruby_without_gvl([] { QApplication::exec(); });
+  const int msec = NUM2INT(ms);
+  ruby_without_gvl([msec] {
+    QEventLoop loop;
+    QTimer::singleShot(msec, &loop, &QEventLoop::quit);
+    loop.exec();
+  });
   ruby_raise_pending_exit();
   return Qnil;
 }
@@ -613,6 +628,9 @@ static QObject *ctor_slider(int argc, VALUE *argv) {
 // paints the palette's white text onto those white backgrounds, which is why
 // the Legal Agreement pane looks empty. Default to the light scheme COSMOS
 // was written against. COSMOS_QT_COLOR_SCHEME=dark|system opts out.
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+static int g_color_scheme_requested = 0;   // see qt_color_scheme
+#endif
 static void apply_color_scheme() {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
   const char *want = getenv("COSMOS_QT_COLOR_SCHEME");
@@ -620,6 +638,19 @@ static void apply_color_scheme() {
   Qt::ColorScheme scheme = Qt::ColorScheme::Light;
   if (want && !strcasecmp(want, "dark")) scheme = Qt::ColorScheme::Dark;
   if (QStyleHints *h = QGuiApplication::styleHints()) h->setColorScheme(scheme);
+  g_color_scheme_requested = (int)scheme;
+#endif
+}
+
+// The colour scheme apply_color_scheme asked Qt for: 0 none (system), 1
+// light, 2 dark; nil before Qt 6.8, which has no way to ask. For the suites:
+// offscreen, the platform ignores the request and the palette is light
+// either way, so only the request itself can be checked.
+static VALUE qt_color_scheme(VALUE) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+  return INT2NUM(g_color_scheme_requested);
+#else
+  return Qnil;
 #endif
 }
 
@@ -852,11 +883,27 @@ static VALUE button_click(VALUE self) {
 template <typename T> static void val_free(void *p) { delete static_cast<T *>(p); }
 template <typename T> static size_t val_size(const void *) { return sizeof(T); }
 
+// The Ruby class a wrapped C++ type is exposed as ("QSize" -> "Qt::Size"),
+// for TypeError messages: every value type was "Qt::Value" and every item
+// type "Qt::Item", so they read "wrong argument type Qt::Value (expected
+// Qt::Value)".
+template <typename T> static const char *ruby_type_name() {
+  static const std::string name = [] {
+    int status = 0;
+    char *demangled = abi::__cxa_demangle(typeid(T).name(), NULL, NULL, &status);
+    std::string n = (status == 0 && demangled) ? demangled : typeid(T).name();
+    free(demangled);
+    if (n.size() > 1 && n[0] == 'Q') n = "Qt::" + n.substr(1);
+    return n;
+  }();
+  return name.c_str();
+}
+
 template <typename T> static const rb_data_type_t &val_type() {
   // One static per instantiation, so TypedData type-checking stays sound.
   static const rb_data_type_t t = {
-    "Qt::Value",
-    { NULL, val_free<T>, val_size<T>, { NULL, NULL } },
+    ruby_type_name<T>(),
+    { NULL, val_free<T>, val_size<T> },
     NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY
   };
   return t;
@@ -1130,7 +1177,7 @@ static VALUE core_set_app_name(VALUE self, VALUE v) {
 // ---------------------------------------------------------------------------
 template <typename T> static const rb_data_type_t &ptr_type() {
   static const rb_data_type_t t = {
-    "Qt::Item", { NULL, NULL, NULL, { NULL, NULL } }, NULL, NULL, 0
+    ruby_type_name<T>(), { NULL, NULL, NULL }, NULL, NULL, 0
   };
   return t;   // dfree == NULL: the owning widget frees it, not Ruby
 }
@@ -1138,7 +1185,21 @@ template <typename T> static VALUE wrap_ptr(VALUE klass, T *p) {
   return p ? TypedData_Wrap_Struct(klass, &ptr_type<T>(), p) : Qnil;
 }
 template <typename T> static T *get_ptr(VALUE self) {
-  T *p; TypedData_Get_Struct(self, T, &ptr_type<T>(), p); return p;
+  T *p; TypedData_Get_Struct(self, T, &ptr_type<T>(), p);
+  if (!p) rb_raise(rb_eRuntimeError, "Qt item has been disposed");
+  return p;
+}
+// A new wrapper is made for every lookup (topLevelItem, child, parent, ...),
+// so == compares the Qt items, not the wrappers. TestRunner's Test
+// Selections unchecks every suite but the clicked item's top level
+// (test_runner.rb:753); with object identity that was every suite.
+template <typename T> static VALUE item_eq(VALUE self, VALUE other) {
+  if (!rb_typeddata_is_kind_of(other, &ptr_type<T>())) return Qfalse;
+  void *p = DATA_PTR(self);
+  return p && p == DATA_PTR(other) ? Qtrue : Qfalse;
+}
+template <typename T> static VALUE item_hash(VALUE self) {
+  return ULL2NUM((unsigned long long)(uintptr_t)DATA_PTR(self));
 }
 
 static VALUE cTableWidget, cTableWidgetItem, cTreeWidget, cTreeWidgetItem;
@@ -1221,11 +1282,16 @@ static VALUE lwitem_new(int argc, VALUE *argv, VALUE klass) {
 }
 static VALUE lwitem_initialize(int argc, VALUE *argv, VALUE self) {
   QListWidgetItem *it = get_ptr<QListWidgetItem>(self);
+  QListWidget *list = NULL;
   for (int i = 0; i < argc; i++) {
     if (NIL_P(argv[i])) continue;
     if (RB_TYPE_P(argv[i], T_STRING))           it->setText(rb_to_qs(argv[i]));
     else if (rb_obj_is_kind_of(argv[i], cIcon)) it->setIcon(*get_val<QIcon>(argv[i]));
+    else if (rb_obj_is_kind_of(argv[i], cListWidget)) list = qcast<QListWidget>(argv[i]);
   }
+  // The (text, list) overload: ExceptionListDialog adds each exception this
+  // way (exception_list_dialog.rb:39), and its list stayed empty.
+  if (list) list->addItem(it);
   return self;
 }
 static VALUE tritem_text(VALUE self, VALUE col) {
@@ -1340,11 +1406,15 @@ static VALUE menu_add_action(VALUE self, VALUE a) {
   release_ownership(a);
   return self;
 }
+// Returns the separator action, as Qt does: PacketViewer labels its View
+// menu's separator with addSeparator.setText('Formatting')
+// (packet_viewer.rb:191), which retitled the whole menu when this returned it.
 static VALUE menu_add_separator(VALUE self) {
   QObject *o = get_obj(self);
-  if (QMenu *m = qobject_cast<QMenu *>(o))            m->addSeparator();
-  else if (QToolBar *t = qobject_cast<QToolBar *>(o)) t->addSeparator();
-  return self;
+  QAction *sep = NULL;
+  if (QMenu *m = qobject_cast<QMenu *>(o))            sep = m->addSeparator();
+  else if (QToolBar *t = qobject_cast<QToolBar *>(o)) sep = t->addSeparator();
+  return sep ? wrap_obj(cAction, sep, false) : Qnil;   // the menu owns it
 }
 // menu.exec(global_point) opens every COSMOS context menu (14 sites in 11
 // files, e.g. cmd_params.rb:194, script_runner.rb:889). Unbound, it resolved
@@ -1752,19 +1822,25 @@ static VALUE image_new(int argc, VALUE *argv, VALUE klass) {
 static VALUE image_width(VALUE self)  { return INT2NUM(get_val<QImage>(self)->width()); }
 static VALUE image_height(VALUE self) { return INT2NUM(get_val<QImage>(self)->height()); }
 
+// (organization, application) as COSMOS makes them, and qtbindings'
+// (file, format), which lets the suites use a file of their own.
 static VALUE settings_init(int argc, VALUE *argv, VALUE self) {
   if (get_wrap(self)->ptr) return self;
   VALUE org, app2; rb_scan_args(argc, argv, "02", &org, &app2);
-  QSettings *st = (NIL_P(org) || NIL_P(app2))
-      ? new QSettings() : new QSettings(rb_to_qs(org), rb_to_qs(app2));
+  QSettings *st;
+  if (NIL_P(org) || NIL_P(app2))  st = new QSettings();
+  else if (RB_INTEGER_TYPE_P(app2)) st = new QSettings(rb_to_qs(org), (QSettings::Format)NUM2INT(app2));
+  else                            st = new QSettings(rb_to_qs(org), rb_to_qs(app2));
   attach(self, st, true);
   return self;
 }
+// Takes whatever Qt::Variant.new takes. It was registered twice, and both
+// versions turned anything but an Integer, Size, Point or Variant into a
+// String with rb_to_qs: a Float or a boolean raised TypeError.
 static VALUE settings_set_value(VALUE self, VALUE k, VALUE v) {
-  QSettings *st = qcast<QSettings>(self);
-  if (rb_obj_is_kind_of(v, cVariant)) st->setValue(rb_to_qs(k), *get_val<QVariant>(v));
-  else if (RB_TYPE_P(v, T_FIXNUM))    st->setValue(rb_to_qs(k), NUM2INT(v));
-  else                                 st->setValue(rb_to_qs(k), rb_to_qs(v));
+  QVariant var;
+  if (!variant_arg(v, &var)) var = *get_val<QVariant>(variant_new(1, &v, cVariant));
+  qcast<QSettings>(self)->setValue(rb_to_qs(k), var);
   return self;
 }
 static VALUE settings_value(VALUE self, VALUE k) {
@@ -1815,21 +1891,40 @@ static VALUE cIntValidator, cDoubleValidator, cCompleter, cPainter, cRect, cPoin
 static VALUE cTextBlockKlass = Qnil;   // hoisted: used by the text-editing accessors above
 static VALUE cPolygon, cTextDocument, cTextCharFormat, cTextOption, cUrl, cDate;
 
+// The validators' Qt::Object arguments are the parent and the rest the
+// range: (parent), (bottom, top[, parent]), and for DoubleValidator
+// (bottom, top, decimals[, parent]). IntegerChooser and FloatChooser pass
+// their line edit (integer_chooser.rb:53), and their fixup overrides reach it
+// as parent(); taking the line edit as the bottom of the range left it nil.
+// A parented validator belongs to it.
+static QObject *validator_args(int argc, VALUE *argv, VALUE *nums, int max, int *n) {
+  QObject *parent = NULL;
+  *n = 0;
+  for (int i = 0; i < argc; i++) {
+    if (rb_obj_is_kind_of(argv[i], cQtBase)) parent = get_obj(argv[i]);
+    else if (!NIL_P(argv[i]) && *n < max) nums[(*n)++] = argv[i];
+  }
+  return parent;
+}
 static VALUE intval_init(int argc, VALUE *argv, VALUE self) {
   if (get_wrap(self)->ptr) return self;
-  VALUE lo, hi; rb_scan_args(argc, argv, "02", &lo, &hi);
-  QIntValidator *v = (NIL_P(lo) || NIL_P(hi))
-      ? new QIntValidator() : new QIntValidator(NUM2INT(lo), NUM2INT(hi));
-  attach(self, v, true);
+  VALUE nums[2]; int n;
+  QObject *parent = validator_args(argc, argv, nums, 2, &n);
+  QIntValidator *v = n == 2
+      ? new RubyValidator<QIntValidator>(NUM2INT(nums[0]), NUM2INT(nums[1]), parent)
+      : new RubyValidator<QIntValidator>(parent);
+  attach(self, v, !parent);
   return self;
 }
 static VALUE dblval_init(int argc, VALUE *argv, VALUE self) {
   if (get_wrap(self)->ptr) return self;
-  VALUE lo, hi, dec; rb_scan_args(argc, argv, "03", &lo, &hi, &dec);
-  QDoubleValidator *v = (NIL_P(lo) || NIL_P(hi))
-      ? new QDoubleValidator()
-      : new QDoubleValidator(NUM2DBL(lo), NUM2DBL(hi), NIL_P(dec) ? 2 : NUM2INT(dec));
-  attach(self, v, true);
+  VALUE nums[3]; int n;
+  QObject *parent = validator_args(argc, argv, nums, 3, &n);
+  QDoubleValidator *v = n >= 2
+      ? new RubyValidator<QDoubleValidator>(NUM2DBL(nums[0]), NUM2DBL(nums[1]),
+                                            n == 3 ? NUM2INT(nums[2]) : 2, parent)
+      : new RubyValidator<QDoubleValidator>(parent);
+  attach(self, v, !parent);
   return self;
 }
 static VALUE dblval_set_notation(VALUE self, VALUE n) {
@@ -1852,6 +1947,12 @@ static VALUE intval_set_bottom(VALUE self, VALUE v) {
 static VALUE intval_set_top(VALUE self, VALUE v) {
   qcast<QIntValidator>(self)->setTop(NUM2INT(v)); return self;
 }
+// The choosers' fixup overrides clamp to bottom() and top()
+// (integer_chooser.rb:19/22, float_chooser.rb:19/22).
+static VALUE intval_bottom(VALUE self) { return INT2NUM(qcast<QIntValidator>(self)->bottom()); }
+static VALUE intval_top(VALUE self)    { return INT2NUM(qcast<QIntValidator>(self)->top()); }
+static VALUE dblval_bottom(VALUE self) { return rb_float_new(qcast<QDoubleValidator>(self)->bottom()); }
+static VALUE dblval_top(VALUE self)    { return rb_float_new(qcast<QDoubleValidator>(self)->top()); }
 static VALUE intval_set_range(VALUE self, VALUE lo, VALUE hi) {
   qcast<QIntValidator>(self)->setRange(NUM2INT(lo), NUM2INT(hi)); return self;
 }
@@ -2795,12 +2896,87 @@ static VALUE url_to_local_file(VALUE self) {
   return rb_str_new2(get_val<QUrl>(self)->toLocalFile().toUtf8().constData());
 }
 
+// The object and virtual being dispatched into Ruby (ruby_event_dispatch_n,
+// ruby_event_call). A handler called on that object under that name is its
+// override's super.
+static thread_local QObject *t_dispatch_obj = nullptr;
+static thread_local const char *t_dispatch_method = nullptr;
+struct DispatchScope {
+  QObject *saved_obj;
+  const char *saved_method;
+  DispatchScope(QObject *o, const char *m) : saved_obj(t_dispatch_obj), saved_method(t_dispatch_method) {
+    t_dispatch_obj = o;
+    t_dispatch_method = m;
+  }
+  ~DispatchScope() { t_dispatch_obj = saved_obj; t_dispatch_method = saved_method; }
+};
+// While qt_base_event runs another widget's handler, that widget's forwarding
+// virtual runs Qt's default instead of dispatching into Ruby: its Ruby
+// override, if it has one, is what called here (see ruby_overrides).
+static thread_local const QObject *t_bypass_obj = nullptr;
+static thread_local const char *t_bypass_method = nullptr;
+
+// The protected QWidget handlers, public so one can run on another widget.
+// Calls through this are virtual: they reach the widget's own class.
+struct WidgetHandlers : public QWidget {
+  using QWidget::closeEvent;   using QWidget::paintEvent;   using QWidget::resizeEvent;
+  using QWidget::showEvent;    using QWidget::wheelEvent;   using QWidget::leaveEvent;
+  using QWidget::focusInEvent; using QWidget::focusOutEvent; using QWidget::keyPressEvent;
+  using QWidget::mousePressEvent; using QWidget::mouseMoveEvent; using QWidget::mouseReleaseEvent;
+};
+// `other.wheelEvent(event)` inside a handler runs other's own handler on the
+// event being dispatched, as qtbindings did. TableManager hands each combo
+// box's wheel to its window this way, whose default ignores it so the table
+// scrolls (table_manager.rb:20-24). Nothing runs outside a dispatch, or for
+// an event the handler does not take. Returns the event it ran on.
+static QEvent *run_other_handler(QObject *receiver, const char *name) {
+  QEvent *e = ruby_current_event();
+  QWidget *w = qobject_cast<QWidget *>(receiver);
+  if (!e || !w || !name) return nullptr;
+  WidgetHandlers *h = static_cast<WidgetHandlers *>(w);
+  const QEvent::Type t = e->type();
+  const QObject *saved_obj = t_bypass_obj;
+  const char *saved_method = t_bypass_method;
+  t_bypass_obj = w;
+  t_bypass_method = name;
+  bool ran = true;
+  if (!strcmp(name, "closeEvent") && t == QEvent::Close)            h->closeEvent(static_cast<QCloseEvent *>(e));
+  else if (!strcmp(name, "paintEvent") && t == QEvent::Paint)       h->paintEvent(static_cast<QPaintEvent *>(e));
+  else if (!strcmp(name, "resizeEvent") && t == QEvent::Resize)     h->resizeEvent(static_cast<QResizeEvent *>(e));
+  else if (!strcmp(name, "showEvent") && t == QEvent::Show)         h->showEvent(static_cast<QShowEvent *>(e));
+  else if (!strcmp(name, "wheelEvent") && t == QEvent::Wheel)       h->wheelEvent(static_cast<QWheelEvent *>(e));
+  else if (!strcmp(name, "leaveEvent") && t == QEvent::Leave)       h->leaveEvent(e);
+  else if (!strcmp(name, "focusInEvent") && t == QEvent::FocusIn)   h->focusInEvent(static_cast<QFocusEvent *>(e));
+  else if (!strcmp(name, "focusOutEvent") && t == QEvent::FocusOut) h->focusOutEvent(static_cast<QFocusEvent *>(e));
+  else if (!strcmp(name, "keyPressEvent") && t == QEvent::KeyPress) h->keyPressEvent(static_cast<QKeyEvent *>(e));
+  else if (!strcmp(name, "mousePressEvent") &&
+           (t == QEvent::MouseButtonPress || t == QEvent::MouseButtonDblClick))
+    h->mousePressEvent(static_cast<QMouseEvent *>(e));
+  else if (!strcmp(name, "mouseMoveEvent") && t == QEvent::MouseMove)
+    h->mouseMoveEvent(static_cast<QMouseEvent *>(e));
+  else if (!strcmp(name, "mouseReleaseEvent") && t == QEvent::MouseButtonRelease)
+    h->mouseReleaseEvent(static_cast<QMouseEvent *>(e));
+  else ran = false;
+  t_bypass_obj = saved_obj;
+  t_bypass_method = saved_method;
+  return ran ? e : nullptr;
+}
+
 // Bound so a Ruby override's `super` reaches Qt's default implementation.
 // 25 COSMOS event handlers call super; without these it is a NoMethodError
-// ("super: no superclass method `closeEvent'"). Takes any args and ignores
-// them -- the event pointer is captured by the dispatching virtual.
-static VALUE qt_base_event(int argc, VALUE *argv, VALUE) {
-  QEvent *e = ruby_call_base_event();
+// ("super: no superclass method `closeEvent'"). The event pointer is
+// captured by the dispatching virtual. Called on any other widget, or under
+// another handler's name, it is that widget's handler instead: it used to run
+// whatever default was being dispatched, whatever the receiver.
+static VALUE qt_base_event(int argc, VALUE *argv, VALUE self) {
+  QObject *receiver = get_wrap(self)->ptr;   // NULL once Qt deleted it
+  const char *name = rb_id2name(rb_frame_this_func());
+  QEvent *e;
+  if (receiver && receiver == t_dispatch_obj && t_dispatch_method && name &&
+      !strcmp(name, t_dispatch_method))
+    e = ruby_call_base_event();
+  else
+    e = run_other_handler(receiver, name);
   // Copy what Qt's default did to the event back into the Ruby snapshot the
   // override was handed: the dispatcher writes the snapshot's flag onto the
   // real event afterwards, and the untouched default (accepted) undid Qt's
@@ -3170,15 +3346,6 @@ static VALUE variant_to_point(VALUE self) {
 static VALUE settings_contains(VALUE self, VALUE k) {
   return qcast<QSettings>(self)->contains(rb_to_qs(k)) ? Qtrue : Qfalse;
 }
-static VALUE settings_set_value_variant(VALUE self, VALUE k, VALUE v) {
-  QSettings *st = qcast<QSettings>(self);
-  if (rb_obj_is_kind_of(v, cSize))       st->setValue(rb_to_qs(k), *get_val<QSize>(v));
-  else if (rb_obj_is_kind_of(v, cPoint)) st->setValue(rb_to_qs(k), *get_val<QPoint>(v));
-  else if (rb_obj_is_kind_of(v, cVariant)) st->setValue(rb_to_qs(k), *get_val<QVariant>(v));
-  else if (RB_TYPE_P(v, T_FIXNUM))       st->setValue(rb_to_qs(k), NUM2INT(v));
-  else                                    st->setValue(rb_to_qs(k), rb_to_qs(v));
-  return self;
-}
 
 // ---- resize/move accepting value types -------------------------------------
 static VALUE widget_resize_v(int argc, VALUE *argv, VALUE self) {
@@ -3231,7 +3398,7 @@ static void painter_free(void *v) {
 static size_t painter_size(const void *) { return sizeof(PainterWrap); }
 static const rb_data_type_t painter_type = {
   "Qt::Painter",
-  { NULL, painter_free, painter_size, { NULL, NULL } },
+  { NULL, painter_free, painter_size },
   NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY
 };
 
@@ -3421,6 +3588,7 @@ bool ruby_event_dispatch_n(QObject *obj, const char *method, int argc, VALUE *ar
   EvCall c;
   c.obj = self; c.mid = mid; c.argc = argc;
   for (int i = 0; i < argc && i < 4; i++) c.argv[i] = argv[i];
+  DispatchScope ds(obj, method);
   return ev_invoke_protected(&c, method);
 }
 
@@ -3732,6 +3900,7 @@ VALUE ruby_event_call(QObject *obj, const char *method, int argc, VALUE *argv, b
   r.ev.obj = self; r.ev.mid = mid; r.ev.argc = argc;
   for (int i = 0; i < argc && i < 4; i++) r.ev.argv[i] = argv[i];
   r.result = Qnil;
+  DispatchScope ds(obj, method);
   *handled = ev_call_ret_protected(&r, method);
   return r.result;
 }
@@ -4023,9 +4192,6 @@ static VALUE tc_at_end(VALUE self)          { return get_val<QTextCursor>(self)-
 static VALUE tc_at_start(VALUE self)        { return get_val<QTextCursor>(self)->atStart() ? Qtrue : Qfalse; }
 static VALUE tc_block_text(VALUE self) {
   return rb_str_new2(get_val<QTextCursor>(self)->block().text().toUtf8().constData());
-}
-static VALUE tc_selected_text(VALUE self)  {
-  return rb_str_new2(get_val<QTextCursor>(self)->selectedText().toUtf8().constData());
 }
 static VALUE tc_select(VALUE self, VALUE sel) {
   get_val<QTextCursor>(self)->select((QTextCursor::SelectionType)NUM2INT(sel)); return self;
@@ -4461,9 +4627,11 @@ static VALUE guard_3(VALUE self, VALUE a, VALUE b, VALUE c) {
 static VALUE guard_4(VALUE self, VALUE a, VALUE b, VALUE c, VALUE d) {
   return ((VALUE (*)(VALUE, VALUE, VALUE, VALUE, VALUE))guarded_target())(self, a, b, c, d);
 }
+// (rb_define_method)(...) calls the function, not the Ruby 2.7+ macro of the
+// same name, which only takes a compile-time arity; this one is a variable.
 static void define_guarded(VALUE owner, const char *name, AnyFn fn, int arity) {
   for (const char *u : kUnguarded)
-    if (!strcmp(u, name)) { rb_define_method(owner, name, fn, arity); return; }
+    if (!strcmp(u, name)) { (rb_define_method)(owner, name, fn, arity); return; }
   AnyFn tramp;
   switch (arity) {
     case -1: tramp = RUBY_METHOD_FUNC(guard_m1); break;
@@ -4475,7 +4643,7 @@ static void define_guarded(VALUE owner, const char *name, AnyFn fn, int arity) {
     default: rb_fatal("qt6 binding: no main-thread guard for arity %d (%s)", arity, name);
   }
   g_bound[BoundKey{owner, rb_intern(name)}] = fn;
-  rb_define_method(owner, name, tramp, arity);
+  (rb_define_method)(owner, name, tramp, arity);
 }
 // A Qt class's own (singleton) method, e.g. Qt::MessageBox.warning.
 #define QCDEF(klass, name, fn, arity) \
@@ -4519,6 +4687,7 @@ static const char *const kForwardedVirtuals[] = {
   "dragEnterEvent", "dragMoveEvent", "dropEvent", "reject",
   "initializeGL", "resizeGL", "paintGL",
   "createEditor", "setEditorData", "setModelData", "paint",
+  "sizeHint", "minimumSizeHint", "fixup",
 };
 static const int kForwardedCount = (int)(sizeof(kForwardedVirtuals) / sizeof(kForwardedVirtuals[0]));
 static std::atomic<unsigned long> g_override_epoch{1};   // caches start at 0
@@ -4558,6 +4727,10 @@ static bool override_mask(const QObject *obj, unsigned *mask) {
   return true;
 }
 bool ruby_overrides(const QObject *obj, RubyOverrides &c, const char *method) {
+  if (obj == t_bypass_obj && t_bypass_method && !strcmp(method, t_bypass_method)) {
+    t_bypass_obj = nullptr;            // this one call only (see run_other_handler)
+    return false;
+  }
   int i = 0;
   while (i < kForwardedCount && strcmp(kForwardedVirtuals[i], method)) i++;
   if (i == kForwardedCount) return true;              // not tracked
@@ -4572,6 +4745,43 @@ bool ruby_overrides(const QObject *obj, RubyOverrides &c, const char *method) {
   }
   return (c.mask.load(std::memory_order_relaxed) >> i) & 1u;
 }
+// The size hint being asked of Ruby. super from the override comes back
+// through Widget#sizeHint and the virtual; that call gets Qt's own.
+static thread_local const QObject *t_hint_obj = nullptr;
+static thread_local const char *t_hint_method = nullptr;
+bool ruby_size_hint(const QObject *obj, RubyOverrides &c, const char *method, QSize *out) {
+  if (t_hint_obj == obj && t_hint_method && !strcmp(t_hint_method, method)) return false;
+  if (!ruby_overrides(obj, c, method)) return false;
+  bool ok = false;
+  ruby_with_gvl([&] {
+    const QObject *saved_obj = t_hint_obj;
+    const char *saved_method = t_hint_method;
+    t_hint_obj = obj;
+    t_hint_method = method;
+    bool handled = false;
+    VALUE r = ruby_event_call(const_cast<QObject *>(obj), method, 0, NULL, &handled);
+    t_hint_obj = saved_obj;
+    t_hint_method = saved_method;
+    if (handled && rb_obj_is_kind_of(r, cSize)) {
+      *out = *get_val<QSize>(r);
+      ok = true;
+    }
+  });
+  return ok;
+}
+// The override gets the entry as a String and may rewrite it in place, which
+// is Qt's contract for fixup; COSMOS's instead set the line edit's text.
+bool ruby_fixup(const QObject *obj, RubyOverrides &c, QString &input) {
+  if (!ruby_overrides(obj, c, "fixup")) return false;
+  bool handled = false;
+  ruby_with_gvl([&] {
+    VALUE str = rb_utf8_str_new_cstr(input.toUtf8().constData());
+    handled = ruby_event_dispatch(const_cast<QObject *>(obj), "fixup", str);
+    if (handled && RB_TYPE_P(str, T_STRING)) input = rb_to_qs(str);
+  });
+  return handled;
+}
+
 // lib/Qt.rb calls this after anything that can add or remove an override.
 static VALUE qt_overrides_changed(VALUE) {
   g_override_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -4591,6 +4801,30 @@ static VALUE variant_from_value(VALUE klass, VALUE v) {
   return wrap_val<QVariant>(cVariant, QVariant(rb_to_qs(v)));
 }
 
+// The setModelData overrides of CmdSender's parameter delegate and
+// TableManager's write the picked state back with
+// model.setData(index, Qt::Variant.new(text), Qt::EditRole)
+// (cmd_param_table_item_delegate.rb:74, table_manager.rb:75).
+static VALUE model_set_data(int argc, VALUE *argv, VALUE self) {
+  VALUE idx, value, role;
+  rb_scan_args(argc, argv, "21", &idx, &value, &role);
+  QVariant v;
+  if (!variant_arg(value, &v)) v = *get_val<QVariant>(variant_new(1, &value, cVariant));
+  return qcast<QAbstractItemModel>(self)->setData(
+      *get_val<QModelIndex>(idx), v, NIL_P(role) ? (int)Qt::EditRole : NUM2INT(role)) ? Qtrue : Qfalse;
+}
+
+
+// QDialogButtonBox(buttons[, parent]): TestRunner's Test Selections asks for
+// Ok | Cancel (test_runner.rb:856); ctor_plain ignored them, so it had none.
+static QObject *ctor_dialog_button_box(int argc, VALUE *argv) {
+  QWidget *p = parent_arg(argc, argv);
+  if (p) g_ctor_took_parent = true;
+  for (int i = 0; i < argc; i++)
+    if (RB_INTEGER_TYPE_P(argv[i]))
+      return new QDialogButtonBox(QDialogButtonBox::StandardButtons(NUM2INT(argv[i])), p);
+  return new QDialogButtonBox(p);
+}
 
 // Qt::Shortcut was declared but never given a constructor, so every
 // Qt::Shortcut.new fell through to ctor_plain<QObject> and built a bare
@@ -4707,6 +4941,50 @@ static VALUE lwitem_set_data(VALUE self, VALUE role, VALUE val) {
   get_ptr<QListWidgetItem>(self)->setData(NUM2INT(role), *get_val<QVariant>(val));
   return self;
 }
+// qt.rb reopens TreeWidgetItem with column defaults that call super
+// (qt.rb:394-424), and every COSMOS tree's itemClicked handler walks
+// checkState and parent (qt.rb:336-349); TestRunner's Test Selections reads
+// font while it builds its tree (test_runner.rb:764). All were unbound.
+static VALUE tritem_font(VALUE self, VALUE col) {
+  return wrap_val<QFont>(cFont, get_ptr<QTreeWidgetItem>(self)->font(NUM2INT(col)));
+}
+static VALUE tritem_set_font(VALUE self, VALUE col, VALUE f) {
+  get_ptr<QTreeWidgetItem>(self)->setFont(NUM2INT(col), *get_val<QFont>(f));
+  return self;
+}
+static VALUE tritem_child_count(VALUE self) {
+  return INT2NUM(get_ptr<QTreeWidgetItem>(self)->childCount());
+}
+static VALUE tritem_child(VALUE self, VALUE i) {
+  return wrap_ptr<QTreeWidgetItem>(cTreeWidgetItem, get_ptr<QTreeWidgetItem>(self)->child(NUM2INT(i)));
+}
+static VALUE tritem_parent(VALUE self) {
+  return wrap_ptr<QTreeWidgetItem>(cTreeWidgetItem, get_ptr<QTreeWidgetItem>(self)->parent());
+}
+static VALUE tritem_check_state(VALUE self, VALUE col) {
+  return INT2NUM((int)get_ptr<QTreeWidgetItem>(self)->checkState(NUM2INT(col)));
+}
+// LimitsMonitor's Ignored Telemetry Items reads each selected item's data on
+// Delete (limits_monitor.rb:786) and removes the selection with qt.rb's
+// remove_selected_items, which needs row(item) (qt.rb:614).
+static VALUE lwitem_data(VALUE self, VALUE role) {
+  return wrap_val<QVariant>(cVariant, get_ptr<QListWidgetItem>(self)->data(NUM2INT(role)));
+}
+static VALUE listw_row(VALUE self, VALUE item) {
+  return INT2NUM(qcast<QListWidget>(self)->row(get_ptr<QListWidgetItem>(item)));
+}
+// COSMOS removes list entries with takeItem(i).dispose (qt.rb:598/614/690,
+// tlm_extractor.rb:57), and lib/Qt.rb's value-type no-op leaked each one.
+// Deletes the item; one still in a list leaves it (~QListWidgetItem).
+static VALUE lwitem_dispose(VALUE self) {
+  QListWidgetItem *p = (QListWidgetItem *)DATA_PTR(self);
+  DATA_PTR(self) = NULL;
+  delete p;
+  return Qnil;
+}
+static VALUE lwitem_disposed_p(VALUE self) {
+  return DATA_PTR(self) ? Qfalse : Qtrue;
+}
 static VALUE tritem_set_check_state(VALUE self, VALUE col, VALUE st) {
   get_ptr<QTreeWidgetItem>(self)
     ->setCheckState(NUM2INT(col), (Qt::CheckState)NUM2INT(st));
@@ -4795,6 +5073,34 @@ static VALUE delegate_init_style_option(VALUE self, VALUE opt, VALUE idx) {
       get_val<QStyleOptionViewItem>(opt), *get_val<QModelIndex>(idx));
   return self;
 }
+// What super reaches from a COSMOS delegate override: QStyledItemDelegate's
+// own implementation, called non-virtually so it does not dispatch back into
+// the override. CmdSender's parameter delegate calls super for every cell it
+// does not draw itself (cmd_param_table_item_delegate.rb:38/68/76/90), and
+// TableManager's for every cell without states (table_manager.rb:64/77/94).
+static VALUE delegate_paint(VALUE self, VALUE painter, VALUE opt, VALUE idx) {
+  qcast<QStyledItemDelegate>(self)->QStyledItemDelegate::paint(
+      painter_of(painter), *get_val<QStyleOptionViewItem>(opt), *get_val<QModelIndex>(idx));
+  return Qnil;
+}
+static VALUE delegate_create_editor(VALUE self, VALUE parent, VALUE opt, VALUE idx) {
+  QStyleOptionViewItem none;
+  QWidget *w = qcast<QStyledItemDelegate>(self)->QStyledItemDelegate::createEditor(
+      ruby_unwrap_widget(parent), NIL_P(opt) ? none : *get_val<QStyleOptionViewItem>(opt),
+      *get_val<QModelIndex>(idx));
+  return ruby_wrap_qobject(w);   // the view owns the editor
+}
+static VALUE delegate_set_editor_data(VALUE self, VALUE editor, VALUE idx) {
+  qcast<QStyledItemDelegate>(self)->QStyledItemDelegate::setEditorData(
+      ruby_unwrap_widget(editor), *get_val<QModelIndex>(idx));
+  return Qnil;
+}
+static VALUE delegate_set_model_data(VALUE self, VALUE editor, VALUE model, VALUE idx) {
+  qcast<QStyledItemDelegate>(self)->QStyledItemDelegate::setModelData(
+      ruby_unwrap_widget(editor), qobject_cast<QAbstractItemModel *>(get_obj(model)),
+      *get_val<QModelIndex>(idx));
+  return Qnil;
+}
 
 // ---- bindings COSMOS calls that were never defined -------------------------
 // Each of these raised NoMethodError the first time its control was used.
@@ -4864,10 +5170,6 @@ static VALUE fm_line_spacing(VALUE self) {
 static VALUE layout_parent_widget(VALUE self) {
   return wrap_obj(cWidget, qcast<QLayout>(self)->parentWidget(), false);
 }
-static VALUE tabw_set_tab_icon(VALUE self, VALUE i, VALUE icon) {
-  qcast<QTabWidget>(self)->setTabIcon(NUM2INT(i), *get_val<QIcon>(icon));
-  return self;
-}
 
 // The C initialize goes in an included module, not on the class: COSMOS
 // reopens some of these classes with their own initialize and calls super.
@@ -4876,6 +5178,12 @@ static void item_init_module(VALUE klass, const char *name,
   VALUE m = rb_define_module_under(mQt, name);
   define_guarded(m, "initialize", RUBY_METHOD_FUNC(fn), -1);
   rb_include_module(klass, m);
+}
+// == / eql? / hash by Qt item; see item_eq.
+template <typename T> static void define_item_equality(VALUE klass) {
+  QDEF(klass, "==",   RUBY_METHOD_FUNC(item_eq<T>), 1);
+  QDEF(klass, "eql?", RUBY_METHOD_FUNC(item_eq<T>), 1);
+  QDEF(klass, "hash", RUBY_METHOD_FUNC(item_hash<T>), 0);
 }
 
 extern "C" void Init_qt6(void) {
@@ -4891,6 +5199,7 @@ extern "C" void Init_qt6(void) {
   rb_define_singleton_method(mQt, "single_shot",  RUBY_METHOD_FUNC(qt_single_shot), -1);
   rb_define_singleton_method(mQt, "post_to_main_thread", RUBY_METHOD_FUNC(qt_post_to_main), -1);
   rb_define_singleton_method(mQt, "__overrides_changed", RUBY_METHOD_FUNC(qt_overrides_changed), 0);
+  rb_define_singleton_method(mQt, "__color_scheme",      RUBY_METHOD_FUNC(qt_color_scheme), 0);
   rb_define_singleton_method(mQt, "on_main_thread?",     RUBY_METHOD_FUNC(qt_on_main_thread_p), 0);
   rb_define_singleton_method(mQt, "object_count", RUBY_METHOD_FUNC(obj_object_count), 0);
 
@@ -4948,7 +5257,6 @@ extern "C" void Init_qt6(void) {
   QCDEF(cApplication, "quit",            RUBY_METHOD_FUNC(app_quit), 0);
   QCDEF(cApplication, "closeAllWindows", RUBY_METHOD_FUNC(app_close_all_windows), 0);
   QCDEF(cApplication, "processEvents",   RUBY_METHOD_FUNC(app_process_events_cls), 0);
-  QCDEF(cApplication, "processEvents",  RUBY_METHOD_FUNC(app_process_events_cls), 0);
   QCDEF(cApplication, "instance",       RUBY_METHOD_FUNC(app_instance), 0);
   QCDEF(cApplication, "desktop",        RUBY_METHOD_FUNC(app_desktop), 0);
   QDEF(cApplication, "desktop",  RUBY_METHOD_FUNC(app_desktop), 0);   // also as an instance method (script_runner.rb)
@@ -5260,6 +5568,17 @@ extern "C" void Init_qt6(void) {
   rb_define_singleton_method(mQt, "white",     RUBY_METHOD_FUNC((global_color<(int)Qt::white>)), 0);
   rb_define_singleton_method(mQt, "red",       RUBY_METHOD_FUNC((global_color<(int)Qt::red>)), 0);
   rb_define_singleton_method(mQt, "lightGray", RUBY_METHOD_FUNC((global_color<(int)Qt::lightGray>)), 0);
+  // The rest of Qt::GlobalColor, which qtbindings had; COSMOS uses only the
+  // four above, but screens and tools outside the repo may use any.
+#define DEF_GLOBAL_COLOR(n) \
+  rb_define_singleton_method(mQt, #n, RUBY_METHOD_FUNC((global_color<(int)Qt::n>)), 0)
+  DEF_GLOBAL_COLOR(color0);     DEF_GLOBAL_COLOR(color1);    DEF_GLOBAL_COLOR(darkGray);
+  DEF_GLOBAL_COLOR(gray);       DEF_GLOBAL_COLOR(green);     DEF_GLOBAL_COLOR(blue);
+  DEF_GLOBAL_COLOR(cyan);       DEF_GLOBAL_COLOR(magenta);   DEF_GLOBAL_COLOR(yellow);
+  DEF_GLOBAL_COLOR(darkRed);    DEF_GLOBAL_COLOR(darkGreen); DEF_GLOBAL_COLOR(darkBlue);
+  DEF_GLOBAL_COLOR(darkCyan);   DEF_GLOBAL_COLOR(darkMagenta); DEF_GLOBAL_COLOR(darkYellow);
+  DEF_GLOBAL_COLOR(transparent);
+#undef DEF_GLOBAL_COLOR
 
   rb_define_const(mQt, "MidButton", INT2NUM((int)Qt::MiddleButton));  // renamed in Qt6
   rb_define_const(mQt, "MiddleButton", INT2NUM((int)Qt::MiddleButton));
@@ -5457,6 +5776,7 @@ extern "C" void Init_qt6(void) {
   QDEF(cTableWidgetItem, "setSizeHint",    RUBY_METHOD_FUNC(twitem_set_size_hint), 1);
   QDEF(cTableWidgetItem, "setData",        RUBY_METHOD_FUNC(twitem_set_data), 2);
   QDEF(cTableWidgetItem, "data",           RUBY_METHOD_FUNC(twitem_data), 1);
+  define_item_equality<QTableWidgetItem>(cTableWidgetItem);
 
   cTableWidget = rb_define_class_under(mQt, "TableWidget", cAbstractItemView);
   // cmd_tlm_server_gui.rb:90 reopens Qt::TableWidget purely to override
@@ -5488,6 +5808,13 @@ extern "C" void Init_qt6(void) {
   QDEF(cTreeWidgetItem, "addChild",      RUBY_METHOD_FUNC(tritem_add_child), 1);
   QDEF(cTreeWidgetItem, "setForeground", RUBY_METHOD_FUNC(tritem_set_foreground), 2);
   QDEF(cTreeWidgetItem, "setBackground", RUBY_METHOD_FUNC(tritem_set_background), 2);
+  QDEF(cTreeWidgetItem, "font",          RUBY_METHOD_FUNC(tritem_font), 1);
+  QDEF(cTreeWidgetItem, "setFont",       RUBY_METHOD_FUNC(tritem_set_font), 2);
+  QDEF(cTreeWidgetItem, "childCount",    RUBY_METHOD_FUNC(tritem_child_count), 0);
+  QDEF(cTreeWidgetItem, "child",         RUBY_METHOD_FUNC(tritem_child), 1);
+  QDEF(cTreeWidgetItem, "parent",        RUBY_METHOD_FUNC(tritem_parent), 0);
+  QDEF(cTreeWidgetItem, "checkState",    RUBY_METHOD_FUNC(tritem_check_state), 1);
+  define_item_equality<QTreeWidgetItem>(cTreeWidgetItem);
 
   cTreeWidget = rb_define_class_under(mQt, "TreeWidget", cAbstractItemView);
   register_ctor(cTreeWidget, ctor_plain<RubyForward<QTreeWidget> >);
@@ -5511,9 +5838,14 @@ extern "C" void Init_qt6(void) {
   QDEF(cListWidgetItem, "setText",     RUBY_METHOD_FUNC(lwi_set_text), 1);
   QDEF(cListWidgetItem, "setSelected", RUBY_METHOD_FUNC(lwi_set_selected), 1);
   QDEF(cListWidgetItem, "isSelected",  RUBY_METHOD_FUNC(lwi_is_selected), 0);
+  QDEF(cListWidgetItem, "data",        RUBY_METHOD_FUNC(lwitem_data), 1);
+  QDEF(cListWidgetItem, "dispose",     RUBY_METHOD_FUNC(lwitem_dispose), 0);
+  QDEF(cListWidgetItem, "disposed?",   RUBY_METHOD_FUNC(lwitem_disposed_p), 0);
+  define_item_equality<QListWidgetItem>(cListWidgetItem);
   register_ctor(cListWidget, ctor_plain<RubyForward<QListWidget> >);
   QDEF(cListWidget, "setUniformItemSizes", RUBY_METHOD_FUNC(listw_set_uniform_item_sizes), 1);
   QDEF(cListWidget, "takeItem",            RUBY_METHOD_FUNC(listw_take_item), 1);
+  QDEF(cListWidget, "row",                 RUBY_METHOD_FUNC(listw_row), 1);
   QDEF(cListWidget, "visualItemRect",      RUBY_METHOD_FUNC(listw_visual_item_rect), 1);
   QDEF(cListWidget, "item",          RUBY_METHOD_FUNC(lw_item), 1);
   QDEF(cListWidget, "findItems",     RUBY_METHOD_FUNC(lw_find_items), -1);
@@ -5527,7 +5859,6 @@ extern "C" void Init_qt6(void) {
 
   // ---- containers ------------------------------------------------------
   cTabWidget = rb_define_class_under(mQt, "TabWidget", cWidget);
-  QDEF(cTabWidget, "setTabIcon", RUBY_METHOD_FUNC(tabw_set_tab_icon), 2);
   register_ctor(cTabWidget, ctor_plain<QTabWidget>);
   QDEF(cTabWidget, "addTab",          RUBY_METHOD_FUNC(tab_add_tab), 2);
   QDEF(cTabWidget, "tabText",         RUBY_METHOD_FUNC(tab_text), 1);
@@ -5651,8 +5982,6 @@ extern "C" void Init_qt6(void) {
   // ---- text / timer ----------------------------------------------------
   cTextEdit = rb_define_class_under(mQt, "TextEdit", cAbstractScrollArea);
   register_ctor(cTextEdit, ctor_str<RubyForward<QTextEdit> >);
-  QDEF(cTextEdit, "setPlainText", RUBY_METHOD_FUNC((set_str<QTextEdit, &QTextEdit::setPlainText>)), 1);
-  QDEF(cTextEdit, "toPlainText",  RUBY_METHOD_FUNC((get_str<QTextEdit, &QTextEdit::toPlainText>)), 0);
   QDEF(cTextEdit, "currentCharFormat",    RUBY_METHOD_FUNC(edit_current_char_format), 0);
   QDEF(cTextEdit, "moveCursor",  RUBY_METHOD_FUNC(edit_move_cursor), -1);
   QDEF(cTextEdit, "cursorRect",  RUBY_METHOD_FUNC(edit_cursor_rect), 0);
@@ -5849,7 +6178,8 @@ extern "C" void Init_qt6(void) {
   QDEF(cSettings, "setValue", RUBY_METHOD_FUNC(settings_set_value), 2);
   QDEF(cSettings, "value",    RUBY_METHOD_FUNC(settings_value), 1);
   QDEF(cSettings, "contains", RUBY_METHOD_FUNC(settings_contains), 1);
-  QDEF(cSettings, "setValue", RUBY_METHOD_FUNC(settings_set_value_variant), 2);
+  rb_define_const(cSettings, "NativeFormat", INT2NUM((int)QSettings::NativeFormat));
+  rb_define_const(cSettings, "IniFormat",    INT2NUM((int)QSettings::IniFormat));
 
   cDesktopWidget = rb_define_class_under(mQt, "DesktopWidget", rb_cObject);
   QDEF(cDesktopWidget, "screen",         RUBY_METHOD_FUNC(desktop_self), 0);
@@ -5874,6 +6204,10 @@ extern "C" void Init_qt6(void) {
   QDEF(cIntValidator,    "setBottom",   RUBY_METHOD_FUNC(intval_set_bottom), 1);
   QDEF(cIntValidator,    "setTop",      RUBY_METHOD_FUNC(intval_set_top), 1);
   QDEF(cIntValidator,    "setRange",    RUBY_METHOD_FUNC(intval_set_range), 2);
+  QDEF(cIntValidator,    "bottom",      RUBY_METHOD_FUNC(intval_bottom), 0);
+  QDEF(cIntValidator,    "top",         RUBY_METHOD_FUNC(intval_top), 0);
+  QDEF(cDoubleValidator, "bottom",      RUBY_METHOD_FUNC(dblval_bottom), 0);
+  QDEF(cDoubleValidator, "top",         RUBY_METHOD_FUNC(dblval_top), 0);
   QDEF(cLineEdit, "setValidator", RUBY_METHOD_FUNC(lineedit_set_validator), 1);
 
   cCompleter = rb_define_class_under(mQt, "Completer", cQtObject);
@@ -5937,6 +6271,7 @@ extern "C" void Init_qt6(void) {
 
   cAbstractItemModel = rb_define_class_under(mQt, "AbstractItemModel", cQtObject);
   QDEF(cAbstractItemModel, "index", RUBY_METHOD_FUNC(model_index), -1);
+  QDEF(cAbstractItemModel, "setData", RUBY_METHOD_FUNC(model_set_data), -1);
   VALUE cStringListModel = rb_define_class_under(mQt, "StringListModel", cAbstractItemModel);
   rb_define_alloc_func(cStringListModel, qtobj_alloc);
   QDEF(cStringListModel, "initialize", RUBY_METHOD_FUNC(slmodel_init), -1);
@@ -5983,6 +6318,10 @@ extern "C" void Init_qt6(void) {
   VALUE cStyledItemDelegate = rb_define_class_under(mQt, "StyledItemDelegate", cQtObject);
   register_ctor(cStyledItemDelegate, ctor_plain<RubyItemDelegate>);   // virtuals -> Ruby
   QDEF(cStyledItemDelegate, "initStyleOption", RUBY_METHOD_FUNC(delegate_init_style_option), 2);
+  QDEF(cStyledItemDelegate, "paint",         RUBY_METHOD_FUNC(delegate_paint), 3);
+  QDEF(cStyledItemDelegate, "createEditor",  RUBY_METHOD_FUNC(delegate_create_editor), 3);
+  QDEF(cStyledItemDelegate, "setEditorData", RUBY_METHOD_FUNC(delegate_set_editor_data), 2);
+  QDEF(cStyledItemDelegate, "setModelData",  RUBY_METHOD_FUNC(delegate_set_model_data), 3);
   QDEF(cStyledItemDelegate, "commitData",  RUBY_METHOD_FUNC(delegate_commit_data), 1);
   QDEF(cStyledItemDelegate, "closeEditor", RUBY_METHOD_FUNC(delegate_close_editor), -1);
 
@@ -6022,7 +6361,7 @@ extern "C" void Init_qt6(void) {
 
   // ---- misc widgets / helpers --------------------------------------------
   VALUE cDialogButtonBox = rb_define_class_under(mQt, "DialogButtonBox", cWidget);
-  register_ctor(cDialogButtonBox, ctor_plain<QDialogButtonBox>);
+  register_ctor(cDialogButtonBox, ctor_dialog_button_box);
   QDEF(cDialogButtonBox, "addButton", RUBY_METHOD_FUNC(dbb_add_button), 1);
   QDEF(cDialogButtonBox, "setOrientation", RUBY_METHOD_FUNC(dbb_set_orientation), 1);
 #define DEF_DBB(n) rb_define_const(cDialogButtonBox, #n, INT2NUM((int)QDialogButtonBox::n))
@@ -6209,7 +6548,6 @@ extern "C" void Init_qt6(void) {
   QDEF(cTextCursor, "setPosition",  RUBY_METHOD_FUNC(tc_set_position), -1);
   QDEF(cTextCursor, "position",     RUBY_METHOD_FUNC(tc_position), 0);
   QDEF(cTextCursor, "blockNumber",  RUBY_METHOD_FUNC(tc_block_number), 0);
-  QDEF(cTextCursor, "selectedText",       RUBY_METHOD_FUNC(tc_selected_text), 0);
   QDEF(cTextCursor, "positionInBlock",    RUBY_METHOD_FUNC(tc_position_in_block), 0);
   QDEF(cTextCursor, "anchor",             RUBY_METHOD_FUNC(tc_anchor), 0);
   QDEF(cTextCursor, "selectionStart",     RUBY_METHOD_FUNC(tc_selection_start), 0);
@@ -6404,6 +6742,9 @@ extern "C" void Init_qt6(void) {
   register_qt_class("QAbstractButton", cAbstractButton);
   // Completer#popup's QListView, and any other bare item view Qt hands back.
   register_qt_class("QAbstractItemView", cAbstractItemView);
+  // The model a delegate's setModelData is handed (QTableWidget's is the
+  // private QTableModel); it came back as a bare Qt::Object with no setData.
+  register_qt_class("QAbstractItemModel", cAbstractItemModel);
   // The static MessageBox.critical/warning/... boxes are built in C++; found
   // through topLevelWidgets they came back as a bare Qt::Dialog.
   register_qt_class("QMessageBox", cMessageBox);

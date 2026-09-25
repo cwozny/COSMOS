@@ -41,6 +41,7 @@ QEvent *ruby_call_base_event() {
   f();
   return e;
 }
+QEvent *ruby_current_event() { return t_base_qevent; }
 
 // ---- RubyItemDelegate ------------------------------------------------------
 QWidget *RubyItemDelegate::createEditor(QWidget *parent,
@@ -51,7 +52,8 @@ QWidget *RubyItemDelegate::createEditor(QWidget *parent,
   bool handled = false;
   QWidget *w = NULL;
   ruby_with_gvl([&] {
-    VALUE args[3] = { ruby_wrap_qobject(parent), Qnil, ruby_wrap_model_index(idx) };
+    VALUE args[3] = { ruby_wrap_qobject(parent), ruby_wrap_style_option_view_item(&opt),
+                      ruby_wrap_model_index(idx) };
     VALUE r = ruby_event_call(const_cast<RubyItemDelegate *>(this),
                               "createEditor", 3, args, &handled);
     if (handled) w = ruby_unwrap_widget(r);
@@ -107,6 +109,14 @@ void RubyItemDelegate::paint(QPainter *p, const QStyleOptionViewItem &opt,
 }
 
 // ---- RubyGLWidget ----------------------------------------------------------
+QSize RubyGLWidget::sizeHint() const {
+  QSize s;
+  return ruby_size_hint(this, m_overrides, "sizeHint", &s) ? s : QOpenGLWidget::sizeHint();
+}
+QSize RubyGLWidget::minimumSizeHint() const {
+  QSize s;
+  return ruby_size_hint(this, m_overrides, "minimumSizeHint", &s) ? s : QOpenGLWidget::minimumSizeHint();
+}
 void RubyGLWidget::initializeGL() {
   if (!ruby_overrides(this, m_overrides, "initializeGL")) { QOpenGLWidget::initializeGL(); return; }
   bool handled = false;
@@ -247,6 +257,14 @@ static bool dispatch_dnd(QObject *self, RubyOverrides &ov, const char *method, i
   }
 
 // ---- RubyWidget ------------------------------------------------------------
+QSize RubyWidget::sizeHint() const {
+  QSize s;
+  return ruby_size_hint(this, m_overrides, "sizeHint", &s) ? s : QWidget::sizeHint();
+}
+QSize RubyWidget::minimumSizeHint() const {
+  QSize s;
+  return ruby_size_hint(this, m_overrides, "minimumSizeHint", &s) ? s : QWidget::minimumSizeHint();
+}
 FWD_PLAIN(RubyWidget, QWidget, resizeEvent,   RUBY_EV_RESIZE, QResizeEvent)
 FWD_PLAIN(RubyWidget, QWidget, leaveEvent,    RUBY_EV_LEAVE,  QEvent)
 FWD_PLAIN(RubyWidget, QWidget, focusInEvent,  RUBY_EV_FOCUS,  QFocusEvent)

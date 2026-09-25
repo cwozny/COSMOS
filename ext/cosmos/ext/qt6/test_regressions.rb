@@ -54,12 +54,13 @@ end
 chk('addButton(Button) hands ownership to Qt (no double free)') do
   # QMessageBox reparents and deletes the button. If the Ruby wrapper still
   # claims ownership, both sides free it and the process dies at teardown --
-  # after every test has already printed "ok".
+  # after every test has already printed "ok". (This check used to end in
+  # `|| true` and could not fail.)
   m = Qt::MessageBox.new(nil)
   b = Qt::PushButton.new('Open')
+  before = b.owned?
   m.addButton(b, Qt::MessageBox::ResetRole)
-  GC.start
-  !b.destroyed? || true   # the assertion is that GC.start did not crash us
+  (before && !b.owned?) || raise("owned? #{before} before, #{b.owned?} after")
 end
 chk('clickedButton bound (nil before exec)') { Qt::MessageBox.new(nil).clickedButton.nil? }
 chk('exec/dispose inherited from Dialog') do
@@ -404,22 +405,24 @@ puts "\n14. Dark mode made light-assuming stylesheets invisible"
 puts "   (legal_dialog.rb:53 sets background-color white with no text colour;"
 puts "    Qt4 had no dark-mode support, Qt6 follows the system and painted"
 puts "    white on white -- the Legal Agreement pane looked empty)"
-chk('the app defaults to the light colour scheme') do
-  # Render white-on-default text over the stylesheet COSMOS actually uses and
-  # confirm the result is not a single flat colour.
-  l = Qt::Label.new('Copyright 2017 Ball Aerospace & Technologies Corp.')
-  l.setStyleSheet('QLabel { background-color : white; padding: 5px; }')
-  l.resize(420, 40)
-  l.show
-  Qt::Application.processEvents
-  png = File.join(Dir.tmpdir, "_regr_label_#{Process.pid}.png")   # no /tmp on Windows
-  l.grab.save(png)
-  data = File.binread(png)
-  # A blank (all-white) label compresses to a much smaller PNG than one with
-  # glyphs on it; 1.5 KB is far above an empty 420x40 fill and far below text.
-  ok = data.bytesize > 1500
-  File.delete(png) rescue nil
-  ok
+# The scheme the binding asks Qt for, in a child with COSMOS_QT_COLOR_SCHEME
+# set to +setting+ (nil: unset). Offscreen the platform ignores the request
+# and the palette is light either way, so rendering a label -- what this
+# section did before -- passed whether or not the binding asked for light.
+def color_scheme_requested(setting)
+  lib = File.expand_path('../../../../lib', __dir__)
+  code = "require 'Qt'; app = Qt::Application.new([]); p Qt.__color_scheme"
+  IO.popen({ 'COSMOS_QT_COLOR_SCHEME' => setting }, [RbConfig.ruby, '-I', lib, '-e', code, err: File::NULL], &:read).strip
+end
+if Qt.__color_scheme.nil?
+  skip_chk('the app asks for the light colour scheme', "Qt #{Qt.qVersion} cannot set one (6.8+)")
+else
+  chk('the app asks for the light colour scheme') do
+    (r = color_scheme_requested(nil)) == '1' || raise("requested #{r}")
+  end
+  chk('COSMOS_QT_COLOR_SCHEME=dark and =system opt out') do
+    (r = [color_scheme_requested('dark'), color_scheme_requested('system')]) == %w[2 0] || raise("requested #{r.inspect}")
+  end
 end
 
 puts "\n15. Widgets fetched back out of Qt came back as bare Qt::Widget"
@@ -632,15 +635,23 @@ puts "    rb_define_singleton_method put the original directly in the singleton"
 puts "    class, where the reopen replaced it. qt_tool.rb:255 stores window"
 puts "    geometry as Variant.new(pos()), which fell through to a String cast.)"
 chk('reopened self.critical can call super (5 args)') do
-  ran = false
-  klass = Class.new(Qt::MessageBox)
-  klass.define_singleton_method(:critical) do |parent, title, text, buttons = Qt::MessageBox::Ok, dflt = Qt::MessageBox::NoButton|
-    ran = true
-    Qt::MessageBox.critical(parent, title, text, buttons, dflt)
+  # As script_module_gui.rb:28 does it: reopen Qt::MessageBox itself (this
+  # check used to reopen a subclass and never called super), then remove the
+  # reopen so later checks reach the binding directly.
+  $critical_reopen_ran = false
+  Qt::MessageBox.singleton_class.class_eval do
+    def critical(parent, title, text, buttons = Qt::MessageBox::Ok, dflt = Qt::MessageBox::NoButton)
+      $critical_reopen_ran = true
+      super(parent, title, text, buttons, dflt)
+    end
   end
-  Qt.single_shot(30) { Qt::Application.topLevelWidgets.each { |w| w.close if w.is_a?(Qt::Dialog) } }
-  klass.critical(nil, 'T', 'body')
-  ran
+  begin
+    Qt.single_shot(30) { Qt::Application.topLevelWidgets.each { |w| w.close if w.is_a?(Qt::Dialog) } }
+    Qt::MessageBox.critical(nil, 'T', 'body')
+    $critical_reopen_ran || raise('the reopen did not run')
+  ensure
+    Qt::MessageBox.singleton_class.send(:remove_method, :critical)
+  end
 end
 chk('MessageBox statics accept the 5-arg COSMOS form') do
   Qt.single_shot(30) { Qt::Application.topLevelWidgets.each { |w| w.close if w.is_a?(Qt::Dialog) } }
@@ -1206,8 +1217,9 @@ puts "    in 11 files, e.g. cmd_params.rb:194, script_runner.rb:889 -- and"
 puts "    resolved to the private Kernel#exec: NoMethodError, no menu)"
 chk('Qt::Menu#exec is a public method') { Qt::Menu.public_method_defined?(:exec) }
 chk('and it is the binding, not Kernel#exec') { Qt::Menu.instance_method(:exec).owner != Kernel }
-# The modal path is test_cosmos_tools.rb section 12: modal loops return at
-# once in this file after section 8.
+# The modal path, through the menus COSMOS opens, is test_cosmos_tools.rb
+# section 12. (All of section 12 and this section fail with Menu#exec
+# unbound; two of those checks were written after the fix.)
 
 puts "\n42. GC on a non-GUI thread deleted Ruby-owned QObjects there"
 puts "   (qtwrap_free deleted an owned widget on whichever Ruby thread ran the"
@@ -2500,6 +2512,506 @@ chk('Qt destroying objects whose wrappers are garbage, under GC from another thr
   out = IO.popen([RbConfig.ruby, '-I', lib, '-e', DESTROY_RACE, '8', err: [:child, :out]], &:read)
   ($?.success? && out.include?('survived')) ||
     raise($?.signaled? ? "died with SIG#{Signal.signame($?.termsig)}" : "exit #{$?.exitstatus}: #{out.lines.grep(/BUG/).first.to_s.strip}")
+end
+
+puts "\n77. super in a StyledItemDelegate override raised NoMethodError"
+puts "   (Qt::StyledItemDelegate had no paint, createEditor, setEditorData or"
+puts "    setModelData for super to reach. CmdSender's parameter delegate calls"
+puts "    super for every cell it does not draw itself, so each of those paints"
+puts "    reported an error, and after its painter.save the skipped restore"
+puts "    left Qt warning 'Painter ended with 1 saved states')"
+class SuperDelegate < Qt::StyledItemDelegate
+  attr_reader :calls
+  def initialize(parent); super(parent); @calls = []; end
+  def paint(painter, option, index)
+    @calls << :paint
+    painter.save
+    super(painter, option, index)
+    painter.restore
+  end
+  def createEditor(parent, option, index); @calls << :createEditor; super(parent, option, index); end
+  def setEditorData(editor, index); @calls << :setEditorData; super(editor, index); end
+  def setModelData(editor, model, index); @calls << :setModelData; super(editor, model, index); end
+end
+f77_table = Qt::TableWidget.new
+f77_table.setRowCount(1)
+f77_table.setColumnCount(1)
+f77_table.setItem(0, 0, Qt::TableWidgetItem.new('before'))
+f77_delegate = SuperDelegate.new(f77_table)
+f77_table.setItemDelegate(f77_delegate)
+f77_table.show
+APP.processEvents
+f77_paint = stderr_of { f77_table.grab }
+chk('paint calling super reports no error') do
+  f77_delegate.calls.include?(:paint) || raise('paint never reached Ruby')
+  f77_paint.empty? || raise(f77_paint.lines.first.to_s.strip)
+end
+f77_edit = stderr_of { f77_table.editItem(f77_table.item(0, 0)) }
+f77_editor = f77_table.viewport.findChildren.find { |c| c.is_a?(Qt::LineEdit) }
+chk('createEditor and setEditorData calling super open an editor on the cell') do
+  f77_edit.empty? || raise(f77_edit.lines.first.to_s.strip)
+  (f77_editor && f77_editor.text == 'before') || raise("editor #{f77_editor.inspect}")
+end
+chk('setModelData calling super writes the edit back') do
+  f77_editor.setText('after')
+  commit = stderr_of { f77_delegate.commitData(f77_editor) }
+  commit.empty? || raise(commit.lines.first.to_s.strip)
+  f77_table.item(0, 0).text == 'after' || raise("cell #{f77_table.item(0, 0).text.inspect}")
+end
+f77_table.hide
+chk('Qt::Style.CE_ItemViewItem reads the constant, as qtbindings did') do
+  # cmd_param_table_item_delegate.rb:65 paints the description column with it
+  Qt::Style.CE_ItemViewItem == Qt::Style::CE_ItemViewItem
+end
+
+puts "\n78. Qt::AbstractItemModel#setData was unbound"
+puts "   (the setModelData overrides of CmdSender's parameter delegate and"
+puts "    TableManager's write a chosen state back with model.setData"
+puts "    (cmd_param_table_item_delegate.rb:74, table_manager.rb:75): every"
+puts "    commit reported NoMethodError and Qt's default wrote the value)"
+def f78_table
+  table = Qt::TableWidget.new
+  table.setRowCount(1)
+  table.setColumnCount(1)
+  table.setItem(0, 0, Qt::TableWidgetItem.new('x'))
+  table
+end
+chk('model.setData(index, Variant, EditRole) sets the cell and returns true') do
+  table = f78_table
+  model = table.model
+  ok = model.setData(model.index(0, 0), Qt::Variant.new('y'), Qt::EditRole)
+  (ok == true && table.item(0, 0).text == 'y') ||
+    raise("returned #{ok.inspect}, cell #{table.item(0, 0).text.inspect}")
+end
+chk('setData takes a plain value and defaults the role to EditRole') do
+  table = f78_table
+  model = table.model
+  model.setData(model.index(0, 0), 'z')
+  table.item(0, 0).text == 'z' || raise("cell #{table.item(0, 0).text.inspect}")
+end
+
+puts "\n79. Handing an event to another widget's handler ran the caller's default"
+puts "   (qt_base_event, the pass-through that makes super work, ran whatever"
+puts "    default was being dispatched and ignored its receiver. TableManager"
+puts "    hands each combo box's wheel to its window, whose default ignores"
+puts "    it so the table scrolls (table_manager.rb:20-24); the combo's own"
+puts "    default ran instead and changed the value under the mouse)"
+class HandOffDialog < Qt::Dialog
+  attr_accessor :other, :handler
+  def closeEvent(e); @other.__send__(@handler, e); end   # no super on itself
+end
+# Closes a HandOffDialog that hands its close event to +handler+ of a plain
+# widget. QDialog's own default would call reject() first.
+def hand_off_close(handler)
+  d = HandOffDialog.new
+  d.other = Qt::Widget.new
+  d.handler = handler
+  rejected = false
+  d.connect(SIGNAL('rejected()')) { rejected = true }
+  d.show
+  APP.processEvents
+  err = stderr_of { d.close }
+  err.empty? || raise(err.lines.first.to_s.strip)
+  rejected && raise("the dialog's own QDialog::closeEvent ran (rejected)")
+  !d.isVisible || raise('the close did not go through')
+end
+chk("closeEvent handed to another widget runs that widget's default") do
+  hand_off_close(:closeEvent)   # QWidget's default accepts the close
+end
+chk('an event handed to a handler of another kind runs nothing') do
+  hand_off_close(:wheelEvent)   # a close event is not a wheel event
+end
+chk('super still runs the dispatching widget\'s own default') do
+  d = Class.new(Qt::Dialog) { def closeEvent(e); super(e); end }.new
+  rejected = false
+  d.connect(SIGNAL('rejected()')) { rejected = true }
+  d.show
+  APP.processEvents
+  d.close
+  APP.processEvents
+  rejected || raise('QDialog::closeEvent did not run')
+end
+
+puts "\n80. Qt::ListWidgetItem.new(text, list) left the list empty"
+puts "   (ExceptionListDialog adds each exception that way"
+puts "    (exception_list_dialog.rb:39), so its list showed nothing)"
+chk('ListWidgetItem.new(text, list) adds the item to the list') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new('first', list)
+  Qt::ListWidgetItem.new('second', list)
+  (list.count == 2 && list.item(1).text == 'second') || raise("count #{list.count}")
+end
+chk('ListWidgetItem.new(icon, text, list) too') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new(Qt::Icon.new, 'x', list)
+  list.count == 1 || raise("count #{list.count}")
+end
+
+puts "\n81. Menu#addSeparator returned the menu, not the separator"
+puts "   (PacketViewer labels its View menu's separator with"
+puts "    addSeparator.setText('Formatting') (packet_viewer.rb:191), which"
+puts "    retitled the whole menu 'Formatting')"
+chk('addSeparator returns the separator action') do
+  menu = Qt::Menu.new('&View')
+  sep = menu.addSeparator
+  sep.setText('Formatting')
+  (sep.is_a?(Qt::Action) && menu.actions.include?(sep) && menu.title == '&View') ||
+    raise("returned #{sep.class}, menu title #{menu.title.inspect}")
+end
+chk('ToolBar#addSeparator returns the separator action') do
+  Qt::ToolBar.new.addSeparator.is_a?(Qt::Action)
+end
+
+puts "\n82. TreeWidgetItem font/setFont/childCount/child/checkState/parent were"
+puts "    unbound, and DialogButtonBox.new(buttons) built no buttons"
+puts "   (qt.rb reopens TreeWidgetItem with column defaults that call super"
+puts "    (qt.rb:394-424) and every COSMOS tree's itemClicked handler reads"
+puts "    checkState and parent (qt.rb:336-349), so a checkbox click raised;"
+puts "    TestRunner's Test Selections dialog also reads font while it is"
+puts "    built (test_runner.rb:764) and asks for Ok|Cancel buttons (856))"
+def f82_tree
+  tree = Qt::TreeWidget.new
+  tree.setColumnCount(1)
+  suite = Qt::TreeWidgetItem.new(['Suite'])
+  tree.addTopLevelItem(suite)
+  test = Qt::TreeWidgetItem.new(['Test'])
+  suite.addChild(test)
+  [tree, suite, test]
+end
+chk('TreeWidgetItem#font(column) and setFont(column, font)') do
+  _, suite, = f82_tree
+  font = suite.font(0)
+  font.setBold(true)
+  suite.setFont(0, font)
+  suite.font(0).bold || raise('setFont did not take')
+end
+chk('TreeWidgetItem#childCount, #child(i) and #parent') do
+  _, suite, test = f82_tree
+  (suite.childCount == 1 && suite.child(0).text(0) == 'Test' &&
+   test.parent.text(0) == 'Suite' && suite.parent.nil?) ||
+    raise("childCount #{suite.childCount}, parent #{suite.parent.inspect}")
+end
+chk('TreeWidgetItem#checkState(column) reads setCheckState') do
+  _, suite, = f82_tree
+  suite.setCheckState(0, Qt::Checked)
+  suite.checkState(0) == Qt::Checked || raise("checkState #{suite.checkState(0).inspect}")
+end
+chk('DialogButtonBox.new(Ok | Cancel) builds both buttons') do
+  box = Qt::DialogButtonBox.new(Qt::DialogButtonBox::Ok | Qt::DialogButtonBox::Cancel)
+  texts = box.findChildren.select { |c| c.is_a?(Qt::PushButton) }.map(&:text)
+  texts.size == 2 || raise("buttons #{texts.inspect}")
+end
+
+puts "\n83. Two wrappers of the same Qt item compared unequal"
+puts "   (an item wrapper is made anew for every lookup, and == was object"
+puts "    identity. TestRunner's Test Selections unchecks every suite that"
+puts "    is not the clicked item's top level (test_runner.rb:753), so it"
+puts "    unchecked the suite just clicked as well)"
+chk('items compare equal when they wrap the same Qt item') do
+  tree, suite, test = f82_tree
+  (tree.topLevelItem(0) == suite && test.parent == suite && suite.child(0).eql?(test) &&
+   suite.child(0).hash == test.hash) || raise('same item compared unequal')
+end
+chk('items compare unequal when they wrap different Qt items') do
+  _, suite, test = f82_tree
+  suite != test || raise('different items compared equal')
+end
+chk('table and list items compare the same way') do
+  table = Qt::TableWidget.new
+  table.setRowCount(1)
+  table.setColumnCount(1)
+  cell = Qt::TableWidgetItem.new('x')
+  table.setItem(0, 0, cell)
+  list = Qt::ListWidget.new
+  entry = Qt::ListWidgetItem.new('y', list)
+  (table.item(0, 0) == cell && list.item(0) == entry) || raise('same item compared unequal')
+end
+
+puts "\n84. ListWidgetItem#data and ListWidget#row were unbound"
+puts "   (LimitsMonitor's Ignored Telemetry Items dialog reads each selected"
+puts "    item's data on Delete (limits_monitor.rb:786), then removes the"
+puts "    selection with qt.rb's remove_selected_items, which calls row(item)"
+puts "    (qt.rb:614): nothing was ever removed)"
+chk('ListWidgetItem#data(role) returns what setData stored') do
+  item = Qt::ListWidgetItem.new('x')
+  item.setData(Qt::UserRole, Qt::Variant.new(%w[INST HEALTH_STATUS TEMP1]))
+  (v = item.data(Qt::UserRole).value) == %w[INST HEALTH_STATUS TEMP1] || raise("data #{v.inspect}")
+end
+chk('ListWidget#row(item) is the item\'s row') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new('a', list)
+  b = Qt::ListWidgetItem.new('b', list)
+  list.row(b) == 1 || raise("row #{list.row(b).inspect}")
+end
+
+puts "\n85. ListWidgetItem#dispose freed nothing"
+puts "   (COSMOS removes list entries with takeItem(i).dispose (qt.rb:598,"
+puts "    614, 690; tlm_extractor.rb:57); dispose was lib/Qt.rb's no-op for"
+puts "    value types, so every removed entry leaked)"
+chk('dispose deletes the item: an item still in its list leaves it') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new('a', list)
+  list.item(0).dispose            # ~QListWidgetItem takes it out of the list
+  list.count == 0 || raise("count #{list.count} after dispose")
+end
+chk('a taken item disposes once; a second dispose and later calls are safe') do
+  list = Qt::ListWidget.new
+  Qt::ListWidgetItem.new('a', list)
+  item = list.takeItem(0)
+  item.dispose
+  item.dispose
+  item.disposed? || raise('not disposed')
+  begin
+    item.text
+    raise 'text on a disposed item did not raise'
+  rescue RuntimeError => e
+    raise if e.message.include?('did not raise')
+    true
+  end
+end
+
+puts "\n86. Ruby sizeHint and minimumSizeHint overrides were never consulted"
+puts "   (neither virtual was forwarded, so layouts sized a Ruby widget by"
+puts "    Qt's default: TlmGrapher's overview graph (sizeHint 0x50,"
+puts "    overview_graph.rb:81) came out 0 px tall, and OpenGL Builder's"
+puts "    viewer (gl_viewer.rb:87-93) got Qt's default size)"
+class HintedWidget < Qt::Widget
+  def sizeHint; Qt::Size.new(0, 50); end
+  def minimumSizeHint; Qt::Size.new(0, 30); end
+end
+class HintedFromSuper < Qt::Widget
+  def sizeHint; s = super; Qt::Size.new(s.width, 77); end
+end
+# The widget's height in a column whose other entry takes the spare room,
+# as the plots do above TlmGrapher's overview graph.
+def f86_height(widget, max_height)
+  widget.setMaximumHeight(max_height)
+  host = Qt::Widget.new
+  layout = Qt::VBoxLayout.new
+  layout.addWidget(Qt::Widget.new, 1)
+  layout.addWidget(widget)
+  host.setLayout(layout)
+  host.resize(400, 300)
+  host.show
+  APP.processEvents
+  widget.height
+ensure
+  host.hide if host
+end
+def f86_min_height(widget)
+  host = Qt::Widget.new
+  layout = Qt::VBoxLayout.new
+  layout.addWidget(widget)
+  host.setLayout(layout)
+  host.minimumSizeHint.height
+end
+chk('a layout sizes a widget by its Ruby sizeHint') do
+  (h = f86_height(HintedWidget.new, 50)) == 50 || raise("height #{h}")
+end
+chk('a layout reads the Ruby minimumSizeHint') do
+  (d = f86_min_height(HintedWidget.new) - f86_min_height(Qt::Widget.new)) == 30 || raise("minimum differs by #{d}")
+end
+chk('super from a sizeHint override reaches Qt\'s, not the override') do
+  (h = f86_height(HintedFromSuper.new, 77)) == 77 || raise("height #{h}")
+end
+
+puts "\n87. Validator constructors dropped the line edit, and fixup never ran"
+puts "   (IntegerChooser and FloatChooser build IntegerChooserIntValidator.new"
+puts "    (@value) and override fixup to clamp an out-of-range entry through"
+puts "    parent().setText (integer_chooser.rb:15-31, float_chooser.rb:15-29)."
+puts "    parent was nil, and fixup was not forwarded, so the entry stayed out"
+puts "    of range)"
+class ClampingValidator < Qt::IntValidator
+  def fixup(input)
+    parent.setText(top.to_s) if input.to_i > top
+  end
+end
+class RewritingValidator < Qt::IntValidator
+  def fixup(input)
+    input.replace(top.to_s)   # Qt's contract: fix the string in place
+  end
+end
+# Types +text+ into a line edit guarded by +validator_class+ (0..100) and
+# moves the focus away, which is when QLineEdit calls fixup.
+def f87_entry(validator_class, text)
+  host = Qt::Widget.new
+  layout = Qt::VBoxLayout.new
+  entry = Qt::LineEdit.new('5')
+  other = Qt::LineEdit.new('x')
+  layout.addWidget(entry)
+  layout.addWidget(other)
+  host.setLayout(layout)
+  validator = validator_class.new(entry)
+  validator.setBottom(0)
+  validator.setTop(100)
+  entry.setValidator(validator)
+  finished = 0
+  entry.connect(SIGNAL('editingFinished()')) { finished += 1 }
+  host.show
+  APP.processEvents
+  entry.setFocus
+  APP.processEvents
+  entry.setText(text)
+  other.setFocus
+  APP.processEvents
+  [entry.text, finished]
+ensure
+  host.hide if host
+end
+chk('IntValidator.new(line_edit) is parented to the line edit') do
+  entry = Qt::LineEdit.new
+  (v = Qt::IntValidator.new(entry)).parent == entry || raise("parent #{v.parent.inspect}")
+end
+chk('DoubleValidator.new(line_edit) and (bottom, top, decimals, line_edit)') do
+  entry = Qt::LineEdit.new
+  v1 = Qt::DoubleValidator.new(entry)
+  v2 = Qt::DoubleValidator.new(0.0, 1.0, 3, entry)
+  (v1.parent == entry && v2.parent == entry) || raise("parents #{[v1.parent, v2.parent].inspect}")
+end
+chk('a Ruby fixup clamps an out-of-range entry when editing finishes') do
+  text, = f87_entry(ClampingValidator, '500')
+  text == '100' || raise("text #{text.inspect}")
+end
+chk('a fixup that rewrites its argument is applied, and editing finishes') do
+  text, finished = f87_entry(RewritingValidator, '500')
+  (text == '100' && finished == 1) || raise("text #{text.inspect}, editingFinished x#{finished}")
+end
+
+puts "\n88. Settings#setValue raised TypeError for a Float or a boolean"
+puts "   (it was registered twice, the later one winning, and both turned"
+puts "    anything but an Integer, Size, Point or Variant into a String with"
+puts "    rb_to_qs; COSMOS itself always passes a Variant (qt_tool.rb:255))"
+chk('Settings#setValue takes a Float, a boolean and an Array, like Variant.new') do
+  file = File.join(Dir.tmpdir, "qt6_regressions_#{Process.pid}.ini")
+  begin
+    settings = Qt::Settings.new(file, Qt::Settings::IniFormat)
+    settings.setValue('scale', 2.5)
+    settings.setValue('on', true)
+    settings.setValue('names', %w[a b])
+    settings.setValue('count', 3)
+    got = %w[scale on names count].map { |k| settings.value(k).value }
+    got == [2.5, true, %w[a b], 3] || raise("read back #{got.inspect}")
+  ensure
+    FileUtils.rm_f(file)
+  end
+end
+
+puts "\n89. Qt::Application#exec_for closed every window"
+puts "   (it ended its loop with QCoreApplication::quit, which in Qt 6 closes"
+puts "    every top-level window first. COSMOS never calls it; these suites"
+puts "    do, between checks that expect their windows to stay as they were.)"
+chk('exec_for leaves top-level windows open') do
+  w = Qt::Widget.new
+  w.show
+  APP.exec_for(20)
+  visible = w.isVisible
+  w.hide
+  visible || raise('the window was closed')
+end
+chk('a modal exec after exec_for still runs until its dialog closes') do
+  APP.exec_for(20)
+  d = Qt::Dialog.new
+  Qt.single_shot(150) { d.accept }
+  t0 = Time.now
+  d.exec
+  ms = ((Time.now - t0) * 1000).round
+  ms >= 100 || raise("exec returned after #{ms} ms")
+end
+
+puts "\n90. The wrong value or item type raised 'wrong argument type Qt::Value"
+puts "    (expected Qt::Value)'"
+puts "   (every value type shared one Ruby data type name, and every item"
+puts "    type another, so the TypeError could not say which was which)"
+def f90_type_error
+  yield
+  raise 'no TypeError'
+rescue TypeError => e
+  e.message
+end
+chk('a value of the wrong type names both types') do
+  (m = f90_type_error { Qt::Widget.new.resize(Qt::Point.new(1, 2)) }) ==
+    'wrong argument type Qt::Point (expected Qt::Size)' || raise(m)
+end
+chk('an item of the wrong type names both types') do
+  (m = f90_type_error { Qt::TreeWidget.new.addTopLevelItem(Qt::ListWidgetItem.new('x')) }) ==
+    'wrong argument type Qt::ListWidgetItem (expected Qt::TreeWidgetItem)' || raise(m)
+end
+
+puts "\n91. Only four of Qt's global colors existed (Qt::blue was undefined)"
+puts "   (black, white, red and lightGray are all COSMOS itself uses; qtbindings"
+puts "    had every Qt::GlobalColor, which screens and tools outside the repo"
+puts "    may use)"
+chk('every Qt::GlobalColor is defined and names its color') do
+  expected = {
+    blue: [0, 0, 255], green: [0, 255, 0], yellow: [255, 255, 0], cyan: [0, 255, 255],
+    magenta: [255, 0, 255], gray: [160, 160, 164], darkGray: [128, 128, 128],
+    darkRed: [128, 0, 0], darkGreen: [0, 128, 0], darkBlue: [0, 0, 128],
+    darkCyan: [0, 128, 128], darkMagenta: [128, 0, 128], darkYellow: [128, 128, 0],
+    color0: [255, 255, 255], color1: [0, 0, 0], transparent: [0, 0, 0],
+  }
+  wrong = expected.reject do |name, rgb|
+    c = Qt::Color.new(Qt.__send__(name))
+    [c.red, c.green, c.blue] == rgb
+  end
+  wrong.empty? || raise("wrong: #{wrong.keys.join(', ')}")
+end
+
+puts "\n92. Loading lib/Qt.rb a second time made every post recurse"
+puts "   (its post_to_main_thread wrapper aliases the binding's method first;"
+puts "    a second load aliased the wrapper to itself, and the next post"
+puts "    raised SystemStackError. COSMOS itself only requires it, once.)"
+DOUBLE_LOAD = <<~'RUBY'
+  $stdout.sync = true
+  require 'Qt'
+  load File.join(ARGV[0], 'Qt.rb')
+  app = Qt::Application.new([])
+  ran = false
+  Qt.post_to_main_thread { ran = true }
+  app.processEvents
+  puts(ran ? 'ran' : 'not run')
+RUBY
+chk('a second load of lib/Qt.rb leaves post_to_main_thread working') do
+  lib = File.expand_path('../../../../lib', __dir__)
+  out = IO.popen([RbConfig.ruby, '-I', lib, '-e', DOUBLE_LOAD, lib, err: [:child, :out]], &:read)
+  out.include?('ran') || raise(out.lines.grep(/Error/).first.to_s.strip)
+end
+
+puts "\n93. rake build kept a stale qt6 bundle and blamed a missing Qt6"
+puts "   (when the qt6 extension built nothing, lib/cosmos/ext kept the"
+puts "    bundle of an earlier build, which still loaded as if current, and"
+puts "    the message always said 'Qt6 not found' -- also when extconf.rb had"
+puts "    written its stub because moc failed. The Rakefile's qt6_not_built"
+puts "    now removes the stale bundle and reports extconf.rb's own reason.)"
+QT6_NOT_BUILT = <<~'RUBY'
+  require 'rake'
+  Rake.application.init('rake', [])
+  Dir.chdir(ARGV[0])
+  Rake.application.load_rakefile
+  puts qt6_not_built(ARGV[1], ARGV[2])
+  puts(File.exist?(ARGV[2]) ? 'stale bundle kept' : 'stale bundle removed')
+RUBY
+chk("rake build's qt6 skip removes a stale bundle and gives extconf.rb's reason") do
+  Dir.mktmpdir('qt6_not_built') do |dir|
+    # extconf.rb in a copy, with no Qt6 to find: it writes the stub Makefile
+    bin = File.join(dir, 'bin')
+    Dir.mkdir(bin)
+    FileUtils.cp(File.join(__dir__, 'extconf.rb'), dir)
+    if WINDOWS
+      File.write(File.join(bin, 'pkg-config.bat'), "@exit /b 1\r\n")
+    else
+      File.write(File.join(bin, 'pkg-config'), "#!/bin/sh\nexit 1\n")
+      FileUtils.chmod(0755, File.join(bin, 'pkg-config'))
+    end
+    force_linux = "Object.send(:remove_const, :RUBY_PLATFORM); RUBY_PLATFORM = 'x86_64-linux'.freeze; load 'extconf.rb'"
+    IO.popen({ 'PATH' => [bin, ENV['PATH']].join(File::PATH_SEPARATOR), 'COSMOS_QT6_REQUIRED' => nil },
+             [RbConfig.ruby, '-e', force_linux, chdir: dir, err: [:child, :out]], &:read)
+    stale = File.join(dir, 'qt6.bundle')
+    File.write(stale, 'an earlier build')
+    out = IO.popen([RbConfig.ruby, '-e', QT6_NOT_BUILT, ROOT, File.join(dir, 'Makefile'), stale,
+                    err: [:child, :out]], &:read)
+    (out.include?('qt6: not built (Qt6 not found (brew --prefix qt / pkg-config Qt6Core))') &&
+     out.include?('stale bundle removed')) || raise(out.lines.last(2).join.strip)
+  end
 end
 
 puts
