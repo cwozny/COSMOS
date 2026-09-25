@@ -51,7 +51,7 @@ def locate_qt6
            " -framework QtOpenGL -framework QtOpenGLWidgets"
     [inc, link, moc]
   else
-    # Linux, and Windows with Qt 6 from MSYS2 (pacman mingw-w64-x86_64-qt6-base).
+    # Linux, and Windows with Qt 6 from MSYS2 (pacman mingw-w64-ucrt-x86_64-qt6-base).
     mods = %w[Qt6Core Qt6Gui Qt6Widgets Qt6OpenGL Qt6OpenGLWidgets]
     inc  = pkg_config('--cflags', *mods)
     link = pkg_config('--libs', *mods)
@@ -60,7 +60,7 @@ def locate_qt6
     # e.g. /usr/lib/qt6/libexec/moc on Ubuntu 24.04, and not on PATH. Looking
     # only at host_bins fell back to a bare `moc`, which failed, so the build
     # wrote the stub Makefile and "succeeded" with no GUI.
-    # On Windows it is moc.exe (MSYS2: mingw64/share/qt6/bin).
+    # On Windows it is moc.exe (MSYS2: ucrt64/share/qt6/bin).
     moc_name = "moc#{RbConfig::CONFIG['EXEEXT']}"
     moc = %w[libexecdir host_libexecs host_bins bindir].map do |var|
       dir = pkg_config("--variable=#{var}", 'Qt6Core')
