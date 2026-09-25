@@ -197,7 +197,11 @@ if !ARCHITECTURE!==x86 (
   )
 
   echo Installing 64-bit Ruby
-  !COSMOS_INSTALL!\tmp\!RUBY_INSTALLER! /silent /tasks="nomodpath,noassocfiles,noridkinstall" /dir="!COSMOS_INSTALL!\Vendor\Ruby" /components="ruby,rdoc"
+  REM RubyInstaller 4, unlike 2.6, lets the user pick an install mode, all users
+  REM or just me, in a dialog that /silent still shows, and a CI runner never
+  REM answers it. /currentuser is the mode RubyInstaller 2.6 always used, and
+  REM /suppressmsgboxes keeps any other prompt from stopping a silent install.
+  !COSMOS_INSTALL!\tmp\!RUBY_INSTALLER! /silent /currentuser /suppressmsgboxes /tasks="nomodpath,noassocfiles,noridkinstall" /dir="!COSMOS_INSTALL!\Vendor\Ruby" /components="ruby,rdoc"
   if errorlevel 1 (
     echo ERROR: Problem installing 64-bit Ruby
     echo INSTALL FAILED

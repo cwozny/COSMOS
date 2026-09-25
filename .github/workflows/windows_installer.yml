@@ -23,7 +23,9 @@ on:
 jobs:
   install:
     runs-on: windows-latest
-    timeout-minutes: 120
+    # A full install takes about 10 minutes; a hung step (such as an
+    # installer waiting on a dialog) should not hold the runner for 2 hours.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v2
       - name: Hide the runner's MSYS2
