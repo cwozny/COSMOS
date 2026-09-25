@@ -111,7 +111,7 @@ If you discover a security vulnerability in COSMOS, please do not disclose to an
 
 ## Code Status
 
-* [![AppVeyor Build Status](https://ci.appveyor.com/api/projects/status/gw61r3dvakjamx6o?svg=true)](https://ci.appveyor.com/project/jasonatball/cosmos)
+* [![Cosmos 4 Tests](https://github.com/cwozny/COSMOS/actions/workflows/build_v4.yml/badge.svg?branch=cosmos4-qt6)](https://github.com/cwozny/COSMOS/actions/workflows/build_v4.yml?query=branch%3Acosmos4-qt6)
 * [![Code Climate](https://codeclimate.com/github/BallAerospace/COSMOS/badges/gpa.svg)](https://codeclimate.com/github/BallAerospace/COSMOS)
 * [![Codecov](https://img.shields.io/codecov/c/github/codecov/example-python.svg)](https://codecov.io/gh/BallAerospace/COSMOS)
 
