@@ -234,9 +234,9 @@ module Cosmos
       result
     end
 
-    def prompt_combo_box(string, items, options)
+    def prompt_combo_box(string, items, **options)
       options[:combo] = items
-      prompt_to_continue(string, options)
+      prompt_to_continue(string, **options)
     end
 
     def prompt_message_box(string, buttons, text_color: nil, background_color: nil, font_size: nil, font_family: nil, informative: nil, details: nil, vertical: false)
@@ -288,9 +288,9 @@ module Cosmos
       end
     end
 
-    def prompt_vertical_message_box(string, buttons, options)
+    def prompt_vertical_message_box(string, buttons, **options)
       options[:vertical] = true
-      prompt_message_box(string, buttons, options)
+      prompt_message_box(string, buttons, **options)
     end
 
     def _build_dialog(message)

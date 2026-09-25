@@ -38,7 +38,9 @@ module Cosmos
       tf.write(output)
       tf.close
       begin
-        data = Psych.load_file(tf.path)
+        # Since Psych 4, load_file refuses aliases unless asked, and the
+        # shared parameter lists (e.g. _params.yaml) are YAML aliases
+        data = Psych.load_file(tf.path, aliases: true)
       rescue => error
         error_file = "ERROR_#{filename}"
         File.open(error_file, 'w') { |file| file.puts output }

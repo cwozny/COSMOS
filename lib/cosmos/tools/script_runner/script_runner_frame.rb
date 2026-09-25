@@ -609,7 +609,8 @@ module Cosmos
 
           instrumented_line << " __return_val\n"
         else
-          unless segment =~ /^\s*end\s*$/ or segment =~ /^\s*when .*$/
+          # Nothing may come before a 'when' or a pattern matching 'in'
+          unless segment =~ /^\s*end\s*$/ or segment =~ /^\s*when .*$/ or segment =~ /^\s*in\s/
             num_left_brackets = segment.count('{')
             num_right_brackets = segment.count('}')
             num_left_square_brackets = segment.count('[')
@@ -836,27 +837,18 @@ module Cosmos
     def ruby_syntax_check_text(selection = nil)
       unless self.class.running?()
         selection = text() unless selection
-        check_process = IO.popen("ruby -c -rubygems 2>&1", 'r+')
-        check_process.write("require 'cosmos'; require 'cosmos/script'; " + selection)
-        check_process.close_write
-        results = check_process.gets
-        check_process.close
-        if results
-          if results =~ /Syntax OK/
-            Qt::MessageBox.information(self, 'Syntax Check Successful', results)
-          else
-            # Results is a string like this: ":2: syntax error ..."
-            # Normally the procedure comes before the first colon but since we
-            # are writing to the process this is blank so we throw it away
-            _, line_no, error = results.split(':')
-            Qt::MessageBox.warning(self,
-                                   'Syntax Check Failed',
-                                   "Error on line #{line_no}: #{error.strip}")
-          end
+        # Prism is the parser Ruby itself uses since 3.4, so this is the check
+        # 'ruby -c' makes, without starting whichever ruby is on the PATH.
+        # (ruby -c's -rubygems no longer loads in Ruby 4, and its errors now
+        # span several lines.)
+        errors = Prism.parse(selection).errors
+        if errors.empty?
+          Qt::MessageBox.information(self, 'Syntax Check Successful', 'Syntax OK')
         else
-          Qt::MessageBox.critical(self,
-                                  'Syntax Check Exception',
-                                  'Ruby syntax check unexpectedly returned nil')
+          error = errors.first
+          Qt::MessageBox.warning(self,
+                                 'Syntax Check Failed',
+                                 "Error on line #{error.location.start_line}: #{error.message}")
         end
       end
     end

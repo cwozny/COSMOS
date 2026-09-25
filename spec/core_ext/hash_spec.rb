@@ -16,7 +16,8 @@ describe Hash do
   describe "inspect" do
     it "limits the number of items to 10" do
       hash = {'1'=>1,'2'=>2,'3'=>3,'4'=>4,'5'=>5,'6'=>6,'7'=>7,'8'=>8,'9'=>9,'10'=>10}
-      expect(hash.inspect).to eql '{"1"=>1, "2"=>2, "3"=>3, "4"=>4, "5"=>5, "6"=>6, "7"=>7, "8"=>8, "9"=>9, "10"=>10}'
+      # Ruby 3.4 and later put spaces around =>
+      expect(hash.inspect).to eql '{"1" => 1, "2" => 2, "3" => 3, "4" => 4, "5" => 5, "6" => 6, "7" => 7, "8" => 8, "9" => 9, "10" => 10}'
       hash['11'] = 11
       expect(hash.inspect).to match(/#<Hash:\d+>/)
     end

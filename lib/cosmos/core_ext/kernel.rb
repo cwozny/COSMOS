@@ -28,6 +28,8 @@ module Kernel
   # @param start [Integer] The number of stack entries to skip
   # @return [Symbol] The name of the calling method
   def calling_method(start = 1)
-    caller[start][/`([^']*)'/, 1].intern
+    # Since Ruby 3.4 a backtrace line reads "in 'Class#method'" rather than
+    # "in `method'". A location's base_label is the method name alone.
+    caller_locations(start + 1, 1).first.base_label.intern
   end
 end
