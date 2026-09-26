@@ -88,3 +88,54 @@ jobs:
         run: bundle exec rake qt6_scan_unbound
       - name: Qt6 suites
         run: bundle exec rake qt6_test
+
+  # DART (lib/cosmos/dart), the Rails application in COSMOS, against PostgreSQL:
+  # its specs, then dart_end_to_end.rb, which imports a packet log into the demo
+  # project's DART and reads it back through the DART servers.
+  dart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: dart
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DART_USERNAME: dart
+      DART_DB: dart
+      DART_TEST_DB: dart_test
+      PGHOST: localhost
+      COSMOS_NO_SIMPLECOV: 1
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0.7"
+          bundler-cache: true
+      - name: Build extensions
+        run: bundle exec rake build
+      - name: DART specs
+        working-directory: lib/cosmos/dart
+        env:
+          RAILS_ENV: test
+        run: |
+          bin/rails db:create db:schema:load
+          bundle exec rspec
+      - name: DART end to end
+        working-directory: demo
+        env:
+          # The demo has its own Gemfile, which uses the released cosmos gem
+          BUNDLE_GEMFILE: ${{ github.workspace }}/Gemfile
+        run: |
+          bundle exec rake db:create db:migrate
+          # db:migrate dumps db/schema.rb again; it should not change
+          git diff --exit-code -- ../lib/cosmos/dart/db/schema.rb
+          bundle exec ruby ../.github/scripts/dart_end_to_end.rb

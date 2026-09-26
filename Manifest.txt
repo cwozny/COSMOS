@@ -3,6 +3,7 @@
 .github/ISSUE_TEMPLATE/bug_report.md
 .github/ISSUE_TEMPLATE/feature_request.md
 .github/ISSUE_TEMPLATE/help---usage---general-question.md
+.github/scripts/dart_end_to_end.rb
 .github/workflows/build_v4.yml
 .gitignore
 .rubocop.yml
