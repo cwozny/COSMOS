@@ -668,7 +668,7 @@ module DartCommon
     end
     model.reset_column_information
     model_name = table_name.upcase
-    Cosmos.public_send(:remove_const, model_name) if Cosmos.const_defined?(model_name)
+    Cosmos.send(:remove_const, model_name) if Cosmos.const_defined?(model_name)
     Cosmos.const_set(model_name, model)
   end
 
