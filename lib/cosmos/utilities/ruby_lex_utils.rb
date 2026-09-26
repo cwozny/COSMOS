@@ -177,16 +177,17 @@ class RubyLexUtils
     #   block the line is in, from its 'begin' line up to the line before its
     #   'end', or nil if it isn't in one
     def begin_level(line)
-      level = nil
-      innermost = nil
-      @begin_ranges.each do |first, last, begin_level|
-        next unless line >= first and line <= last
-        if innermost.nil? or first >= innermost
-          innermost = first
-          level = begin_level
+      # Work out every line's level once. Ranges are applied in order of their
+      # first line, so the innermost block containing a line (the one that
+      # starts last, and of those the last one found) sets its level.
+      @begin_levels ||= begin
+        levels = []
+        @begin_ranges.each_with_index.sort_by { |(first, _last, _level), index| [first, index] }.each do |(first, last, level), _index|
+          (first..last).each { |range_line| levels[range_line] = level }
         end
+        levels
       end
-      level
+      @begin_levels[line]
     end
 
     private
