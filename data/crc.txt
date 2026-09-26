@@ -2,7 +2,7 @@
 "lib/cosmos.rb" 0x8520B1D5
 "lib/cosmos/ccsds/ccsds_packet.rb" 0xA30EE27E
 "lib/cosmos/ccsds/ccsds_parser.rb" 0x89A5FB3A
-"lib/cosmos/config/config_parser.rb" 0xECEA93B5
+"lib/cosmos/config/config_parser.rb" 0x29469D6C
 "lib/cosmos/config/meta_config_parser.rb" 0xE4521B6B
 "lib/cosmos/conversions.rb" 0x3C0D8984
 "lib/cosmos/conversions/conversion.rb" 0xCE9919ED
