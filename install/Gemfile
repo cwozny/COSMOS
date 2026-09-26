@@ -8,6 +8,10 @@ if ENV['COSMOS_DEVEL']
 else
   gem 'cosmos'
 end
+# COSMOS's Excel support (cosmos/win32/excel) needs win32ole, which Ruby 4
+# no longer includes as a default gem. A cosmos gem built on Linux or macOS
+# doesn't depend on it, so the project lists it for Windows.
+gem 'win32ole', platforms: :windows
 
 # Uncomment this line to add DART dependencies to your main Gemfile
 # instance_eval File.read(File.join(__dir__, 'config/dart/Gemfile'))
