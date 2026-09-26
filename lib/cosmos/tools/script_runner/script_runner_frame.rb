@@ -609,8 +609,10 @@ module Cosmos
 
           instrumented_line << " __return_val\n"
         else
-          # Nothing may come before a 'when' or a pattern matching 'in'
-          unless segment =~ /^\s*end\s*$/ or segment =~ /^\s*when .*$/ or segment =~ /^\s*in\s/
+          # Nothing may come before a 'when' or a pattern matching 'in'. Only
+          # look at the start of the segment (\A, not ^): a multi-line segment,
+          # such as a statement with a heredoc, can have such a line inside.
+          unless segment =~ /\A\s*end\s*$/ or segment =~ /\A\s*when .*$/ or segment =~ /\A\s*in\s/
             num_left_brackets = segment.count('{')
             num_right_brackets = segment.count('}')
             num_left_square_brackets = segment.count('[')
