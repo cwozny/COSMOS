@@ -978,6 +978,7 @@ lib/cosmos/dart/app/models/system_config.rb
 lib/cosmos/dart/app/models/target.rb
 lib/cosmos/dart/bin/rails
 lib/cosmos/dart/bin/rake
+lib/cosmos/dart/config.ru
 lib/cosmos/dart/config/application.rb
 lib/cosmos/dart/config/boot.rb
 lib/cosmos/dart/config/database.yml
