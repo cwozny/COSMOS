@@ -128,9 +128,14 @@ Qt.single_shot(400) { cbs << :b }
 before = mu.synchronize { ticks }
 app.exec_for(700)
 after = mu.synchronize { ticks }
+# The 400 ms callback missed the 700 ms window once on windows-latest (PR #7,
+# run 36202371689, attempt 1; the rerun passed). Keep running the loop until
+# both have run, for up to 5 s, and report the ones that did if not.
+deadline = Time.now + 5
+app.exec_for(50) while cbs.size < 2 && Time.now < deadline
 ths.each(&:kill)
 chk("Ruby threads run during exec()"){ (after - before) > 30 }
-chk("Qt calls into Ruby during exec"){ cbs == [:a, :b] }
+chk("Qt calls into Ruby during exec"){ cbs == [:a, :b] || "callbacks run: #{cbs.inspect}" }
 
 section "9. value types"
 ks = Qt::KeySequence.new("Ctrl+Q")
