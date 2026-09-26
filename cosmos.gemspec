@@ -105,6 +105,8 @@ spec = Gem::Specification.new do |s|
   s.add_runtime_dependency 'logger', '~> 1.7'
   s.add_runtime_dependency 'matrix', '~> 0.4'
   s.add_runtime_dependency 'ostruct', '~> 0.6'
+  # win32ole only builds on Windows. Gem.win_platform? is evaluated when the
+  # gem is built, so the project Gemfiles (install/, demo/) list it as well.
   s.add_runtime_dependency 'win32ole', '~> 1.9' if Gem.win_platform?
 
   # Development Dependencies
