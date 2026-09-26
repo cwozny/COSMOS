@@ -61,6 +61,12 @@ describe DartDecomQuery do
     thread.kill
   end
 
+  describe "dart_status" do
+    it "reports the database size" do
+      expect(@query.dart_status[:DART_DATABASE_BYTES]).to be > 0
+    end
+  end
+
   describe "query" do
     it "raises if start time specified incorrectly" do
       query = {"start_time_sec" => "SEC", "start_time_usec" => "USEC"}
