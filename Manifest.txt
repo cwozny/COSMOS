@@ -1453,6 +1453,7 @@ spec/core_ext/string_spec.rb
 spec/core_ext/stringio_spec.rb
 spec/core_ext/time_spec.rb
 spec/gui/line_graph/line_clip_spec.rb
+spec/gui/line_graph/lines_spec.rb
 spec/gui/qt_spec.rb
 spec/gui/utilities/script_module_gui_spec.rb
 spec/install/config/data/data.txt
