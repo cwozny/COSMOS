@@ -92,7 +92,9 @@ module DartCommon
   #   and YYY is the table index. Reduction tables have a _m, _h, _d extension
   #   on the table name.
   def get_table_model(table, reduction_modifier = "")
-    model_name = "T" + table[1..-1] + reduction_modifier
+    # The same constant name create_table uses, so a recreated table's model
+    # replaces this one
+    model_name = (table + reduction_modifier).upcase
     begin
       model = Cosmos.const_get(model_name)
     rescue

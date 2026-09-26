@@ -329,4 +329,13 @@ describe DartCommon do
       expect(packet).to be_nil
     end
   end
+
+  describe "get_decom_table_model" do
+    it "returns the model of a reduction table that was made again" do
+      common.send(:create_table, "t9_0_m") { |t| t.integer :first }
+      expect(common.get_decom_table_model(9, 0, "_m").column_names).to include("first")
+      common.send(:create_table, "t9_0_m") { |t| t.integer :second }
+      expect(common.get_decom_table_model(9, 0, "_m").column_names).to include("second")
+    end
+  end
 end

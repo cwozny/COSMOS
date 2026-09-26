@@ -89,11 +89,11 @@
 "lib/cosmos/dart/db/seeds.rb" 0xF64BB16E
 "lib/cosmos/dart/examples/dart_decom_client.rb" 0x64155895
 "lib/cosmos/dart/examples/dart_stream_client.rb" 0x50834BF3
-"lib/cosmos/dart/lib/dart_common.rb" 0x1A40C683
+"lib/cosmos/dart/lib/dart_common.rb" 0xFB937442
 "lib/cosmos/dart/lib/dart_constants.rb" 0x6A68A279
 "lib/cosmos/dart/lib/dart_database_cleaner.rb" 0x4D70698F
 "lib/cosmos/dart/lib/dart_decom_query.rb" 0xB1BA16AE
-"lib/cosmos/dart/lib/dart_decommutator.rb" 0x4299CAA8
+"lib/cosmos/dart/lib/dart_decommutator.rb" 0x1FC5F9A4
 "lib/cosmos/dart/lib/dart_importer.rb" 0x0404462B
 "lib/cosmos/dart/lib/dart_logging.rb" 0xA77140B0
 "lib/cosmos/dart/lib/dart_master_query.rb" 0x30D903C1
@@ -110,10 +110,10 @@
 "lib/cosmos/dart/processes/dart_stream_server.rb" 0xDB0A685D
 "lib/cosmos/dart/processes/dart_util.rb" 0x529F6B02
 "lib/cosmos/dart/processes/dart_worker.rb" 0x276DA6C2
-"lib/cosmos/dart/spec/dart/dart_common_spec.rb" 0xC9BFE6ED
+"lib/cosmos/dart/spec/dart/dart_common_spec.rb" 0xC0D5DC0D
 "lib/cosmos/dart/spec/dart/dart_database_cleaner_spec.rb" 0xADBC66CD
-"lib/cosmos/dart/spec/dart/dart_decom_query_spec.rb" 0xC4E9E151
-"lib/cosmos/dart/spec/dart/dart_decommutator_spec.rb" 0x7142E481
+"lib/cosmos/dart/spec/dart/dart_decom_query_spec.rb" 0x0D196F6C
+"lib/cosmos/dart/spec/dart/dart_decommutator_spec.rb" 0x11AA3B9C
 "lib/cosmos/dart/spec/dart/dart_importer_spec.rb" 0x9ED47532
 "lib/cosmos/dart/spec/dart/dart_logging_spec.rb" 0x3170887C
 "lib/cosmos/dart/spec/dart/dart_packet_log_writer_spec.rb" 0x31246F90
