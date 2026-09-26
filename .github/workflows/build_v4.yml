@@ -138,4 +138,6 @@ jobs:
           bundle exec rake db:create db:migrate
           # db:migrate dumps db/schema.rb again; it should not change
           git diff --exit-code -- ../lib/cosmos/dart/db/schema.rb
+          # The database is usable before DART first starts (the Status row exists)
+          bundle exec ruby ../bin/dart_util showdatabase
           bundle exec ruby ../.github/scripts/dart_end_to_end.rb

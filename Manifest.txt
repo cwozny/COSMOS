@@ -1037,6 +1037,7 @@ lib/cosmos/dart/lib/dart_packet_log_writer.rb
 lib/cosmos/dart/lib/dart_reducer_manager.rb
 lib/cosmos/dart/lib/dart_reducer_worker_thread.rb
 lib/cosmos/dart/lib/dart_tcpip_server_interface.rb
+lib/cosmos/dart/lib/tasks/dart.rake
 lib/cosmos/dart/processes/dart.rb
 lib/cosmos/dart/processes/dart_decom_server.rb
 lib/cosmos/dart/processes/dart_import.rb
