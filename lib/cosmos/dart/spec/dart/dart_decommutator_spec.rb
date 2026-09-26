@@ -30,7 +30,7 @@ describe DartDecommutator do
     # instead of for a fixed time
     def wait_for_decom(timeout = 30)
       deadline = Time.now + timeout
-      while PacketLogEntry.where(decom_state: PacketLogEntry::NOT_STARTED).exists? && Time.now < deadline
+      while PacketLogEntry.where(decom_state: [PacketLogEntry::NOT_STARTED, PacketLogEntry::IN_PROGRESS]).exists? && Time.now < deadline
         sleep 0.1
       end
     end
@@ -139,6 +139,36 @@ describe DartDecommutator do
           end
           db_index += 1
         end
+      end
+    end
+
+    it "decommutates an entry once if the master hands it out twice" do
+      setup_ples()
+      # The master refills its list with every entry not started yet, so it can
+      # hand out an entry again while a worker is still decommutating it
+      calls = 0
+      allow_any_instance_of(DartMasterQuery).to receive(:get_decom_ple_ids) do
+        calls += 1
+        calls <= 2 ? [1, 2] : []
+      end
+
+      thread = Thread.new do
+        decom = DartDecommutator.new
+        decom.run
+      end
+      # Wait until the decommutator has asked again after the second hand out
+      deadline = Time.now + 30
+      sleep 0.1 while calls < 3 && Time.now < deadline
+      thread.kill
+
+      (1..2).each do |id|
+        expect(PacketLogEntry.find(id).decom_state).to eq PacketLogEntry::COMPLETE
+      end
+      [["SYSTEM", "META"], ["INST", "HEALTH_STATUS"]].each do |target_name, packet_name|
+        target = Target.where("name = ?", target_name).first
+        packet = Packet.where("target_id = ? AND name = ?", target.id, packet_name).first
+        packet_config = PacketConfig.where("packet_id = ?", packet.id).first
+        expect(common.get_decom_table_model(packet_config.id, 0).count).to eq 1
       end
     end
 

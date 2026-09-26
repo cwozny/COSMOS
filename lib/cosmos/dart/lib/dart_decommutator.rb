@@ -69,6 +69,12 @@ class DartDecommutator
       if ple_ids and ple_ids.length > 0
         ple_ids.each do |ple_id|
           begin
+            # The master can hand out an entry again while another worker is
+            # still decommutating it, so claim it first. DartDatabaseCleaner
+            # resets entries left IN_PROGRESS.
+            claimed = PacketLogEntry.where(id: ple_id, decom_state: PacketLogEntry::NOT_STARTED).
+              update_all(decom_state: PacketLogEntry::IN_PROGRESS)
+            next if claimed == 0
             ple = PacketLogEntry.find(ple_id)
             meta_ple = get_meta_ple(ple)
             next unless meta_ple
@@ -100,7 +106,14 @@ class DartDecommutator
               end
             end
           rescue => err
-            handle_error("PLE:#{ple.id}:ERROR\n#{err.formatted}")
+            handle_error("PLE:#{ple_id}:ERROR\n#{err.formatted}")
+            # Let the entry be tried again
+            begin
+              PacketLogEntry.where(id: ple_id, decom_state: PacketLogEntry::IN_PROGRESS).
+                update_all(decom_state: PacketLogEntry::NOT_STARTED)
+            rescue => err
+              handle_error("PLE:#{ple_id}:ERROR releasing\n#{err.formatted}")
+            end
           end
         end
       else

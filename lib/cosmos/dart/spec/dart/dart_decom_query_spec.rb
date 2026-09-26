@@ -55,7 +55,7 @@ describe DartDecomQuery do
       decom.run
     end
     while true
-      break if 0 == PacketLogEntry.where("decom_state = #{PacketLogEntry::NOT_STARTED}").count
+      break if 0 == PacketLogEntry.where(decom_state: [PacketLogEntry::NOT_STARTED, PacketLogEntry::IN_PROGRESS]).count
       sleep 0.1
     end
     thread.kill
