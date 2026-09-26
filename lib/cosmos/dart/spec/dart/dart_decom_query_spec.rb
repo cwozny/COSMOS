@@ -38,7 +38,8 @@ describe DartDecomQuery do
     @hs_packets = []
     # Write packets. The first packet is always SYSTEM META.
     num_pkts.times do |x|
-      hs_packet.received_time = Time.now
+      # The packet log stores microseconds, so the times read back can only match to the microsecond
+      hs_packet.received_time = Time.now.floor(6)
       hs_packet.write("COLLECT_TYPE", x, :RAW)
       @hs_packets << hs_packet.clone
       writer.write(hs_packet)
