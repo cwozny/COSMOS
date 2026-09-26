@@ -39,10 +39,11 @@ describe DartDatabaseCleaner do
       # Create a bogus SystemConfig to cause an error
       SystemConfig.create(:name => "test")
 
-      expect(Cosmos::Logger).to receive(:error) do |msg|
-        expect(msg).to match(/Could not load system_config: test/)
-      end
+      # System.load_configuration logs its own error before DART's
+      messages = []
+      allow(Cosmos::Logger).to receive(:error) { |msg| messages << msg }
       config, error = @cleaner.clean_system_configs
+      expect(messages).to include(a_string_matching(/Could not load system_config: test/))
       # Ensure the configuration is loaded
       expect(config).to eq Cosmos::System.configuration_name
     end
@@ -150,10 +151,11 @@ describe DartDatabaseCleaner do
       sys_config = SystemConfig.create(:name => "test")
       PacketConfig.create(:packet_id => packet_id, :name => packet.config_name, :first_system_config_id => sys_config.id)
 
-      expect(Cosmos::Logger).to receive(:error) do |msg|
-        expect(msg).to match(/Could not switch to system config: test/)
-      end
+      # System.load_configuration logs its own error before DART's
+      messages = []
+      allow(Cosmos::Logger).to receive(:error) { |msg| messages << msg }
       @cleaner.clean_packet_configs
+      expect(messages).to include(a_string_matching(/Could not switch to system config: test/))
     end
 
     it "recreates the PacketConfig if it is not 'ready'" do
