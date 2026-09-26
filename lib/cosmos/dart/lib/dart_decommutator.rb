@@ -10,7 +10,6 @@
 
 require 'dart_common'
 require 'dart_logging'
-require 'packet_log_entry'
 require 'cosmos/io/json_drb_object'
 
 class DartDecommutatorStatus

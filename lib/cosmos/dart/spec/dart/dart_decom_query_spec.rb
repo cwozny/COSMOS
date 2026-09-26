@@ -10,7 +10,6 @@
 
 require 'rails_helper'
 require 'dart_decom_query'
-require 'packet_log_entry'
 require 'dart_packet_log_writer'
 require 'dart_decommutator'
 

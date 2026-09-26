@@ -10,7 +10,6 @@
 
 require 'rails_helper'
 require 'dart_reducer_manager'
-require 'database_cleaner'
 require 'dart_packet_log_writer'
 require 'dart_decommutator'
 require 'dart_common'

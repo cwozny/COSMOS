@@ -10,7 +10,6 @@
 
 require 'rails_helper'
 require 'dart_tcpip_server_interface'
-require 'packet_log_entry'
 require 'dart_packet_log_writer'
 
 describe DartTcpipServerInterface do

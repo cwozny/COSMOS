@@ -10,7 +10,6 @@
 
 require 'rails_helper'
 require 'dart_common'
-require 'database_cleaner'
 require 'cosmos/tools/cmd_tlm_server/cmd_tlm_server'
 require 'cosmos/tools/cmd_tlm_server/api'
 
