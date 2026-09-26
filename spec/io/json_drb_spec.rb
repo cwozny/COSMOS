@@ -96,7 +96,9 @@ module Cosmos
       end
 
       it "raises an error if the server doesn't start" do
-        allow(Rack::Handler::Puma).to receive(:run) {}
+        # A server whose run returns at once without ever starting
+        server = double("server", add_tcp_listener: nil, run: Thread.new {}, running: nil, binder: double(close: nil))
+        allow(Puma::Server).to receive(:new).and_return(server)
         expect { @json.start_service('127.0.0.1', 7777, self) }.to raise_error(/JsonDRb http server could not be started/)
       end
 
@@ -115,7 +117,7 @@ module Cosmos
 
       it "rescues listen thread exceptions" do
         capture_io do |stdout|
-          allow(Rack::Handler::Puma).to receive(:run) { raise "BLAH" }
+          allow(Puma::Server).to receive(:new) { raise "BLAH" }
           expect { @json.start_service('127.0.0.1', 7777, self) }.to raise_error(/JsonDRb http server could not be started/)
           sleep(0.1)
           @json.stop_service

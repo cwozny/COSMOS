@@ -158,7 +158,7 @@ module Cosmos
         begin
           Cosmos.set_working_dir do
             file_list = data_package_files()
-            Zip::File.open(@data_package_filename, Zip::File::CREATE) do|zf|
+            Zip::File.open(@data_package_filename, create: true) do|zf|
               count = 0
               file_list.each do |file|
                 break if @canceled

@@ -130,8 +130,10 @@ module Cosmos
       y_max = 1
       y_min = -1
 
-      # Ensure we have a valid range of values
-      if value_range.size
+      # Ensure we have a valid range of values: numbers at both ends. This
+      # used Range#size, which was nil otherwise; since Ruby 3.4 it raises
+      # TypeError for any range it can't iterate, which includes Floats.
+      if value_range.begin.is_a?(Numeric) and value_range.end.is_a?(Numeric)
         y_min = value_range.first
         y_max = value_range.last
 

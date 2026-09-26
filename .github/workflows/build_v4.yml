@@ -20,7 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        ruby-version: ["2.5", "2.6"]
+        # One exact version, the same one the Windows installer installs
+        ruby-version: ["4.0.7"]
     steps:
       - uses: actions/checkout@v2
       - uses: ruby/setup-ruby@v1
@@ -47,48 +48,32 @@ jobs:
       CI: 1
       # A missing Qt6 or moc fails the build instead of stubbing it out.
       COSMOS_QT6_REQUIRED: 1
-      # On Windows, gems with C code (racc, io-console) build as C17: MSYS2's
-      # GCC 16 defaults to C23, which rejects the Ruby 2.6 C API's VALUE (*)().
-      # ffi strips any -std= from CFLAGS, so -fpermissive also turns that
-      # error (and GCC 14's other new errors for old C) back into a warning.
-      # mkmf reads CONFIGURE_ARGS in every extconf.rb, and $(cflags) keeps the
-      # usual optimization and warning flags.
-      CONFIGURE_ARGS: "${{ matrix.os == 'windows-latest' && '--with-cflags=''$(cflags) -std=gnu17 -fpermissive''' || '' }}"
     steps:
       - uses: actions/checkout@v2
       - name: Install the toolchain and Qt 6 (Windows)
         if: runner.os == 'Windows'
         # One MSYS2 for everything: Qt 6, the compiler that builds against it
-        # and the DLLs Ruby loads at run time. MINGW64 is the MSVCRT toolchain
-        # RubyInstaller 2.6 is built with, and RubyInstaller adds C:\msys64's
-        # mingw64\bin to its DLL search path at startup. This runs before
+        # and the DLLs Ruby loads at run time. UCRT64 is the toolchain
+        # RubyInstaller 4 is built with, and RubyInstaller adds C:\msys64's
+        # ucrt64\bin to its DLL search path at startup. This runs before
         # setup-ruby, whose bundle install builds native gems with it.
-        run: C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed make mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base
+        run: C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-qt6-base
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "2.6"
+          ruby-version: "4.0.7"
           bundler-cache: true
-          # setup-ruby's own Windows toolchain is a second MSYS2 (GCC 14) in
-          # Ruby's directory, which RubyInstaller would find first.
+          # setup-ruby's own Windows toolchain is a second MSYS2 in Ruby's
+          # directory, without Qt 6, which RubyInstaller would find first.
           windows-toolchain: ${{ runner.os == 'Windows' && 'none' || 'default' }}
-      - name: Give Ruby MSYS2's GCC runtime (Windows)
+      - name: Show the toolchain (Windows)
         if: runner.os == 'Windows'
-        # RubyInstaller 2.6 ships the GCC runtime it was built with (2022) in
-        # bin\ruby_builtin_dlls and binds it for the whole process. Qt 6 from
-        # MSYS2 is built with GCC 16 and needs newer ones: loading qt6.so
-        # failed with "127: The specified procedure could not be found". The
-        # newer runtime is backward compatible, so Ruby runs on it as well.
+        # If qt6.so fails to load, compare the GCC that built Ruby and its
+        # bundled runtime DLLs with the one that builds Qt 6 and COSMOS.
         shell: pwsh
         run: |
-          $dlls = Join-Path (Split-Path (Get-Command ruby).Source) 'ruby_builtin_dlls'
-          foreach ($name in 'libgcc_s_seh-1.dll', 'libwinpthread-1.dll', 'libstdc++-6.dll') {
-            $target = Join-Path $dlls $name
-            if (Test-Path $target) {
-              Copy-Item "C:\msys64\mingw64\bin\$name" $target -Force
-              "replaced $name"
-            }
-          }
-          Get-ChildItem $dlls | ForEach-Object { $_.Name }
+          ruby -e "puts RUBY_DESCRIPTION; puts RbConfig::CONFIG['CC_VERSION_MESSAGE'].to_s.lines.first"
+          C:\msys64\ucrt64\bin\gcc.exe --version | Select-Object -First 1
+          Get-ChildItem (Join-Path (Split-Path (Get-Command ruby).Source) 'ruby_builtin_dlls') | ForEach-Object { $_.Name }
       - name: Install Qt 6 (Linux)
         if: runner.os == 'Linux'
         run: |

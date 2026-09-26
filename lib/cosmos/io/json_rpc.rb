@@ -9,6 +9,9 @@
 # attribution addendums as found in the LICENSE.txt
 
 require 'json'
+# Since json 2.14, String#to_json_raw_object and String.json_create, which
+# carry binary strings through JSON-RPC, are only defined by json/add/string
+require 'json/add/string'
 require 'date'
 
 class Object

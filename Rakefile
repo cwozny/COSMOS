@@ -126,15 +126,18 @@ end
 task :devkit do
   if RUBY_ENGINE == 'ruby'
     if RUBY_PLATFORM[0..2] == 'x64'
-      if File.exist?("C:/msys64/mingw64")
+      # RubyInstaller 3.1 and later (x64-mingw-ucrt) are built with MSYS2's
+      # UCRT64 toolchain; older ones (x64-mingw32) with MINGW64
+      msystem = RUBY_PLATFORM.include?('ucrt') ? 'ucrt64' : 'mingw64'
+      if File.exist?("C:/msys64/#{msystem}")
         ENV['RI_DEVKIT'] = "C:\\msys64"
-        ENV['MSYSTEM']="MINGW64"
-        ENV['PKG_CONFIG_PATH']="/mingw64/lib/pkgconfig:/mingw64/share/pkgconfig"
-        ENV['ACLOCAL_PATH']="/mingw64/share/aclocal:/usr/share/aclocal"
-        ENV['MANPATH']="/mingw64/share/man"
-        ENV['MINGW_PACKAGE_PREFIX']="mingw-w64-x86_64"
+        ENV['MSYSTEM'] = msystem.upcase
+        ENV['PKG_CONFIG_PATH']="/#{msystem}/lib/pkgconfig:/#{msystem}/share/pkgconfig"
+        ENV['ACLOCAL_PATH']="/#{msystem}/share/aclocal:/usr/share/aclocal"
+        ENV['MANPATH']="/#{msystem}/share/man"
+        ENV['MINGW_PACKAGE_PREFIX'] = (msystem == 'ucrt64') ? "mingw-w64-ucrt-x86_64" : "mingw-w64-x86_64"
         ENV['LANG']="en_US.UTF-8"
-        ENV['PATH'] = 'C:\\msys64\\mingw64\\bin;C:\\msys64\\usr\\bin;' + ENV['PATH']
+        ENV['PATH'] = "C:\\msys64\\#{msystem}\\bin;C:\\msys64\\usr\\bin;" + ENV['PATH']
       end
     else
       if File.exist?("C:/msys64/mingw32")
@@ -160,7 +163,6 @@ task :build => [:devkit] do
 
     extensions = [
       'crc',
-      'low_fragmentation_array',
       'polynomial_conversion',
       'config_parser',
       'string',
@@ -294,8 +296,6 @@ task :metrics do
   `flay lib > flay_report.txt`
   puts "\nRunning reek and creating reek_report.txt"
   `reek lib > reek_report.txt`
-  puts "\nRunning roodi and creating roodi_report.txt"
-  `roodi -config=roodi.yml lib > roodi_report.txt`
 end
 
 task :stress do

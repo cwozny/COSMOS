@@ -24,20 +24,18 @@ set PROTOCOL=https
 set ARCHITECTURE=%PROCESSOR_ARCHITECTURE%
 
 :: Update this version if making any changes to this script
-set INSTALLER_VERSION=3.0
+set INSTALLER_VERSION=4.0
 
 :: Paths and versions for COSMOS dependencies
 :: RubyInstaller without the Devkit: the Devkit puts a second MSYS2 inside
 :: Vendor\Ruby, where Ruby would look for it first.
-set RUBY_INSTALLER=rubyinstaller-2.6.10-1-x64.exe
-set RUBY_INSTALLER_PATH=//github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-2.6.10-1/
-set RUBY_ABI_VERSION=2.6.0
-:: RubyGems 3.5 and later need Ruby 3
-set RUBYGEMS_VERSION=3.4.22
+set RUBY_INSTALLER=rubyinstaller-4.0.7-1-x64.exe
+set RUBY_INSTALLER_PATH=//github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-4.0.7-1/
+set RUBY_ABI_VERSION=4.0.0
 set MSYS2_INSTALLER=msys2-x86_64-latest.sfx.exe
 set MSYS2_INSTALLER_PATH=//repo.msys2.org/distrib/
-:: MINGW64 is the MSVCRT toolchain RubyInstaller 2.6 is built with
-set MSYS2_PACKAGES=make mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base
+:: UCRT64 is the toolchain RubyInstaller 4 is built with
+set MSYS2_PACKAGES=make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-qt6-base
 set WKHTMLTOPDF=wkhtmltox-0.12.6-1.msvc2015-win64.exe
 set WKHTMLPATHWITHPROTOCOL=https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/
 set COSMOS_REPO=//github.com/cwozny/COSMOS
@@ -164,7 +162,6 @@ if errorlevel 1 (
 @echo RUBY_INSTALLER=!RUBY_INSTALLER! >> !COSMOS_INSTALL!\INSTALL.log
 @echo RUBY_INSTALLER_PATH=!RUBY_INSTALLER_PATH! >> !COSMOS_INSTALL!\INSTALL.log
 @echo RUBY_ABI_VERSION=!RUBY_ABI_VERSION! >> !COSMOS_INSTALL!\INSTALL.log
-@echo RUBYGEMS_VERSION=!RUBYGEMS_VERSION! >> !COSMOS_INSTALL!\INSTALL.log
 @echo MSYS2_INSTALLER=!MSYS2_INSTALLER! >> !COSMOS_INSTALL!\INSTALL.log
 @echo MSYS2_INSTALLER_PATH=!MSYS2_INSTALLER_PATH! >> !COSMOS_INSTALL!\INSTALL.log
 @echo MSYS2_PACKAGES=!MSYS2_PACKAGES! >> !COSMOS_INSTALL!\INSTALL.log
@@ -200,7 +197,11 @@ if !ARCHITECTURE!==x86 (
   )
 
   echo Installing 64-bit Ruby
-  !COSMOS_INSTALL!\tmp\!RUBY_INSTALLER! /silent /tasks="nomodpath,noassocfiles,noridkinstall" /dir="!COSMOS_INSTALL!\Vendor\Ruby" /components="ruby,rdoc"
+  REM RubyInstaller 4, unlike 2.6, lets the user pick an install mode, all users
+  REM or just me, in a dialog that /silent still shows, and a CI runner never
+  REM answers it. /currentuser is the mode RubyInstaller 2.6 always used, and
+  REM /suppressmsgboxes keeps any other prompt from stopping a silent install.
+  !COSMOS_INSTALL!\tmp\!RUBY_INSTALLER! /silent /currentuser /suppressmsgboxes /tasks="nomodpath,noassocfiles,noridkinstall" /dir="!COSMOS_INSTALL!\Vendor\Ruby" /components="ruby,rdoc"
   if errorlevel 1 (
     echo ERROR: Problem installing 64-bit Ruby
     echo INSTALL FAILED
@@ -218,7 +219,7 @@ if !ARCHITECTURE!==x86 (
 
 :: Ruby finds the MSYS2 next to its own folder before any other MSYS2 on the
 :: machine. It builds gems with that MSYS2's tools and loads DLLs from its
-:: mingw64\bin, which is where the Qt 6 DLLs are.
+:: ucrt64\bin, which is where the Qt 6 DLLs are.
 echo Downloading MSYS2
 powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('!PROTOCOL!:!MSYS2_INSTALLER_PATH!!MSYS2_INSTALLER!', '!COSMOS_INSTALL!\tmp\!MSYS2_INSTALLER!')"
 if errorlevel 1 (
@@ -260,24 +261,6 @@ if errorlevel 1 (
   exit /b 1
 ) else (
   @echo Successfully installed MSYS2 packages: !MSYS2_PACKAGES! >> !COSMOS_INSTALL!\INSTALL.log
-)
-
-:: Give Ruby the newer GCC runtime Qt 6 is built with. RubyInstaller 2.6 binds
-:: the copies in bin\ruby_builtin_dlls (from 2022) for the whole process, and
-:: with them the Qt6 extension fails to load with "127: The specified
-:: procedure could not be found". The newer runtime is backward compatible,
-:: so Ruby runs on it as well.
-for %%D in (libgcc_s_seh-1.dll libwinpthread-1.dll) do (
-  copy /y !COSMOS_INSTALL!\Vendor\msys64\mingw64\bin\%%D !COSMOS_INSTALL!\Vendor\Ruby\bin\ruby_builtin_dlls\%%D > nul
-  if errorlevel 1 (
-    echo ERROR: Problem copying %%D into Ruby
-    echo INSTALL FAILED
-    @echo ERROR: Problem copying %%D into Ruby >> !COSMOS_INSTALL!\INSTALL.log
-    pause
-    exit /b 1
-  ) else (
-    @echo Successfully copied %%D into Ruby >> !COSMOS_INSTALL!\INSTALL.log
-  )
 )
 
 ::::::::::::::::::::::::
@@ -389,25 +372,8 @@ SET "PATH=!COSMOS_INSTALL!\Vendor\Ruby\bin;%PATH%"
 SET RUBYOPT=
 SET RUBYLIB=
 
-:: Build gems with C code as C17. MSYS2's GCC defaults to C23, which rejects
-:: the Ruby 2.6 C API's VALUE (*)(). ffi strips any -std= from CFLAGS, so
-:: -fpermissive also turns that error back into a warning. mkmf reads
-:: CONFIGURE_ARGS in every extconf.rb.
-SET "CONFIGURE_ARGS=--with-cflags='$(cflags) -std=gnu17 -fpermissive'"
 :: Fail instead of installing COSMOS without its GUI when Qt 6 is not found
 SET COSMOS_QT6_REQUIRED=1
-
-:: Update gem
-call gem update --system !RUBYGEMS_VERSION!
-if errorlevel 1 (
-  echo ERROR: Problem updating RubyGems to !RUBYGEMS_VERSION!
-  echo INSTALL FAILED
-  @echo ERROR: Problem updating RubyGems to !RUBYGEMS_VERSION! >> !COSMOS_INSTALL!\INSTALL.log
-  pause
-  exit /b 1
-) else (
-  @echo Successfully updated RubyGems to !RUBYGEMS_VERSION! >> !COSMOS_INSTALL!\INSTALL.log
-)
 
 :: Build the COSMOS gem, versioned like lib/cosmos/version.rb
 set COSMOS_VERSION=

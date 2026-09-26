@@ -16,24 +16,8 @@ require 'drb/drb'
 require 'set'
 require 'cosmos/io/json_rpc'
 require 'cosmos/io/json_drb_rack'
-require 'rack/handler/puma'
-
-# Add methods to the Puma::Launcher and Puma::Single class so we can tell
-# if the server has been started.
-module Puma
-  class Launcher
-    def running
-      @runner and @runner.running
-    end
-  end
-  class Runner
-  end
-  class Single < Runner
-    def running
-      @server and @server.running
-    end
-  end
-end
+require 'puma'
+require 'puma/server'
 
 module Cosmos
   # JsonDRb implements the JSON-RPC 2.0 Specification to provide an interface
@@ -78,12 +62,10 @@ module Cosmos
       clients = 0
       @server_mutex.synchronize do
         if @server
-          # @server.stats() returns a string like: { "backlog": 0, "running": 0 }
-          # "running" indicates the number of server threads running, and
-          # therefore the number of clients connected.
-          stats = @server.stats()
-          stats =~ /"running": \d*/
-          clients = $&.split(":")[1].to_i
+          # The number of server threads running, and therefore the number
+          # of clients connected. It was the "running" value of Puma 3's
+          # stats string.
+          clients = @server.running.to_i
         end
       end
       return clients
@@ -130,20 +112,24 @@ module Cosmos
 
           # Create an http server to accept requests from clients
           begin
-            server_config = {
-              :Host   => hostname,
-              :Port   => port,
-              :Silent => true,
-              :Verbose => false,
-              :Threads => "0:#{max_threads}",
-            }
-
-            # The run call will block until the server is stopped.
-            Rack::Handler::Puma.run(JsonDrbRack.new(self, system), server_config) do |server|
-              @server_mutex.synchronize do
-                @server = server
-              end
+            # Puma's own server, embedded. Rack's Puma handler used to run a
+            # Puma::Launcher, which also installs signal traps; COSMOS only
+            # needs the server, with 0 to max_threads threads and no logging.
+            # If handling a request fails outright, answer with an empty 500 as
+            # Puma 3 did. JsonDRbObject raises DRbConnError for an empty body;
+            # Puma 8's default page would also send the backtrace to the client.
+            server = Puma::Server.new(JsonDrbRack.new(self, system), nil,
+                                      min_threads: 0,
+                                      max_threads: max_threads,
+                                      log_writer: Puma::LogWriter.null,
+                                      lowlevel_error_handler: ->(_error) { [500, {}, []] })
+            server.add_tcp_listener(hostname, port)
+            @server_mutex.synchronize do
+              @server = server
             end
+
+            # The server runs in its own thread until it is stopped
+            server.run.join
 
             # Wait for all puma threads to stop before trying to close
             # the sockets
@@ -156,8 +142,8 @@ module Cosmos
               sleep 0.25
             end
 
-            # Puma doesn't clean up it's own sockets after shutting down,
-            # so we'll do that here.
+            # Puma 3 didn't close its sockets after shutting down. Puma 8
+            # does, and closing them again does nothing.
             @server_mutex.synchronize do
               @server.binder.close() if @server
             end

@@ -48,6 +48,16 @@ blah = 5 # Inline comment
 DOC
         expect(@lex.remove_comments(text)).to eql "\nblah = 5 \n\n"
       end
+
+      it "keeps the newlines of a =begin block so line numbers stay the same" do
+        text = "a = 1\n=begin\nnotes\n=end\nb = 2\n"
+        expect(@lex.remove_comments(text)).to eql "a = 1\n\n\n\nb = 2\n"
+      end
+
+      it "leaves a # that does not start a comment" do
+        text = "x = %w(\#{var} B) # tail\ny = \"#\" + '#'\n"
+        expect(@lex.remove_comments(text)).to eql "x = %w(\#{var} B) \ny = \"#\" + '#'\n"
+      end
     end
 
     describe "each_lexed_segment" do
@@ -79,6 +89,69 @@ DOC
           ["else\n",false,nil,4], # can't instrument else
           ["z\n",true,nil,5],
           ["end\n",false,nil,6])  # can't instrument end
+      end
+
+      it "yields a statement with a heredoc as one segment, not instrumented" do
+        # ScriptRunner would put its instrumentation on the terminator line
+        text = "x = <<~EOS\n  hello\nEOS\ny = 1\n"
+        expect { |b| @lex.each_lexed_segment(text, &b) }.to yield_successive_args(
+          ["x = <<~EOS\n  hello\nEOS\n",false,nil,1],
+          ["y = 1\n",true,nil,4])
+      end
+
+      it "keeps a heredoc begun on a block's first line with that line" do
+        text = "wait(<<~MSG) do |line|\n  waiting\nMSG\n  puts line\nend\n"
+        expect { |b| @lex.each_lexed_segment(text, &b) }.to yield_successive_args(
+          ["wait(<<~MSG) do |line|\n  waiting\nMSG\n",false,nil,1],
+          ["  puts line\n",true,nil,4],
+          ["end\n",false,nil,5])
+      end
+
+      it "yields a method chain continued with leading dots as one segment" do
+        text = "list = items\n  .map(&:upcase)\n  .sort\n"
+        expect { |b| @lex.each_lexed_segment(text, &b) }.to yield_successive_args(
+          [text,true,nil,1])
+      end
+
+      it "ends the segment after a method's parameters" do
+        text = "def run(x)\n  x + 1\nend\n"
+        expect { |b| @lex.each_lexed_segment(text, &b) }.to yield_successive_args(
+          ["def run(x)\n",false,nil,1],
+          ["  x + 1\n",true,nil,2],
+          ["end\n",false,nil,3])
+      end
+
+      it "stays inside the outer begin after an inner begin ends" do
+        text = "begin\n  begin\n    a\n  rescue\n    b\n  end\n  c\nrescue\n  d\nend\n"
+        expect { |b| @lex.each_lexed_segment(text, &b) }.to yield_successive_args(
+          ["begin\n",false,0,1],
+          ["  begin\n",false,1,2],
+          ["    a\n",true,1,3],
+          ["  rescue\n",false,1,4],
+          ["    b\n",true,1,5],
+          ["  end\n",false,0,6],
+          ["  c\n",true,0,7],  # still inside the outer begin
+          ["rescue\n",false,0,8],
+          ["  d\n",true,0,9],
+          ["end\n",false,nil,10])
+      end
+
+      it "ignores keywords and blocks inside string interpolation" do
+        text = "puts \"\#{x if y} \#{[1].map { |i| i }}\"\n"
+        expect { |b| @lex.each_lexed_segment(text, &b) }.to yield_successive_args(
+          [text,true,nil,1])
+      end
+
+      it "doesn't instrument a rightward pattern match, which has no value" do
+        text = "config => {name:}\n"
+        expect { |b| @lex.each_lexed_segment(text, &b) }.to yield_successive_args(
+          [text,false,nil,1])
+      end
+
+      it "stops at __END__" do
+        text = "a = 1\n__END__\ndata\n"
+        expect { |b| @lex.each_lexed_segment(text, &b) }.to yield_successive_args(
+          ["a = 1\n",true,nil,1])
       end
     end
   end
