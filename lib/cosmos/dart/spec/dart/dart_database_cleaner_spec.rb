@@ -12,6 +12,7 @@ require 'rails_helper'
 require 'dart_database_cleaner'
 require 'dart_packet_log_writer'
 require 'dart_decommutator'
+require 'dart_importer'
 
 describe DartDatabaseCleaner do
   before(:each) do
@@ -31,6 +32,28 @@ describe DartDatabaseCleaner do
       expect(messages.select{|m| m =~ /Cleaning up PacketConfig/}.length).to eq 1
       expect(messages.select{|m| m =~ /Cleaning up PacketLogEntry/}.length).to eq 1
       expect(messages.select{|m| m =~ /Database cleanup complete/}.length).to eq 1
+    end
+  end
+
+  describe "remove_packet_log" do
+    it "removes an imported packet log and its PacketLogEntries" do
+      # A packet log in DART_DATA, imported the way dart_import imports it
+      writer = Cosmos::PacketLogWriter.new(:TLM, 'test_remove_', true, nil, 2_000_000_000, Cosmos::System.paths['DART_DATA'])
+      packet = Cosmos::System.telemetry.packet("INST", "HEALTH_STATUS")
+      3.times do
+        packet.received_time = Time.now
+        writer.write(packet)
+      end
+      filename = writer.filename
+      writer.shutdown
+      DartImporter.new.import(File.expand_path(filename), false)
+      # SYSTEM META plus the three packets
+      expect(PacketLogEntry.count).to eq 4
+
+      # dart_util removepacketlog takes the name relative to DART_DATA
+      @cleaner.remove_packet_log(File.basename(filename))
+      expect(PacketLog.count).to eq 0
+      expect(PacketLogEntry.count).to eq 0
     end
   end
 
