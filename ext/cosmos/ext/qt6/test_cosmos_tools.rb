@@ -1481,6 +1481,34 @@ chk('it disconnects with the config file it was given') do
   (recorded && recorded[2] == Cosmos::CmdTlmServer::DEFAULT_CONFIG_FILE) || raise("recorded #{recorded.inspect}")
 end
 
+say "\n43. ScriptRunner skipped a statement whose heredoc had an 'end',"
+say "    'when' or 'in' line"
+say "   (script_runner_frame.rb looked for those words with ^, which also"
+say "    matches inside a multi-line segment, and the Prism lexer gives a"
+say "    statement with a heredoc as one segment. The statement then ran"
+say "    without the line highlight, stepping, pausing or the Stop check.)"
+heredoc_script = <<~'SCRIPT'
+  prompt(<<~MSG)
+    in the cleanroom
+  MSG
+  puts(<<~TEXT)
+    when ready
+  TEXT
+  puts(<<~TEXT)
+  end
+  TEXT
+SCRIPT
+heredoc_lex = RubyLexUtils.new
+heredoc_text = heredoc_lex.remove_comments(heredoc_script)
+heredoc_instrumented = Cosmos::ScriptRunnerFrame.instrument_script_implementation(
+  heredoc_lex, heredoc_text, heredoc_text.num_lines.to_f, nil, 'heredoc_probe.rb')
+[[1, 'in'], [4, 'when'], [7, 'end']].each do |line, word|
+  chk("a heredoc with an '#{word}' line is instrumented") do
+    heredoc_instrumented.lines[line - 1].include?("pre_line_instrumentation('heredoc_probe.rb', #{line})") ||
+      raise(heredoc_instrumented.lines[line - 1].strip[0, 60])
+  end
+end
+
 say
 if $failures.empty?
   say 'ALL COSMOS TOOL CHECKS PASSED'

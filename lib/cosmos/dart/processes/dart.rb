@@ -36,6 +36,11 @@ class Dart
     Cosmos::Logger.level = Cosmos::Logger::INFO
     dart_logging = DartLogging.new('dart')
 
+    # A migration adds the Status row the processes update, but for a new
+    # database Rails 8's db:migrate loads db/schema.rb instead of running the
+    # migrations. db/seeds.rb adds the row if it's missing.
+    Rails.application.load_seed
+
     # Cleanup the database before starting processes
     DartDatabaseCleaner.clean(@@force_cleanup)
 

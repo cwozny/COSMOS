@@ -10,7 +10,6 @@
 
 require 'rails_helper'
 require 'dart_decommutator'
-require 'packet_log_entry'
 require 'dart_packet_log_writer'
 
 describe DartDecommutator do
@@ -22,6 +21,19 @@ describe DartDecommutator do
 
   describe "run" do
     let(:common) { Object.new.extend(DartCommon) }
+
+    before(:each) { start_dart_master }
+    after(:each) { stop_dart_master }
+
+    # The decommutator gets its entries from the DART master, which refills its
+    # list about once a second, so wait until every entry has been handled
+    # instead of for a fixed time
+    def wait_for_decom(timeout = 30)
+      deadline = Time.now + timeout
+      while PacketLogEntry.where(decom_state: [PacketLogEntry::NOT_STARTED, PacketLogEntry::IN_PROGRESS]).exists? && Time.now < deadline
+        sleep 0.1
+      end
+    end
 
     def check_val(val, expected)
       case val
@@ -66,7 +78,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 5 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       PacketLogEntry.all.each do |ple|
@@ -130,6 +142,49 @@ describe DartDecommutator do
       end
     end
 
+    it "leaves an entry to be decommutated again if the worker stops in the middle" do
+      setup_ples()
+      # Stopping DART (SIGINT) raises Interrupt wherever each worker is
+      allow_any_instance_of(DartDecommutator).to receive(:decom_packet).and_raise(Interrupt)
+
+      thread = Thread.new { DartDecommutator.new.run } # run rescues the Interrupt
+      expect(thread.join(60)).to_not be_nil
+
+      (1..2).each do |id|
+        expect(PacketLogEntry.find(id).decom_state).to eq PacketLogEntry::NOT_STARTED
+      end
+    end
+
+    it "decommutates an entry once if the master hands it out twice" do
+      setup_ples()
+      # The master refills its list with every entry not started yet, so it can
+      # hand out an entry again while a worker is still decommutating it
+      calls = 0
+      allow_any_instance_of(DartMasterQuery).to receive(:get_decom_ple_ids) do
+        calls += 1
+        calls <= 2 ? [1, 2] : []
+      end
+
+      thread = Thread.new do
+        decom = DartDecommutator.new
+        decom.run
+      end
+      # Wait until the decommutator has asked again after the second hand out
+      deadline = Time.now + 30
+      sleep 0.1 while calls < 3 && Time.now < deadline
+      thread.kill
+
+      (1..2).each do |id|
+        expect(PacketLogEntry.find(id).decom_state).to eq PacketLogEntry::COMPLETE
+      end
+      [["SYSTEM", "META"], ["INST", "HEALTH_STATUS"]].each do |target_name, packet_name|
+        target = Target.where("name = ?", target_name).first
+        packet = Packet.where("target_id = ? AND name = ?", target.id, packet_name).first
+        packet_config = PacketConfig.where("packet_id = ?", packet.id).first
+        expect(common.get_decom_table_model(packet_config.id, 0).count).to eq 1
+      end
+    end
+
     it "marks and skips entries with no SYSTEM META PacketLogEntry" do
       common.sync_targets_and_packets
       target_id, packet_id = common.lookup_target_and_packet_id("INST", "HEALTH_STATUS", true)
@@ -149,7 +204,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       PacketLogEntry.all.each do |ple|
@@ -183,7 +238,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       PacketLogEntry.all.each do |ple|
@@ -233,7 +288,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       (1..2).each do |id|
@@ -253,7 +308,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       (1..2).each do |id|
@@ -277,7 +332,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       expect(PacketLogEntry.find(2).decom_state).to eq PacketLogEntry::NO_PACKET
@@ -296,7 +351,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       (1..2).each do |id|

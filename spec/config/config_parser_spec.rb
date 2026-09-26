@@ -56,6 +56,27 @@ module Cosmos
         tf.unlink
       end
 
+      it "parses the ERB output even if its copy in outputs/tmp is rewritten" do
+        # Other processes loading the same configuration rewrite the copy in
+        # outputs/tmp. Make the file bigger than a read buffer and truncate
+        # the copy after the first line.
+        tf = Tempfile.new('unittest')
+        1000.times { |index| tf.puts "KEYWORD#{index} PARAM1 PARAM2 PARAM3" }
+        tf.close
+
+        keywords = []
+        @cp.parse_file(tf.path) do |keyword, params|
+          if keywords.empty?
+            copy = Dir[File.join(Cosmos::USERPATH, 'outputs', 'tmp', '**', File.basename(tf.path))].first
+            File.truncate(copy, 0)
+          end
+          keywords << keyword
+        end
+        expect(keywords.length).to eql 1000
+        expect(keywords[-1]).to eql "KEYWORD999"
+        tf.unlink
+      end
+
       it "supports ERB syntax" do
         tf = Tempfile.new('unittest')
         tf.puts "KEYWORD <%= 5 * 2 %>"

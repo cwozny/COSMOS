@@ -10,6 +10,7 @@
 
 require 'cosmos/ext/config_parser' if RUBY_ENGINE == 'ruby' and !ENV['COSMOS_NO_EXT']
 require 'tempfile'
+require 'stringio'
 require 'erb'
 
 module Cosmos
@@ -179,9 +180,12 @@ module Cosmos
       raise Error.new(self, "Configuration file #{filename} does not exist.") unless filename && File.exist?(filename)
       @filename = filename
 
-      # Create a temp file where we write the ERB parsed output
-      file = create_parsed_output_file(filename)
-      size = file.stat.size.to_f
+      # Parse the ERB output from memory. The copy written to outputs/tmp is only
+      # for the error message: other processes loading the same configuration
+      # rewrite it, and reading it back could see it truncated.
+      output, parsed_filename = create_parsed_output(filename)
+      file = StringIO.new(output)
+      size = output.bytesize.to_f
 
       # Callbacks for beginning of parsing
       @@message_callback.call("Parsing #{size} bytes of #{filename}") if @@message_callback
@@ -196,7 +200,7 @@ module Cosmos
                    PARSING_REGEX,
                    &block)
       rescue Exception => e # Catch EVERYTHING so we can re-raise with additional info
-        raise e, "#{e}\n\nParsed output in #{file.path}", e.backtrace
+        raise e, "#{e}\n\nParsed output in #{parsed_filename}", e.backtrace
       ensure
         file.close unless file.closed?
       end
@@ -335,8 +339,11 @@ module Cosmos
 
     protected
 
-    # Writes the ERB parsed results
-    def create_parsed_output_file(filename)
+    # Writes the ERB parsed results to outputs/tmp
+    #
+    # @return [Array<String, String>] The ERB parsed results, as written, and
+    #   the file they were written to
+    def create_parsed_output(filename)
       begin
         output = ERB.new(File.read(filename)).result(binding)
       rescue => e
@@ -355,10 +362,9 @@ module Cosmos
       end
       parsed_filename = File.join(Cosmos::USERPATH, 'outputs', 'tmp', copy)
       FileUtils.mkdir_p(File.dirname(parsed_filename)) # Create the path
-      file = File.open(parsed_filename, 'w+')
-      file.puts output
-      file.rewind # Rewind so the file is ready to read
-      file
+      output << "\n" unless output.end_with?("\n") # As puts writes it
+      File.open(parsed_filename, 'w') { |file| file.write(output) }
+      return output, parsed_filename
     end
 
     def self.calculate_range_value(type, data_type, bit_size)

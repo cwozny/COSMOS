@@ -35,7 +35,7 @@ class DartDatabaseCleaner
   def remove_packet_log(filename)
     filename = filename.gsub("\\", "/") # Fix slashes
     filename = File.expand_path(filename, Cosmos::System.paths['DART_DATA']) # Make absolute path
-    if File.exists?(filename)
+    if File.exist?(filename)
       packet_log = PacketLog.where("filename = ?", filename).first
       if packet_log
         size = File.size(filename)

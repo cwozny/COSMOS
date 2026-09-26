@@ -20,7 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        ruby-version: ["2.5", "2.6"]
+        # One exact version, the same one the Windows installer installs
+        ruby-version: ["4.0.7"]
     steps:
       - uses: actions/checkout@v2
       - uses: ruby/setup-ruby@v1
@@ -47,48 +48,32 @@ jobs:
       CI: 1
       # A missing Qt6 or moc fails the build instead of stubbing it out.
       COSMOS_QT6_REQUIRED: 1
-      # On Windows, gems with C code (racc, io-console) build as C17: MSYS2's
-      # GCC 16 defaults to C23, which rejects the Ruby 2.6 C API's VALUE (*)().
-      # ffi strips any -std= from CFLAGS, so -fpermissive also turns that
-      # error (and GCC 14's other new errors for old C) back into a warning.
-      # mkmf reads CONFIGURE_ARGS in every extconf.rb, and $(cflags) keeps the
-      # usual optimization and warning flags.
-      CONFIGURE_ARGS: "${{ matrix.os == 'windows-latest' && '--with-cflags=''$(cflags) -std=gnu17 -fpermissive''' || '' }}"
     steps:
       - uses: actions/checkout@v2
       - name: Install the toolchain and Qt 6 (Windows)
         if: runner.os == 'Windows'
         # One MSYS2 for everything: Qt 6, the compiler that builds against it
-        # and the DLLs Ruby loads at run time. MINGW64 is the MSVCRT toolchain
-        # RubyInstaller 2.6 is built with, and RubyInstaller adds C:\msys64's
-        # mingw64\bin to its DLL search path at startup. This runs before
+        # and the DLLs Ruby loads at run time. UCRT64 is the toolchain
+        # RubyInstaller 4 is built with, and RubyInstaller adds C:\msys64's
+        # ucrt64\bin to its DLL search path at startup. This runs before
         # setup-ruby, whose bundle install builds native gems with it.
-        run: C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed make mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-qt6-base
+        run: C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-qt6-base
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "2.6"
+          ruby-version: "4.0.7"
           bundler-cache: true
-          # setup-ruby's own Windows toolchain is a second MSYS2 (GCC 14) in
-          # Ruby's directory, which RubyInstaller would find first.
+          # setup-ruby's own Windows toolchain is a second MSYS2 in Ruby's
+          # directory, without Qt 6, which RubyInstaller would find first.
           windows-toolchain: ${{ runner.os == 'Windows' && 'none' || 'default' }}
-      - name: Give Ruby MSYS2's GCC runtime (Windows)
+      - name: Show the toolchain (Windows)
         if: runner.os == 'Windows'
-        # RubyInstaller 2.6 ships the GCC runtime it was built with (2022) in
-        # bin\ruby_builtin_dlls and binds it for the whole process. Qt 6 from
-        # MSYS2 is built with GCC 16 and needs newer ones: loading qt6.so
-        # failed with "127: The specified procedure could not be found". The
-        # newer runtime is backward compatible, so Ruby runs on it as well.
+        # If qt6.so fails to load, compare the GCC that built Ruby and its
+        # bundled runtime DLLs with the one that builds Qt 6 and COSMOS.
         shell: pwsh
         run: |
-          $dlls = Join-Path (Split-Path (Get-Command ruby).Source) 'ruby_builtin_dlls'
-          foreach ($name in 'libgcc_s_seh-1.dll', 'libwinpthread-1.dll', 'libstdc++-6.dll') {
-            $target = Join-Path $dlls $name
-            if (Test-Path $target) {
-              Copy-Item "C:\msys64\mingw64\bin\$name" $target -Force
-              "replaced $name"
-            }
-          }
-          Get-ChildItem $dlls | ForEach-Object { $_.Name }
+          ruby -e "puts RUBY_DESCRIPTION; puts RbConfig::CONFIG['CC_VERSION_MESSAGE'].to_s.lines.first"
+          C:\msys64\ucrt64\bin\gcc.exe --version | Select-Object -First 1
+          Get-ChildItem (Join-Path (Split-Path (Get-Command ruby).Source) 'ruby_builtin_dlls') | ForEach-Object { $_.Name }
       - name: Install Qt 6 (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -103,3 +88,56 @@ jobs:
         run: bundle exec rake qt6_scan_unbound
       - name: Qt6 suites
         run: bundle exec rake qt6_test
+
+  # DART (lib/cosmos/dart), the Rails application in COSMOS, against PostgreSQL:
+  # its specs, then dart_end_to_end.rb, which imports a packet log into the demo
+  # project's DART and reads it back through the DART servers.
+  dart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: dart
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DART_USERNAME: dart
+      DART_DB: dart
+      DART_TEST_DB: dart_test
+      PGHOST: localhost
+      COSMOS_NO_SIMPLECOV: 1
+    steps:
+      - uses: actions/checkout@v2
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0.7"
+          bundler-cache: true
+      - name: Build extensions
+        run: bundle exec rake build
+      - name: DART specs
+        working-directory: lib/cosmos/dart
+        env:
+          RAILS_ENV: test
+        run: |
+          bin/rails db:create db:schema:load
+          bundle exec rspec
+      - name: DART end to end
+        working-directory: demo
+        env:
+          # The demo has its own Gemfile, which uses the released cosmos gem
+          BUNDLE_GEMFILE: ${{ github.workspace }}/Gemfile
+        run: |
+          bundle exec rake db:create db:migrate
+          # db:migrate dumps db/schema.rb again; it should not change
+          git diff --exit-code -- ../lib/cosmos/dart/db/schema.rb
+          # The database is usable before DART first starts (the Status row exists)
+          bundle exec ruby ../bin/dart_util showdatabase
+          bundle exec ruby ../.github/scripts/dart_end_to_end.rb

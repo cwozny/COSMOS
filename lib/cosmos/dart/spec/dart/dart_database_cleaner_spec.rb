@@ -12,6 +12,7 @@ require 'rails_helper'
 require 'dart_database_cleaner'
 require 'dart_packet_log_writer'
 require 'dart_decommutator'
+require 'dart_importer'
 
 describe DartDatabaseCleaner do
   before(:each) do
@@ -34,15 +35,38 @@ describe DartDatabaseCleaner do
     end
   end
 
+  describe "remove_packet_log" do
+    it "removes an imported packet log and its PacketLogEntries" do
+      # A packet log in DART_DATA, imported the way dart_import imports it
+      writer = Cosmos::PacketLogWriter.new(:TLM, 'test_remove_', true, nil, 2_000_000_000, Cosmos::System.paths['DART_DATA'])
+      packet = Cosmos::System.telemetry.packet("INST", "HEALTH_STATUS")
+      3.times do
+        packet.received_time = Time.now
+        writer.write(packet)
+      end
+      filename = writer.filename
+      writer.shutdown
+      DartImporter.new.import(File.expand_path(filename), false)
+      # SYSTEM META plus the three packets
+      expect(PacketLogEntry.count).to eq 4
+
+      # dart_util removepacketlog takes the name relative to DART_DATA
+      @cleaner.remove_packet_log(File.basename(filename))
+      expect(PacketLog.count).to eq 0
+      expect(PacketLogEntry.count).to eq 0
+    end
+  end
+
   describe "clean_system_configs" do
     it "ensures all system configs are local" do
       # Create a bogus SystemConfig to cause an error
       SystemConfig.create(:name => "test")
 
-      expect(Cosmos::Logger).to receive(:error) do |msg|
-        expect(msg).to match(/Could not load system_config: test/)
-      end
+      # System.load_configuration logs its own error before DART's
+      messages = []
+      allow(Cosmos::Logger).to receive(:error) { |msg| messages << msg }
       config, error = @cleaner.clean_system_configs
+      expect(messages).to include(a_string_matching(/Could not load system_config: test/))
       # Ensure the configuration is loaded
       expect(config).to eq Cosmos::System.configuration_name
     end
@@ -150,10 +174,11 @@ describe DartDatabaseCleaner do
       sys_config = SystemConfig.create(:name => "test")
       PacketConfig.create(:packet_id => packet_id, :name => packet.config_name, :first_system_config_id => sys_config.id)
 
-      expect(Cosmos::Logger).to receive(:error) do |msg|
-        expect(msg).to match(/Could not switch to system config: test/)
-      end
+      # System.load_configuration logs its own error before DART's
+      messages = []
+      allow(Cosmos::Logger).to receive(:error) { |msg| messages << msg }
       @cleaner.clean_packet_configs
+      expect(messages).to include(a_string_matching(/Could not switch to system config: test/))
     end
 
     it "recreates the PacketConfig if it is not 'ready'" do
@@ -189,7 +214,7 @@ describe DartDatabaseCleaner do
       end
       model.reset_column_information
       model_name = table_name.upcase
-      Cosmos.public_send(:remove_const, model_name) if Cosmos.const_defined?(model_name)
+      Cosmos.send(:remove_const, model_name) if Cosmos.const_defined?(model_name)
       Cosmos.const_set(model_name, model)
 
       expect(model.column_names).to include("delete_me")
@@ -205,7 +230,7 @@ describe DartDatabaseCleaner do
         end
         model.reset_column_information
         model_name = table_name.upcase
-        Cosmos.public_send(:remove_const, model_name) if Cosmos.const_defined?(model_name)
+        Cosmos.send(:remove_const, model_name) if Cosmos.const_defined?(model_name)
         Cosmos.const_set(model_name, model)
 
         expect(model.column_names).to include("delete_me")

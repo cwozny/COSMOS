@@ -10,7 +10,6 @@
 
 require 'rails_helper'
 require 'dart_decom_query'
-require 'packet_log_entry'
 require 'dart_packet_log_writer'
 require 'dart_decommutator'
 
@@ -23,6 +22,8 @@ describe DartDecomQuery do
     # Put all the known targets and packets into the DB
     @query.sync_targets_and_packets
   end
+
+  after(:each) { stop_dart_master }
 
   def load_db(num_pkts)
     writer = DartPacketLogWriter.new(
@@ -37,7 +38,8 @@ describe DartDecomQuery do
     @hs_packets = []
     # Write packets. The first packet is always SYSTEM META.
     num_pkts.times do |x|
-      hs_packet.received_time = Time.now
+      # The packet log stores microseconds, so the times read back can only match to the microsecond
+      hs_packet.received_time = Time.now.floor(6)
       hs_packet.write("COLLECT_TYPE", x, :RAW)
       @hs_packets << hs_packet.clone
       writer.write(hs_packet)
@@ -47,15 +49,22 @@ describe DartDecomQuery do
     sleep 0.1
 
     # Decommutate the DB
+    start_dart_master
     thread = Thread.new do
       decom = DartDecommutator.new
       decom.run
     end
     while true
-      break if 0 == PacketLogEntry.where("decom_state = #{PacketLogEntry::NOT_STARTED}").count
+      break if 0 == PacketLogEntry.where(decom_state: [PacketLogEntry::NOT_STARTED, PacketLogEntry::IN_PROGRESS]).count
       sleep 0.1
     end
     thread.kill
+  end
+
+  describe "dart_status" do
+    it "reports the database size" do
+      expect(@query.dart_status[:DART_DATABASE_BYTES]).to be > 0
+    end
   end
 
   describe "query" do

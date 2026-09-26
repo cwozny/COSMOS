@@ -18,6 +18,13 @@ describe DartPacketLogWriter do
     Rails.application.load_seed
   end
 
+  # Target name, packet name and ready for each entry of a PacketLog, in file order
+  def log_entries(packet_log)
+    PacketLogEntry.where(packet_log_id: packet_log.id).order(:data_offset).map do |ple|
+      [ple.target.name, ple.packet.name, ple.ready]
+    end
+  end
+
   describe "write" do
     it "creates PacketLogEntries and flushes the file" do
       DatabaseCleaner.clean
@@ -94,6 +101,34 @@ describe DartPacketLogWriter do
       expect(files.length).to eq 1
     end
 
+    it "keeps every PacketLogEntry still queued at shutdown" do
+      writer = DartPacketLogWriter.new(
+        :TLM,    # Log telemetry
+        'test_dart_tlm_', # Put dart_ in the log file name
+        true,    # Enable logging
+        nil,     # Don't cycle on time
+        2_000_000_000, # Cycle the log at 2GB
+        Cosmos::System.paths['DART_DATA']) # Log into the DART_DATA dir
+
+      # Slow the database thread down so batches are still queued at shutdown
+      connection = ActiveRecord::Base.connection
+      allow(connection).to receive(:execute).and_wrap_original do |original, sql, *args|
+        sleep 0.05 if sql.start_with?("INSERT INTO packet_log_entries")
+        original.call(sql, *args)
+      end
+
+      hs_packet = Cosmos::System.telemetry.packet("INST", "HEALTH_STATUS")
+      num_packets = DartPacketLogWriter::DEFAULT_SYNC_COUNT_LIMIT * 10 + 50
+      num_packets.times do
+        hs_packet.received_time = Time.now
+        writer.write(hs_packet)
+      end
+      writer.shutdown
+
+      # One SYSTEM META plus all the INST HEALTH_STATUS packets
+      expect(PacketLogEntry.count).to eq num_packets + 1
+    end
+
     it "creates command logs" do
       DatabaseCleaner.clean
       Rails.application.load_seed
@@ -126,24 +161,17 @@ describe DartPacketLogWriter do
       writer.write(clr_cmd) # The second command should create a new log
       sleep 0.1
 
-      # The second Log Entry is the command
-      ple = PacketLogEntry.find(2)
-      expect(ple.target.name).to eq "INST"
-      expect(ple.packet.name).to eq "CLEAR"
-      expect(ple.ready).to eq true
+      # Each log holds SYSTEM META and then the command. The writer saves
+      # SYSTEM META entries at once but queues the others for its database
+      # thread, so the first command's entry can get a higher id than the
+      # second log's SYSTEM META. Check each log's entries in file order.
+      first_log, second_log = PacketLog.order(:id).to_a
+      expect(log_entries(first_log)).to eq [["SYSTEM", "META", true], ["INST", "CLEAR", true]]
 
       writer.shutdown
       sleep 0.1
 
-      # The third and fourth are SYSTEM META and the command
-      ple = PacketLogEntry.find(3)
-      expect(ple.target.name).to eq "SYSTEM"
-      expect(ple.packet.name).to eq "META"
-      expect(ple.ready).to eq true
-      ple = PacketLogEntry.find(4)
-      expect(ple.target.name).to eq "INST"
-      expect(ple.packet.name).to eq "CLEAR"
-      expect(ple.ready).to eq true
+      expect(log_entries(second_log)).to eq [["SYSTEM", "META", true], ["INST", "CLEAR", true]]
 
       files = Dir["#{Cosmos::System.paths['DART_DATA']}/*_test_dart_cmd_*"]
       expect(files.length).to eq 2

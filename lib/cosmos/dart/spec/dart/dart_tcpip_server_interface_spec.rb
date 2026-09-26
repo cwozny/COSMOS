@@ -10,7 +10,6 @@
 
 require 'rails_helper'
 require 'dart_tcpip_server_interface'
-require 'packet_log_entry'
 require 'dart_packet_log_writer'
 
 describe DartTcpipServerInterface do
@@ -71,7 +70,8 @@ describe DartTcpipServerInterface do
     @hs_packets = []
     # Write packets. The first packet is always SYSTEM META.
     num_pkts.times do
-      hs_packet.received_time = Time.now
+      # The packet log stores microseconds, so the times read back can only match to the microsecond
+      hs_packet.received_time = Time.now.floor(6)
       @hs_packets << hs_packet.clone
       writer.write(hs_packet)
       sleep 0.01

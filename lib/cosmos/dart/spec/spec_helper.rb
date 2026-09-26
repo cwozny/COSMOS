@@ -17,11 +17,8 @@
 # NOTE: You MUST require simplecov before anything else!
 if !ENV['COSMOS_NO_SIMPLECOV']
   require 'simplecov'
-  require 'codecov'
-  SimpleCov.formatter = SimpleCov::Formatter::MultiFormatter.new([
-    SimpleCov::Formatter::HTMLFormatter,
-    SimpleCov::Formatter::Codecov,
-  ])
+  # The codecov gem's last release (0.6.0, 2021) does not allow Ruby 4.
+  SimpleCov.formatter = SimpleCov::Formatter::HTMLFormatter
   SimpleCov.start do
     merge_timeout 12 * 60 * 60 # merge the last 12 hours of results
     add_filter '/spec/'

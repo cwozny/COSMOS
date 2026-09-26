@@ -312,9 +312,9 @@ module Cosmos
               unless all_allowed
                 first_char = addr[0..0]
                 if !((first_char =~ /[1234567890]/) || (first_char == '*') || (addr.upcase == 'ALL'))
-                  # Try to lookup IP Address
-                  info = Socket.gethostbyname(addr)
-                  addr = "#{info[3].getbyte(0)}.#{info[3].getbyte(1)}.#{info[3].getbyte(2)}.#{info[3].getbyte(3)}"
+                  # Try to lookup IP Address (its first IPv4 address;
+                  # Socket.gethostbyname is deprecated)
+                  addr = Addrinfo.getaddrinfo(addr, nil, Socket::AF_INET).first.ip_address
                   if (acl_list.empty?)
                     acl_list << 'allow'
                     acl_list << '127.0.0.1'
@@ -715,7 +715,8 @@ module Cosmos
           zip_file.each do |entry|
             path = File.join(@paths['TMP'], entry.name)
             FileUtils.mkdir_p(File.dirname(path))
-            zip_file.extract(entry, path) unless File.exist?(path)
+            # rubyzip 3 extracts to destination_directory + the given path
+            zip_file.extract(entry, entry.name, destination_directory: @paths['TMP']) unless File.exist?(path)
           end
         end
       end
@@ -812,7 +813,7 @@ module Cosmos
           configuration_tmp = File.join(@paths['SAVED_CONFIG'], File.build_timestamped_filename(['tmp_' + @config.name], '.zip.tmp'))
           begin
             Zip.continue_on_exists_proc = true
-            Zip::File.open(configuration_tmp, Zip::File::CREATE) do |zipfile|
+            Zip::File.open(configuration_tmp, create: true) do |zipfile|
               zip_file_path = File.basename(configuration, ".zip")
               zipfile.mkdir zip_file_path
 

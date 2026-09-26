@@ -235,13 +235,14 @@ module Cosmos
         raise ArgumentError, "x_labels data must be given in an array-like class" unless x_labels.nil?
       end
 
-      # Validate y_states data
-      unless y_states.respond_to?(:index)
+      # Validate y_states data. The states are read with key (Hash#index is
+      # gone since Ruby 3.0).
+      unless y_states.respond_to?(:key)
         raise ArgumentError, "y_states data must be given in an hash-like class" unless y_states.nil?
       end
 
       # Validate x_states data
-      unless x_states.respond_to?(:index)
+      unless x_states.respond_to?(:key)
         raise ArgumentError, "x_states data must be given in an hash-like class" unless x_states.nil?
       end
 

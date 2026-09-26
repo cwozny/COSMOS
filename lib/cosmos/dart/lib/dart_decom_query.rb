@@ -255,7 +255,7 @@ class DartDecomQuery
     end
     # Size of SQL Database
     begin
-      result[:DART_DATABASE_BYTES] = ActiveRecord::Base.connection.execute("select pg_database_size('#{ActiveRecord::Base.connection_config[:database]}');")[0]['pg_database_size']
+      result[:DART_DATABASE_BYTES] = ActiveRecord::Base.connection.execute("select pg_database_size('#{ActiveRecord::Base.connection_db_config.database}');")[0]['pg_database_size']
     rescue
       result[:DART_DATABASE_BYTES] = -1
     end
