@@ -23,6 +23,8 @@ describe DartReducerManager do
     Rails.application.load_seed
   end
 
+  after(:each) { stop_dart_master }
+
   def setup_ples(entries, delta_time)
     time = Time.utc(2018, 1, 1, 0, 0, 0)
     meta = Cosmos::System.telemetry.packet("SYSTEM", "META")
@@ -58,6 +60,7 @@ describe DartReducerManager do
     sleep 0.1
     expect(count).to be < 100
 
+    start_dart_master
     thread = Thread.new do
       decom = DartDecommutator.new
       decom.run

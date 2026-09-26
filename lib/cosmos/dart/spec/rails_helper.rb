@@ -30,6 +30,32 @@ require 'database_cleaner/active_record'
 # If you are not using ActiveRecord, you can remove this line.
 ActiveRecord::Migration.maintain_test_schema!
 
+# DartDecommutator asks the DART master for the PacketLogEntry ids to
+# decommutate, over JSON-RPC. Specs that run a DartDecommutator start a master
+# the way processes/dart_master.rb does, and stop it afterwards.
+module DartMasterHelper
+  def start_dart_master
+    require 'dart_master_query'
+    require 'cosmos/io/json_drb'
+    @dart_master_query = DartMasterQuery.new
+    @dart_master = Cosmos::JsonDRb.new
+    @dart_master.method_whitelist = ['get_decom_ple_ids']
+    @dart_master.start_service(Cosmos::System.listen_hosts['DART_MASTER'],
+      Cosmos::System.ports['DART_MASTER'], @dart_master_query, 1000, Cosmos::System)
+  end
+
+  def stop_dart_master
+    @dart_master.stop_service if @dart_master
+    if @dart_master_query
+      # DartMasterQuery has no way to stop the thread that fills its list
+      thread = @dart_master_query.instance_variable_get(:@thread)
+      thread.kill
+      thread.join(5)
+    end
+    @dart_master = @dart_master_query = nil
+  end
+end
+
 RSpec.configure do |config|
   # Remove this line if you're not using ActiveRecord or ActiveRecord fixtures
   config.fixture_paths = ["#{::Rails.root}/spec/fixtures"]
@@ -58,4 +84,6 @@ RSpec.configure do |config|
   config.filter_rails_from_backtrace!
   # arbitrary gems may also be filtered via:
   # config.filter_gems_from_backtrace("gem name")
+
+  config.include DartMasterHelper
 end

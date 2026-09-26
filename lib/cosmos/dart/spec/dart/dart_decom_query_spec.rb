@@ -23,6 +23,8 @@ describe DartDecomQuery do
     @query.sync_targets_and_packets
   end
 
+  after(:each) { stop_dart_master }
+
   def load_db(num_pkts)
     writer = DartPacketLogWriter.new(
       :TLM,    # Log telemetry
@@ -46,6 +48,7 @@ describe DartDecomQuery do
     sleep 0.1
 
     # Decommutate the DB
+    start_dart_master
     thread = Thread.new do
       decom = DartDecommutator.new
       decom.run

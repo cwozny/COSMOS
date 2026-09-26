@@ -22,6 +22,19 @@ describe DartDecommutator do
   describe "run" do
     let(:common) { Object.new.extend(DartCommon) }
 
+    before(:each) { start_dart_master }
+    after(:each) { stop_dart_master }
+
+    # The decommutator gets its entries from the DART master, which refills its
+    # list about once a second, so wait until every entry has been handled
+    # instead of for a fixed time
+    def wait_for_decom(timeout = 30)
+      deadline = Time.now + timeout
+      while PacketLogEntry.where(decom_state: PacketLogEntry::NOT_STARTED).exists? && Time.now < deadline
+        sleep 0.1
+      end
+    end
+
     def check_val(val, expected)
       case val
       when Float
@@ -65,7 +78,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 5 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       PacketLogEntry.all.each do |ple|
@@ -148,7 +161,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       PacketLogEntry.all.each do |ple|
@@ -182,7 +195,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       PacketLogEntry.all.each do |ple|
@@ -232,7 +245,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       (1..2).each do |id|
@@ -252,7 +265,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       (1..2).each do |id|
@@ -276,7 +289,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       expect(PacketLogEntry.find(2).decom_state).to eq PacketLogEntry::NO_PACKET
@@ -295,7 +308,7 @@ describe DartDecommutator do
         decom = DartDecommutator.new
         decom.run
       end
-      sleep 1 # Allow the decommutator to work
+      wait_for_decom
       thread.kill
 
       (1..2).each do |id|
