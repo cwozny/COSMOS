@@ -69,13 +69,11 @@ class DartDecommutator
       if ple_ids and ple_ids.length > 0
         ple_ids.each do |ple_id|
           begin
-            # The master can hand out an entry again while another worker is
-            # still decommutating it, so claim it first. DartDatabaseCleaner
-            # resets entries left IN_PROGRESS.
-            claimed = PacketLogEntry.where(id: ple_id, decom_state: PacketLogEntry::NOT_STARTED).
-              update_all(decom_state: PacketLogEntry::IN_PROGRESS)
-            next if claimed == 0
             ple = PacketLogEntry.find(ple_id)
+            # The master can hand out an entry again after a worker has
+            # decommutated it. decom_packet also checks, in case another
+            # worker is still decommutating it.
+            next unless ple.decom_state == PacketLogEntry::NOT_STARTED
             meta_ple = get_meta_ple(ple)
             next unless meta_ple
             system_meta = get_system_meta(ple, meta_ple)
@@ -107,13 +105,6 @@ class DartDecommutator
             end
           rescue => err
             handle_error("PLE:#{ple_id}:ERROR\n#{err.formatted}")
-            # Let the entry be tried again
-            begin
-              PacketLogEntry.where(id: ple_id, decom_state: PacketLogEntry::IN_PROGRESS).
-                update_all(decom_state: PacketLogEntry::NOT_STARTED)
-            rescue => err
-              handle_error("PLE:#{ple_id}:ERROR releasing\n#{err.formatted}")
-            end
           end
         end
       else
@@ -299,9 +290,13 @@ class DartDecommutator
         table_index += 1
       end
 
-      # The log entry has been decommutated, mark COMPLETE
+      # The log entry has been decommutated, mark COMPLETE. The master can
+      # hand out an entry again while another worker is decommutating it, so
+      # only complete it if no one else has, and otherwise drop these rows.
+      completed = PacketLogEntry.where(id: ple.id, decom_state: PacketLogEntry::NOT_STARTED).
+        update_all(decom_state: PacketLogEntry::COMPLETE)
+      raise ActiveRecord::Rollback if completed == 0
       ple.decom_state = PacketLogEntry::COMPLETE
-      ple.save!
       @status.count += 1
       Cosmos::Logger.debug("PLE:#{ple.id}:#{ple.decom_state_string}")
     end

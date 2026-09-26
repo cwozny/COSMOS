@@ -142,6 +142,19 @@ describe DartDecommutator do
       end
     end
 
+    it "leaves an entry to be decommutated again if the worker stops in the middle" do
+      setup_ples()
+      # Stopping DART (SIGINT) raises Interrupt wherever each worker is
+      allow_any_instance_of(DartDecommutator).to receive(:decom_packet).and_raise(Interrupt)
+
+      thread = Thread.new { DartDecommutator.new.run } # run rescues the Interrupt
+      expect(thread.join(60)).to_not be_nil
+
+      (1..2).each do |id|
+        expect(PacketLogEntry.find(id).decom_state).to eq PacketLogEntry::NOT_STARTED
+      end
+    end
+
     it "decommutates an entry once if the master hands it out twice" do
       setup_ples()
       # The master refills its list with every entry not started yet, so it can
