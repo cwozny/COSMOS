@@ -8,5 +8,9 @@ gem 'ruby-termios', '>= 0.9' if RbConfig::CONFIG['target_os'] !~ /mswin|mingw|cy
 #  gem 'wdm', '>= 0.1.0', :platforms => [:mswin, :mingw]
 #end
 gemspec
-# DART's Gemfile (install/config/dart/Gemfile) is not pulled in: DART is still
-# a Rails 5.1 app, and Rails 5.1 does not run on Ruby 4 (issue #6).
+instance_eval File.read(File.join(__dir__, 'install/config/dart/Gemfile'))
+# DART's specs (lib/cosmos/dart/spec)
+group :test do
+  gem 'rspec-rails', '~> 8.0'
+  gem 'database_cleaner-active_record', '~> 2.2'
+end
