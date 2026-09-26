@@ -101,6 +101,34 @@ describe DartPacketLogWriter do
       expect(files.length).to eq 1
     end
 
+    it "keeps every PacketLogEntry still queued at shutdown" do
+      writer = DartPacketLogWriter.new(
+        :TLM,    # Log telemetry
+        'test_dart_tlm_', # Put dart_ in the log file name
+        true,    # Enable logging
+        nil,     # Don't cycle on time
+        2_000_000_000, # Cycle the log at 2GB
+        Cosmos::System.paths['DART_DATA']) # Log into the DART_DATA dir
+
+      # Slow the database thread down so batches are still queued at shutdown
+      connection = ActiveRecord::Base.connection
+      allow(connection).to receive(:execute).and_wrap_original do |original, sql, *args|
+        sleep 0.05 if sql.start_with?("INSERT INTO packet_log_entries")
+        original.call(sql, *args)
+      end
+
+      hs_packet = Cosmos::System.telemetry.packet("INST", "HEALTH_STATUS")
+      num_packets = DartPacketLogWriter::DEFAULT_SYNC_COUNT_LIMIT * 10 + 50
+      num_packets.times do
+        hs_packet.received_time = Time.now
+        writer.write(hs_packet)
+      end
+      writer.shutdown
+
+      # One SYSTEM META plus all the INST HEALTH_STATUS packets
+      expect(PacketLogEntry.count).to eq num_packets + 1
+    end
+
     it "creates command logs" do
       DatabaseCleaner.clean
       Rails.application.load_seed

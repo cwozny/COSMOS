@@ -50,9 +50,11 @@ class DartPacketLogWriter < Cosmos::PacketLogWriter
     Cosmos.kill_thread(self, @db_thread)
     handle_sync_ple()
     queue_ple_data()
+    # Write what the database thread didn't get to. The queue can still hold
+    # the nils graceful_kill added, in front of the last entries.
     while @db_queue.length > 0
       ple_data = @db_queue.pop
-      break if ple_data.nil?
+      next if ple_data.nil?
       ActiveRecord::Base.connection.execute("INSERT INTO packet_log_entries (target_id, packet_id, time, packet_log_id, data_offset, meta_id, is_tlm, ready) VALUES #{ple_data}")
     end
   end
@@ -146,7 +148,9 @@ class DartPacketLogWriter < Cosmos::PacketLogWriter
     while true
       begin
         ple_data = @db_queue.pop
-        return if @cancel_threads or ple_data.nil?
+        # graceful_kill queues a nil behind the entries still to be written.
+        # Returning on @cancel_threads instead would drop the entries just popped.
+        return if ple_data.nil?
         ActiveRecord::Base.connection.execute("INSERT INTO packet_log_entries (target_id, packet_id, time, packet_log_id, data_offset, meta_id, is_tlm, ready) VALUES #{ple_data}")
       rescue ThreadError
         # This can happen when the thread is killed
